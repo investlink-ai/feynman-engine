@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"let d='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);const f=(j.tool_input||{}).file_path||'';if(/crates\\/(agent-risk|pipeline|api)\\/src\\//.test(f)||/bins\\/feynman-engine\\/src\\//.test(f)){process.stderr.write('\\n\\x1b[33m⚠️  RISK/EXECUTION CODE\\x1b[0m\\nPre-gate: Decimal math? fail-fast on invalid input? dryRun guard? idempotent submission? error propagation? per-agent isolation?\\nRun /hostile-review before finalizing.\\n');}}catch(e){}});\"",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"let d='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);const cmd=(j.tool_input||{}).command||'';const out=JSON.stringify(j.tool_response||'');const isTest=/cargo test|make quick|make check/.test(cmd);const isFail=/FAILED|test result: FAILED|panicked/.test(out);if(isTest&&isFail){process.stderr.write('\\n\\x1b[31m✗ TEST FAILURE\\x1b[0m — Extract root cause to memory/anti-patterns.md before fixing.\\n');}}catch(e){}});\"",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Read(**/.env*)",
+      "Read(**/secrets/**)",
+      "Read(**/credentials/**)"
+    ]
+  }
+}

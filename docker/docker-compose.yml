@@ -1,0 +1,59 @@
+version: '3.9'
+
+services:
+  # ── Execution Engine ──
+  engine:
+    build:
+      context: ..
+      dockerfile: docker/engine.Dockerfile
+    ports:
+      - "50051:50051"    # gRPC
+      - "8080:8080"      # Dashboard
+    environment:
+      - ENGINE_MODE=live
+      - ENGINE_DRY_RUN=true
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=sqlite:///data/feynman.db
+      - RUST_LOG=info
+      - BYBIT_API_KEY=${BYBIT_API_KEY:-}
+      - BYBIT_API_SECRET=${BYBIT_API_SECRET:-}
+    volumes:
+      - engine-data:/data
+      - ../config:/config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=:50051"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+
+  # ── Redis (Message Bus) ──
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  engine-data:
+  redis-data:

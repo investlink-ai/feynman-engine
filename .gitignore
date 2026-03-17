@@ -1,0 +1,57 @@
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+secrets*
+credentials*
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+*.rlib
+*.rmeta
+
+# Build artifacts
+/build/
+/dist/
+
+# Docker
+.dockerignore
+
+# Runtime state (databases, temporary files)
+*.db
+*.db-shm
+*.db-wal
+
+# Test coverage
+/coverage/
+tarpaulin-report.html
+
+# Temporary
+*.tmp
+/tmp/
+*.bak
+*.backup
+
+# Node (if used in scripts)
+node_modules/
+package-lock.json
+
+# Python (if used in scripts)
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/

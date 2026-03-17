@@ -1,0 +1,302 @@
+syntax = "proto3";
+
+package feynman.engine.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+service ExecutionService {
+  // ── Signal ingress (LLM agents — conviction-based, engine does sizing) ──
+  rpc SubmitSignal(Signal) returns (SignalAck);
+
+  // ── Order ingress (algo/ML strategies — fully specified, engine does risk only) ──
+  rpc SubmitOrder(OrderRequest) returns (OrderAck);
+  rpc SubmitBatch(BatchRequest) returns (BatchAck);
+
+  // ── Order management ──
+  rpc CancelOrder(CancelRequest) returns (CancelAck);
+  rpc AmendOrder(AmendRequest) returns (AmendAck);
+  rpc GetOrder(OrderQuery) returns (OrderRecord);
+  rpc ListOpenOrders(AgentFilter) returns (stream OrderRecord);
+
+  // ── Portfolio ──
+  rpc GetFirmBook(google.protobuf.Empty) returns (FirmBook);
+  rpc GetAgentPositions(AgentFilter) returns (stream StrategyPosition);
+  rpc GetAgentAllocation(AgentFilter) returns (AgentAllocation);
+
+  // ── Risk management ──
+  rpc AdjustAgentLimits(AgentLimitsUpdate) returns (StatusAck);
+  rpc PauseAgent(PauseRequest) returns (StatusAck);
+  rpc ResumeAgent(ResumeRequest) returns (StatusAck);
+  rpc HaltAll(HaltRequest) returns (StatusAck);
+  rpc GetRiskSnapshot(google.protobuf.Empty) returns (RiskSnapshot);
+
+  // ── Agent registration ──
+  rpc RegisterAgent(AgentRegistration) returns (StatusAck);
+
+  // ── Streams ──
+  rpc SubscribeFills(AgentFilter) returns (stream Fill);
+  rpc SubscribeEvents(EventFilter) returns (stream EngineEvent);
+
+  // ── Backtest control (rejected in live/paper mode) ──
+  rpc AdvanceClock(ClockAdvance) returns (StatusAck);
+  rpc GetEngineMode(google.protobuf.Empty) returns (EngineModeResponse);
+
+  // ── System ──
+  rpc GetVenueStatus(google.protobuf.Empty) returns (stream VenueStatus);
+  rpc GetEngineHealth(google.protobuf.Empty) returns (HealthReport);
+}
+
+// ── Messages ──
+
+message Signal {
+  string id = 1;
+  string agent = 2;
+  string instrument = 3;
+  string direction = 4;  // "Buy", "Sell"
+  string conviction = 5; // decimal as string for precision
+  optional string sizing_hint = 6;
+  string arb_type = 7;
+  optional string stop_loss = 8;
+  optional string take_profit = 9;
+  string thesis = 10;
+  string urgency = 11; // "Low", "Normal", "High", "Immediate"
+  string metadata = 12; // JSON
+  google.protobuf.Timestamp created_at = 13;
+}
+
+message SignalAck {
+  string order_id = 1;
+  string status = 2; // "accepted", "rejected"
+  string reason = 3;
+  google.protobuf.Timestamp processed_at = 4;
+}
+
+// ── Direct order submission (algo/ML strategies) ──
+
+message OrderRequest {
+  string client_order_id = 1;  // idempotency key
+  string agent = 2;
+  string venue = 3;
+  string symbol = 4;           // venue-native symbol: "BTCUSDT", "BTC-PERP"
+  string side = 5;             // "Buy", "Sell"
+  string order_type = 6;       // "Market", "Limit", "StopLimit", "StopMarket"
+  string qty = 7;              // decimal as string
+  optional string price = 8;   // required for Limit/StopLimit
+  optional string trigger_price = 9;  // required for Stop orders
+  string time_in_force = 10;   // "GTC", "IOC", "FOK", "Day", "GTD"
+  bool post_only = 11;
+  bool reduce_only = 12;
+  optional string take_profit = 13;
+  optional string stop_loss = 14;
+  bool dry_run = 15;           // default: true
+  string metadata = 16;        // JSON
+  google.protobuf.Timestamp created_at = 17;
+}
+
+message OrderAck {
+  string client_order_id = 1;
+  string venue_order_id = 2;
+  string status = 3;           // "accepted", "rejected"
+  string reason = 4;
+  google.protobuf.Timestamp processed_at = 5;
+}
+
+message BatchRequest {
+  string batch_id = 1;         // idempotency key for the batch
+  string agent = 2;
+  repeated OrderRequest orders = 3;
+  bool atomic = 4;             // true = all-or-nothing; false = best-effort
+  string metadata = 5;         // JSON
+}
+
+message BatchAck {
+  string batch_id = 1;
+  string status = 2;           // "accepted", "partial", "rejected"
+  repeated OrderAck order_acks = 3;
+  google.protobuf.Timestamp processed_at = 4;
+}
+
+message AmendRequest {
+  string order_id = 1;
+  string agent = 2;
+  optional string new_price = 3;
+  optional string new_qty = 4;
+}
+
+message AmendAck {
+  string order_id = 1;
+  string status = 2;
+  google.protobuf.Timestamp amended_at = 3;
+}
+
+// ── Agent registration ──
+
+message AgentRegistration {
+  string agent_id = 1;
+  string client_type = 2;     // "llm_agent", "algo_strategy", "ml_model"
+  string display_name = 3;
+  string risk_profile = 4;    // references a risk config name
+  repeated string allowed_venues = 5;
+  repeated string allowed_instruments = 6;
+}
+
+message CancelRequest {
+  string order_id = 1;
+  string agent = 2;
+}
+
+message CancelAck {
+  string order_id = 1;
+  string status = 2;
+  google.protobuf.Timestamp cancelled_at = 3;
+}
+
+message OrderQuery {
+  string order_id = 1;
+}
+
+message OrderRecord {
+  string order_id = 1;
+  string agent = 2;
+  string instrument = 3;
+  string side = 4;
+  string qty = 5;
+  string state = 6;
+  google.protobuf.Timestamp created_at = 7;
+  repeated Fill fills = 8;
+}
+
+message FirmBook {
+  string total_nav = 1;
+  string free_capital = 2;
+  string total_unrealized_pnl = 3;
+  string total_realized_pnl = 4;
+  string total_fees_paid = 5;
+  repeated InstrumentExposure instruments = 6;
+  repeated AgentAllocation agent_allocations = 7;
+  google.protobuf.Timestamp as_of = 8;
+}
+
+message InstrumentExposure {
+  string instrument = 1;
+  string net_qty = 2;
+  string gross_qty = 3;
+  string net_notional_usd = 4;
+  string gross_notional_usd = 5;
+  repeated string venues = 6;
+  repeated string agents = 7;
+}
+
+message StrategyPosition {
+  string agent = 1;
+  string instrument = 2;
+  string qty = 3;
+  string avg_entry_price = 4;
+  string unrealized_pnl = 5;
+  string realized_pnl = 6;
+  google.protobuf.Timestamp opened_at = 7;
+}
+
+message AgentAllocation {
+  string agent = 1;
+  string allocated_capital = 2;
+  string used_capital = 3;
+  string free_capital = 4;
+  string realized_pnl = 5;
+  string unrealized_pnl = 6;
+  string current_drawdown = 7;
+  string max_drawdown_limit = 8;
+  string status = 9; // "Active", "Paused", "DrawdownBreached"
+}
+
+message AgentLimitsUpdate {
+  string agent = 1;
+  string allocated_capital = 2;
+  string max_position_notional = 3;
+  string max_gross_notional = 4;
+  string max_drawdown_pct = 5;
+  string max_daily_loss = 6;
+}
+
+message PauseRequest {
+  string agent = 1;
+  string reason = 2;
+}
+
+message ResumeRequest {
+  string agent = 1;
+}
+
+message HaltRequest {
+  string reason = 1;
+}
+
+message StatusAck {
+  bool success = 1;
+  string message = 2;
+}
+
+message RiskSnapshot {
+  FirmBook firm_book = 1;
+  repeated RiskViolation recent_violations = 2;
+  google.protobuf.Timestamp as_of = 3;
+}
+
+message RiskViolation {
+  string check_name = 1;
+  string violation_type = 2; // "Hard", "Soft"
+  string current_value = 3;
+  string limit = 4;
+}
+
+message Fill {
+  string order_id = 1;
+  string venue_order_id = 2;
+  string qty = 3;
+  string price = 4;
+  string fee = 5;
+  google.protobuf.Timestamp filled_at = 6;
+}
+
+message EngineEvent {
+  string event_type = 1; // "OrderSubmitted", "OrderFilled", "RiskAlert"
+  string payload = 2;    // JSON
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+message AgentFilter {
+  optional string agent = 1;
+  optional string venue = 2;
+}
+
+message EventFilter {
+  optional string event_type = 1;
+  optional string agent = 2;
+}
+
+message VenueStatus {
+  string venue = 1;
+  bool connected = 2;
+  optional int32 latency_ms = 3;
+  int32 open_orders = 4;
+  optional string balance_usd = 5;
+  google.protobuf.Timestamp last_heartbeat = 6;
+}
+
+message HealthReport {
+  string status = 1;      // "healthy", "degraded", "unhealthy"
+  string version = 2;
+  string uptime_secs = 3;
+  repeated VenueStatus venues = 4;
+}
+
+// ── Backtest control ──
+
+message ClockAdvance {
+  google.protobuf.Timestamp advance_to = 1;
+}
+
+message EngineModeResponse {
+  string mode = 1;  // "live", "paper", "backtest"
+}

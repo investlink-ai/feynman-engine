@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/bridge",
+    "crates/agent-risk",
+    "crates/agent-bus",
+    "crates/pipeline",
+    "crates/dashboard",
+    "crates/api",
+    "bins/feynman-engine",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+rust-version = "1.82"
+authors     = ["Feynman Capital"]
+license     = "UNLICENSED"
+
+[workspace.dependencies]
+# ── Async runtime ──
+tokio       = { version = "1", features = ["full"] }
+
+# ── Financial math ──
+rust_decimal        = { version = "1", features = ["serde"] }
+rust_decimal_macros = "1"
+
+# ── Serialization ──
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# ── Time ──
+chrono      = { version = "0.4", features = ["serde"] }
+
+# ── gRPC ──
+tonic       = "0.12"
+tonic-build = "0.12"
+prost       = "0.13"
+
+# ── HTTP / Dashboard ──
+axum        = "0.7"
+tower       = "0.4"
+tower-http  = { version = "0.5", features = ["cors", "trace"] }
+
+# ── Redis (agent bus) ──
+fred        = { version = "9", features = ["tokio-runtime"] }
+
+# ── Tracing / observability ──
+tracing                    = "0.1"
+tracing-subscriber         = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry      = "0.27"
+opentelemetry              = "0.27"
+opentelemetry-otlp         = "0.27"
+prometheus-client          = "0.22"
+
+# ── Config ──
+config      = "0.14"
+
+# ── Error handling ──
+anyhow      = "1"
+thiserror   = "1"
+
+# ── Async trait ──
+async-trait = "0.1"
+
+# ── Testing ──
+proptest    = "1"
+
+# ── Workspace crates ──
+types       = { path = "crates/types" }
+bridge      = { path = "crates/bridge" }
+agent-risk  = { path = "crates/agent-risk" }
+agent-bus   = { path = "crates/agent-bus" }
+pipeline    = { path = "crates/pipeline" }
+dashboard   = { path = "crates/dashboard" }
+api         = { path = "crates/api" }
+
+[profile.release]
+opt-level   = 3
+lto         = "thin"
+codegen-units = 1
+strip       = true
+
+[profile.dev]
+opt-level   = 0
+debug       = true

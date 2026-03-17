@@ -1,0 +1,36 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Dependencies
+node_modules/
+venv/
+env/
+
+# Environment & secrets
+.env*
+*.key
+*.pem
+secrets*
+credentials*
+
+# IDE & local
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary & runtime
+/tmp/
+*.db*
+*.log
+.cursor/
+
+# Large files that slow down indexing
+*.tar
+*.zip
+*.gz
+*.bz2
+coverage/

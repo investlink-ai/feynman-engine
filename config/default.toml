@@ -1,0 +1,69 @@
+# Feynman Capital — Engine Configuration
+# Default: live trading with dry_run=true (safe mode)
+
+[engine]
+mode = "live"
+dry_run = true
+grpc_port = 50051
+dashboard_port = 8080
+log_level = "info"
+
+[redis]
+url = "redis://redis:6379"
+max_connections = 10
+
+[database]
+url = "sqlite:///data/feynman.db"
+
+# ── Firm-level risk limits ──
+[risk.firm]
+max_gross_notional = 200000
+max_net_notional = 100000
+max_drawdown_pct = 5.0
+max_daily_loss = 5000
+max_open_orders = 50
+
+# ── Agent-level limits (per agent) ──
+[risk.agents.satoshi]
+allocated_capital = 50000
+max_position_notional = 25000
+max_gross_notional = 50000
+max_drawdown_pct = 3.0
+max_daily_loss = 1500
+allowed_instruments = ["BTC", "ETH"]
+allowed_venues = ["bybit"]
+
+# ── Instrument-level concentration limits ──
+[risk.instruments.BTC]
+max_net_qty = 10
+max_gross_qty = 20
+max_concentration_pct = 30.0
+
+[risk.instruments.ETH]
+max_net_qty = 100
+max_gross_qty = 200
+max_concentration_pct = 25.0
+
+# ── Venue-level counterparty limits ──
+[risk.venues.bybit]
+max_notional = 200000
+max_positions = 50
+
+# ── Prediction market limits ──
+[risk.prediction]
+max_total_notional = 20000
+max_per_market_notional = 5000
+max_pct_of_nav = 10.0
+max_unresolved_markets = 10
+
+# ── Venue Configuration ──
+[venues.bybit]
+testnet = false
+api_key = "${BYBIT_API_KEY}"
+api_secret = "${BYBIT_API_SECRET}"
+
+# ── Shutdown Policy ──
+[shutdown]
+drain_timeout_secs = 30
+cancel_on_exit = "leave_open"
+snapshot_on_exit = true

@@ -1,0 +1,26 @@
+[package]
+name = "feynman-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "feynman-engine"
+path = "src/main.rs"
+
+[dependencies]
+types.workspace = true
+bridge.workspace = true
+agent-risk.workspace = true
+agent-bus.workspace = true
+pipeline.workspace = true
+dashboard.workspace = true
+api.workspace = true
+
+tokio.workspace = true
+anyhow.workspace = true
+config.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
