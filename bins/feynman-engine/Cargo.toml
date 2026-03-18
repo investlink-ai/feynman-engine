@@ -12,11 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 types.workspace = true
-bridge.workspace = true
-agent-risk.workspace = true
-agent-bus.workspace = true
-pipeline.workspace = true
-dashboard.workspace = true
+risk.workspace = true
+bus.workspace = true
+gateway.workspace = true
+engine-core.workspace = true
+observability.workspace = true
 api.workspace = true
 
 tokio.workspace = true

@@ -20,9 +20,8 @@ You are editing code that evaluates trades or submits orders. Answer all questio
 6. **Per-agent isolation** — Do risk checks enforce per-agent budget limits, not just firm-level limits? One agent's loss must not reduce another's allocation.
 7. **Pipeline order preserved** — Does this change maintain Grouper → Sizing → Risk → ExecutionController sequence? Risk gate must remain before submission.
 8. **Explicit over implicit** — Are there any silent defaults, fallback chains, or `unwrap_or_default()`? Every code path must be explicit. No silent emulation of unsupported order types.
-9. **Sequencer ownership** — Does this code mutate business state (positions, firm book, risk limits, `LiveOrder` state)? If so, it must run inside the Sequencer task — not in a gRPC handler or adapter task behind a lock.
+9. **Sequencer ownership** — Does this code mutate business state (positions, firm book, risk limits)? If so, it must run inside the Sequencer task — not in a gRPC handler or adapter task behind a lock.
 10. **Bounded channels** — Are all new channels bounded with explicit capacity? No `mpsc::unbounded_channel()`.
-11. **Type-state pipeline** — Does this code submit an order to a venue? It must accept `PipelineOrder<Routed>`, not a raw order. Does it risk-check? It must accept `PipelineOrder<Validated>`. See DATA_MODEL.md §3.
 
 ## Invariants (never violate)
 

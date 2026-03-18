@@ -23,13 +23,13 @@ gantt
 
     section Phase 0: Scaffold
     Types + Risk + Bus stubs                :done, p0a, 2026-03-10, 7d
-    AgentRiskManager (7-point)              :active, p0b, 2026-03-17, 5d
+    AgentRiskManager (risk checks)          :active, p0b, 2026-03-17, 5d
     Redis Streams bus                       :p0c, after p0b, 4d
     Integration tests + CI green            :p0d, after p0c, 3d
 
     section Phase 1: Core Engine
-    Nautilus spike (3d go/no-go)            :crit, p1a, after p0d, 3d
-    Order type + Bridge (Signal → Order)    :p1b, after p1a, 5d
+    Order FSM + type-state lifecycle        :p1a, after p0d, 5d
+    Signal → Order bridge                   :p1b, after p1a, 5d
     Pipeline stages                         :p1c, after p1b, 5d
     Event journal (WAL)                     :p1d, after p1c, 3d
 
@@ -64,8 +64,8 @@ gantt
 | # | Task | Crate | Status | Exit Criteria |
 |---|------|-------|--------|--------------|
 | 0.1 | Domain types | `types` | ✅ Done | `cargo build -p types` passes, serde round-trip tests |
-| 0.2 | AgentRiskManager | `agent-risk` | 🚧 In Progress | All 7 MVP checks implemented, property tests pass |
-| 0.3 | Redis Streams client | `agent-bus` | ⏳ Pending | Publish → subscribe → ack round-trip, consumer group redelivery |
+| 0.2 | AgentRiskManager | `risk` | 🚧 In Progress | All risk checks implemented (universal + signal-specific), property tests pass |
+| 0.3 | Redis Streams client | `bus` | ⏳ Pending | Publish → subscribe → ack round-trip, consumer group redelivery |
 | 0.4 | Integration tests | `tests/` | ⏳ Pending | 7 risk tests + 3 bus tests pass |
 | 0.5 | Docker smoke test | `docker/` | ⏳ Pending | `docker compose up` starts engine + Redis, health check passes |
 | 0.6 | CI green | `.github/` | ⏳ Pending | `cargo test` + `clippy` + `fmt` all pass |
@@ -83,33 +83,22 @@ See DATA_MODEL.md §3 for the Order type definition.
 ## Phase 1: Core Engine
 
 **Duration:** 3 weeks
-**Risk:** HIGH (Nautilus spike is go/no-go)
+**Risk:** Medium
 **Gate Alignment:** Gate 1 (50 closed trades in trading bot)
 
-### 1.1 Nautilus Spike (3 days, CRITICAL)
+> **Decision (2026-03-17):** NautilusTrader Rust crates were evaluated and rejected.
+> The engine is fully custom Rust with per-exchange client crates for venue connectivity.
+> See `HYBRID_ENGINE_ARCHITECTURE.md` for the evaluation record.
 
-Test whether NautilusTrader Rust crates work without Python:
+### 1.1 Order FSM + Type-State Lifecycle (5 days)
 
-```bash
-# Minimal test: can we create a Nautilus order from Rust?
-cargo new --lib nautilus-spike
-# Add nautilus-model, nautilus-core as dependencies
-# Try: create Order, Position, run through FSM transitions
-# No Python feature flags enabled
-```
+Implement the order lifecycle state machine with compile-time enforcement of valid transitions (type-state pattern from CORE_ENGINE_DESIGN.md §4.10):
 
-**Go criteria:**
-- Nautilus types compile in pure Rust
-- Order state machine transitions work
-- No hidden Python dependency in critical path
+- `Draft → Validated → Approved → Submitted → Open → Filled/Cancelled/Expired`
+- Invalid transitions are compile errors
+- `CanonicalOrder` with unified order model across all venues
 
-**No-go fallback options (in order of preference):**
-1. **Partial cherry-pick**: Copy only `nautilus-model` types, skip other crates
-2. **PyO3 bridge**: Accept Python dependency for backtest engine only
-3. **Custom build**: Implement order FSM and venue adapters ourselves (add 6-8 weeks)
-4. **Fork**: Fork nautilus-model, strip Python bindings
-
-### 1.2 Order Type + Bridge
+### 1.2 Signal → Order Bridge
 
 Implement `Order` type (from DATA_MODEL.md §3) and the bridge that converts `Signal → Order`:
 
@@ -262,7 +251,7 @@ If anything goes wrong during or after cutover:
 **Risk:** Medium
 **Gate Alignment:** Gate 2 (30d positive P&L)
 
-- Integrate `nautilus-backtest` (or custom if spike failed)
+- Custom backtest engine with `SimulatedVenue` adapter and `SimulatedClock`
 - Replay historical data through the same pipeline
 - Verify same strategy code works in all three modes
 - Backtest framework for new agent strategy development
@@ -296,7 +285,7 @@ Each venue follows the same pattern:
 
 | Risk | Impact | Likelihood | Mitigation |
 |------|--------|-----------|-----------|
-| Nautilus Rust-only doesn't work | +6-8 weeks to Phase 1 | Medium | Phase 1.1 spike resolves this early |
+| ~~Nautilus Rust-only doesn't work~~ | ~~+6-8 weeks~~ | **Resolved** | Rejected 2026-03-17. Custom Rust engine chosen. |
 | Shadow mode reveals edge cases | +1-2 weeks to Phase 3 | High | Budget 3 weeks for shadow mode |
 | Bybit API changes during development | Rework venue adapter | Low | Pin API version, use testnet |
 | Performance regression vs Node.js | Latency increase | Very Low | Rust is faster; benchmark early |

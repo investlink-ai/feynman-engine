@@ -61,11 +61,11 @@ A Rust execution engine for Feynman Capital. Receives signals/orders from strate
 ```
 types (no deps except std + serde)
   ↓
-agent-risk, agent-bus (depend only on types)
+risk, bus (depend only on types)
   ↓
-bridge, pipeline (depend on types + risk/bus)
+gateway, engine-core (depend on types + risk/bus)
   ↓
-dashboard, api (depend on pipeline)
+observability, api (depend on engine-core)
   ↓
 feynman-engine binary (orchestrates all)
 ```
@@ -79,7 +79,7 @@ Signal/Order (from gRPC)
   → Grouper (coalesce by instrument)
   → Detector (identify opportunity)
   → Sizing (conviction → notional → qty)
-  → Risk (AgentRiskManager — 7-point gate)
+  → Risk (AgentRiskManager — see §6)
   → ExecutionController (route to venue)
   → Fill (from venue)
   → Position update (after fill confirmation only)
@@ -93,6 +93,8 @@ Signal/Order (from gRPC)
 - Venue adapter tasks — one per venue, independent, own their WebSocket/rate limiter
 - Background tasks — consistency checker, snapshot writer, bus bridge, metrics
 - All channels bounded with explicit capacity. No `mpsc::unbounded_channel()`.
+- **Priority queueing:** Two channels — high-priority (fills, HaltAll, reconciliation, `urgency=Immediate`) and normal-priority (orders, batches, snapshots). Biased `tokio::select!` drains high before normal.
+- **Poison message handling:** `catch_unwind` around every Sequencer command. Single panic → logged + alerted, command dropped. >3 panics in 60s → `HaltAll`.
 
 See `docs/CORE_ENGINE_DESIGN.md` §15 for full concurrency architecture.
 
@@ -101,10 +103,44 @@ See `docs/CORE_ENGINE_DESIGN.md` §15 for full concurrency architecture.
 | Mode | Venues | Clock | State | Config |
 |------|--------|-------|-------|--------|
 | **Live** | Real adapters | Wall clock | Persisted | `FEYNMAN_MODE=live` |
-| **Paper** | Real data, simulated fills | Wall clock | Persisted | `FEYNMAN_MODE=paper` |
+| **Paper** | Real WebSocket orderbook, local `FillSimulator` | Wall clock | Persisted | `FEYNMAN_MODE=paper` |
 | **Backtest** | `SimulatedVenue` | `SimulatedClock` (via `AdvanceClock` RPC) | In-memory | `FEYNMAN_MODE=backtest` |
 
 Same binary, same EngineCore, same risk pipeline. Mode is deployment config.
+
+### Risk Layers
+
+```
+Layer 0 — Circuit breakers (compiled-in, not hot-reloadable)
+  11 specific breakers: per-order limits, loss halts, rate limits,
+  venue errors, dry-run guard, queue backpressure.
+  See CORE_ENGINE_DESIGN.md §7.1 (CB-1 through CB-11).
+
+Layer 1 — AgentRiskManager (programmatic, configurable per-agent)
+  Universal + signal-specific checks (see §6 below).
+
+Layer 2 — LLM risk agent (future)
+Layer 3 — Human CIO override (future)
+```
+
+### Startup & Shutdown
+
+**Startup reconciliation** (§9.2.1): 5-step blocking sequence before accepting commands — restore snapshot → connect venues → reconcile (positions, orders, fills, balances) → snapshot → accept. Health returns `starting` during this phase.
+
+**Graceful shutdown** (§8.7): 8-step ordered — stop ingress → drain sequencer → cancel/leave orders → drain fills → flush journal → snapshot → close connections → exit. Three cancel policies: `LeaveOpen` (restarts), `CancelAll` (emergency), `CancelByAgent` (selective).
+
+### Batch Semantics
+
+`atomic=true` only allowed for **same-venue** batches. Cross-venue batches use best-effort (`atomic=false`). No automatic compensating cancels — strategy handles partial execution. See `CORE_ENGINE_DESIGN.md` §8.8.
+
+### Authentication Boundary
+
+Phase 0-1: shared API token. Phase 2+: per-agent tokens with `AgentPermissions`. Phase 3+: mTLS. Auth checked in gRPC interceptor, never in hot path. See `CORE_ENGINE_DESIGN.md` §14.8.
+
+### Config Hot-Reload
+
+**Hot-reloadable (via RPC):** Agent risk limits, instrument limits, pause/resume, fee tiers.
+**Requires restart:** Circuit breaker thresholds, venue adapters, channel capacities, `FEYNMAN_MODE`, auth tokens, journal backend. Restart friction is intentional — forces review before financial harm.
 
 ---
 
@@ -255,24 +291,253 @@ No `mpsc::unbounded_channel()` in production code. All channels have explicit ca
 
 ### Error Handling
 
-- Return `anyhow::Result<T>` from all fallible functions
-- Use `anyhow::bail!()` / `anyhow::ensure!()` for guard conditions
-- Never `unwrap()` in non-test code without a doc comment explaining why it's safe
+**Library crates** (`risk`, `bus`, `gateway`, `engine-core`, `observability`, `api`): define a crate-specific error enum with `thiserror`. This gives structured, matchable errors to callers.
+
+```rust
+// In crates/risk/src/lib.rs — thiserror for library errors
+#[derive(Debug, thiserror::Error)]
+pub enum RiskError {
+    #[error("position {notional} exceeds 5% NAV limit {limit}")]
+    PositionLimitExceeded { notional: Decimal, limit: Decimal },
+    #[error("agent {agent} has no active allocation")]
+    UnknownAgent { agent: AgentId },
+    #[error("circuit breaker {breaker} is tripped: {reason}")]
+    CircuitBreakerTripped { breaker: String, reason: String },
+}
+```
+
+**Binary and application code** (`bins/feynman-engine`, integration tests): use `anyhow::Result<T>`, `bail!`, `ensure!`. Never `Box<dyn Error>`.
+
+```rust
+// In risk-touching code — guard conditions
+anyhow::ensure!(
+    conviction >= Decimal::ZERO && conviction <= Decimal::ONE,
+    "conviction must be 0.0–1.0, got {}", conviction
+);
+```
+
+- Never `unwrap()` in non-test code without a doc comment explaining why it is safe
 - Prefer exhaustive `match` over `if let` with silent else
+- `#[must_use]` on every function returning `RiskApproval`, `OrderAck`, or `Result`
+
+```rust
+#[must_use]
+pub fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, RiskError> { … }
+```
 
 ### Code Style
 
 - Edition 2021, stable Rust (1.82+)
 - `cargo fmt` enforced in CI
-- `cargo clippy -- -D warnings` enforced in CI
+- `cargo clippy --workspace -- -D warnings` enforced in CI
 - Async: tokio with `#[tokio::main]` / `#[tokio::test]`
+- Clippy: enable `clippy::pedantic` for all financial crates. Add to `Cargo.toml`:
+
+```toml
+[lints.clippy]
+pedantic = "warn"
+# silence noisy pedantic lints that don't apply here:
+module_name_repetitions = "allow"
+```
+
+### Newtype Pattern
+
+Use newtypes everywhere an identifier could be confused with another:
+
+```rust
+// ✓ Correct — distinct types prevent mixing OrderId with AgentId
+pub struct OrderId(pub String);
+pub struct AgentId(pub String);
+
+// Always derive these so newtypes work ergonomically:
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OrderId(pub String);
+
+// Implement Display for human-readable output
+impl fmt::Display for OrderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
+}
+```
+
+Never use raw `String` where a domain type exists. No `String` parameters that accept order IDs, agent IDs, or venue IDs.
+
+### Type-State Pipeline + Runtime Venue FSM
+
+The order lifecycle uses a **hybrid design** (see DATA_MODEL.md §3 for full specification):
+
+1. **Type-state pipeline** (pre-submission) — compile-time safety where it matters most
+2. **Runtime enum FSM** (post-submission) — flexibility for event-driven venue lifecycle
+
+```rust
+// ── Pipeline: type-state markers (zero-cost, sealed) ──
+pub struct Draft;        // just created
+pub struct Validated;    // passed stateless validation
+pub struct RiskChecked;  // passed risk gate, carries RiskProof
+pub struct Routed;       // venue selected, ready to submit
+
+pub struct PipelineOrder<S: PipelineStage> {
+    pub id: OrderId,
+    pub agent: AgentId,
+    pub qty: Decimal,
+    pub price: Option<Decimal>,
+    // ... (see DATA_MODEL.md §3.1)
+    _stage: PhantomData<S>,
+}
+
+// Each transition consumes self → invalid transitions don't compile
+impl PipelineOrder<Draft> {
+    pub fn validate(self, caps: &VenueCapabilities) -> Result<PipelineOrder<Validated>> { … }
+}
+impl PipelineOrder<Validated> {
+    pub fn risk_check(self, ...) -> RiskOutcome { … }
+    // Returns: Approved(PipelineOrder<RiskChecked>), Resize(PipelineOrder<Draft>), or Rejected
+}
+impl PipelineOrder<RiskChecked> {
+    pub fn route(self, ...) -> Result<PipelineOrder<Routed>> { … }
+}
+impl PipelineOrder<Routed> {
+    /// Boundary: consumes pipeline order, produces LiveOrder with runtime FSM.
+    pub async fn submit(self, adapter: &dyn VenueAdapter) -> Result<LiveOrder> { … }
+}
+
+// ── Venue lifecycle: runtime FSM (event-driven, exhaustive match) ──
+pub struct LiveOrder {
+    pub id: OrderId,
+    pub venue_order_id: VenueOrderId,
+    pub state: VenueState,       // runtime enum
+    pub fills: Vec<Fill>,
+    pub risk_proof: RiskProof,   // proof carried from pipeline
+    // ...
+}
+
+pub enum VenueState {
+    Submitted,
+    Accepted { accepted_at: DateTime<Utc> },
+    Triggered { triggered_at: DateTime<Utc> },
+    PartiallyFilled { summary: FillSummary },
+    Filled { summary: FillSummary, filled_at: DateTime<Utc> },
+    VenueRejected { reason: String, rejected_at: DateTime<Utc> },
+    Cancelled { reason: CancelReason, summary: FillSummary, cancelled_at: DateTime<Utc> },
+    Expired { summary: FillSummary, expired_at: DateTime<Utc> },
+}
+
+// Transitions validated at runtime — no wildcard match on VenueState
+impl VenueState {
+    pub fn on_fill(self, fill: &Fill, original_qty: Decimal) -> Result<Self, InvalidTransition> { … }
+    pub fn on_cancel(self, reason: CancelReason, at: DateTime<Utc>) -> Result<Self, InvalidTransition> { … }
+    // ... (see DATA_MODEL.md §3.8)
+}
+```
+
+### Conversion Traits
+
+Use `From`/`TryFrom` for all type conversions. Never standalone `to_foo()` / `from_foo()` functions.
+
+```rust
+impl TryFrom<SignalProto> for Signal {
+    type Error = anyhow::Error;
+    fn try_from(proto: SignalProto) -> Result<Self> {
+        Ok(Signal {
+            conviction: Decimal::from_str(&proto.conviction)
+                .map_err(|e| anyhow::anyhow!("invalid conviction: {e}"))?,
+            // …
+        })
+    }
+}
+```
+
+### Trait Design
+
+**Fine-grained, single-responsibility traits:**
+
+```rust
+pub trait RiskEvaluator: Send + Sync {
+    fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, RiskError>;
+}
+```
+
+**Static dispatch (`impl Trait`) in hot paths; dynamic dispatch (`dyn Trait`) at wiring boundaries:**
+
+```rust
+// ✓ Hot path — zero-cost, monomorphised
+fn check_position<R: RiskEvaluator>(evaluator: &R, order: &CanonicalOrder) { … }
+
+// ✓ Wiring boundary — runtime polymorphism acceptable
+pub struct Sequencer {
+    risk: Box<dyn RiskGate>,
+    bus: Box<dyn MessageBus>,
+}
+```
+
+**Sealed traits** for safety-critical interfaces that must not be implemented outside this crate:
+
+```rust
+// In crates/risk/src/lib.rs
+mod private { pub trait Sealed {} }
+
+/// Safety-critical. External crates cannot implement this.
+pub trait CircuitBreaker: private::Sealed + Send + Sync { … }
+
+// Only our implementation gets the Sealed bound
+impl private::Sealed for HardcodedCircuitBreaker {}
+```
+
+### Module Privacy
+
+- `pub` only for items that are part of the crate's contract
+- `pub(crate)` for items shared across modules within a crate
+- `pub(super)` for items only needed in the parent module
+- No `pub` on internal helpers
+
+```rust
+pub struct RiskGateImpl { … }          // public: other crates use this
+pub(crate) fn compute_max_loss(…) {}   // internal helper
+fn validate_limits_internal(…) {}      // module-private
+```
+
+### Builder Pattern for Complex Configs
+
+Any struct with more than 3 optional fields uses a builder:
+
+```rust
+#[derive(Debug, Default)]
+pub struct RiskLimitsBuilder {
+    max_gross_notional: Option<Decimal>,
+    max_drawdown_pct: Option<Decimal>,
+    per_agent: HashMap<AgentId, AgentRiskLimits>,
+}
+
+impl RiskLimitsBuilder {
+    pub fn max_gross_notional(mut self, v: Decimal) -> Self { self.max_gross_notional = Some(v); self }
+    pub fn build(self) -> Result<RiskLimits> {
+        Ok(RiskLimits {
+            max_gross_notional: self.max_gross_notional
+                .ok_or_else(|| anyhow::anyhow!("max_gross_notional is required"))?,
+            // …
+        })
+    }
+}
+```
+
+### Avoid Clone in Hot Paths
+
+The Sequencer processes orders synchronously. No `.clone()` inside the main evaluation loop.
+
+```rust
+// ✓ Borrow, don't clone
+fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, RiskError> { … }
+
+// ✗ Avoid in hot path — allocates
+fn evaluate(&self, order: CanonicalOrder) -> Result<RiskApproval, RiskError> { … }
+```
+
+For data that must be shared across async tasks (fills, snapshots), clone once at the boundary and move ownership.
 
 ### Imports
 
 ```rust
 // Standard library
 use std::collections::HashMap;
-use std::sync::Arc;
 
 // Third-party crates
 use anyhow::Result;
@@ -280,31 +545,17 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 
-// Local crates
-use feynman_types::{Order, AgentAllocation, Signal};
-use crate::risk_manager::AgentRiskManager;
-```
-
-### Trait Design
-
-Fine-grained traits for capabilities:
-
-```rust
-pub trait RiskEvaluator: Send + Sync {
-    fn evaluate(&self, order: &Order) -> Result<RiskApproval>;
-}
-
-pub trait MessageBus: Send + Sync {
-    async fn publish(&self, topic: &str, payload: &[u8]) -> Result<MessageId>;
-    async fn subscribe(&self, topic: &str) -> Result<Receiver<Message>>;
-}
+// Local crates (use crate name, not `crate::`)
+use types::{AgentId, OrderId, Signal};
+use risk::{RiskGate, RiskApproval};
 ```
 
 ### Testing
 
 - Unit tests in the same file (`#[cfg(test)]` module)
 - Integration tests in `tests/integration/`
-- Property tests marked with `#[ignore]` (run via `cargo test -- --ignored`)
+- Property tests with `proptest`, run via `cargo test -- --ignored`
+- No production code in `#[cfg(test)]` — test helpers go in `#[cfg(any(test, feature = "test-utils"))]`
 
 ---
 
@@ -327,17 +578,30 @@ pub trait MessageBus: Send + Sync {
 
 ---
 
-## 6. Risk Checks (MVP 7-Point)
+## 6. Risk Checks
 
-1. **Stop loss defined?** — Signal must have `stop_loss` field
-2. **Risk/reward >= 2:1?** — `(tp - entry) / (entry - sl) >= 2`
-3. **Position <= 5% NAV?** — `notional <= 0.05 * firm_book.total_nav`
-4. **Account risk <= 1% NAV?** — `max_loss <= 0.01 * firm_book.total_nav`
-5. **Leverage within limits?** — `gross_notional / free_capital <= max_leverage`
-6. **Drawdown < 15%?** — `(realized + unrealized) / allocated >= -0.15`
-7. **Cash >= 20% NAV?** — `free_capital / total_nav >= 0.20`
+The risk gate evaluates differently depending on the ingress path. Universal checks apply to all order paths. Signal-specific checks apply only to `SubmitSignal` (LLM agents), where the engine owns sizing and the agent doesn't manage its own exits.
 
-Plus per-agent, per-instrument, per-venue isolation.
+### Universal checks (all paths: `SubmitSignal`, `SubmitOrder`, `SubmitBatch`)
+
+1. **Position <= 5% NAV?** — `notional <= 0.05 * firm_book.total_nav`
+2. **Account risk <= 1% NAV?** — `max_loss <= 0.01 * firm_book.total_nav`. If `stop_loss` is present: `max_loss = qty * |entry - stop_loss|`. If absent: `max_loss = notional` (worst case).
+3. **Leverage within limits?** — `gross_notional / free_capital <= max_leverage`
+4. **Drawdown < 15%?** — `(realized + unrealized) / allocated >= -0.15`
+5. **Cash >= 20% NAV?** — `free_capital / total_nav >= 0.20`
+
+### Signal-specific checks (`SubmitSignal` only)
+
+6. **Stop loss defined?** — Signal must have `stop_loss` field. Required because the engine sizes the position and needs a defined exit to calculate risk.
+7. **Risk/reward >= 2:1?** — `(tp - entry) / (entry - sl) >= 2`. Only evaluated when both `stop_loss` and `take_profit` are present.
+
+### Always enforced (all paths, not numbered — these are structural)
+
+- Per-agent budget isolation (agent's order cannot exceed agent's free capital)
+- Per-instrument concentration limits
+- Per-venue exposure limits
+- Agent allowed instruments/venues whitelist
+- Circuit breakers (Layer 0, before risk gate)
 
 ---
 
@@ -348,22 +612,25 @@ Full definition: `proto/feynman/engine/v1/service.proto`
 | Category | RPCs |
 |----------|------|
 | **Signal ingress** | `SubmitSignal` |
-| **Order ingress** | `SubmitOrder`, `SubmitBatch` |
+| **Order ingress** | `SubmitOrder`, `SubmitBatch` (`atomic=true` same-venue only) |
 | **Order management** | `CancelOrder`, `AmendOrder`, `GetOrder`, `ListOpenOrders` |
+| **History** | `GetFillHistory`, `GetOrderHistory` (reconnect and audit) |
 | **Portfolio** | `GetFirmBook`, `GetAgentPositions`, `GetAgentAllocation` |
 | **Risk** | `AdjustAgentLimits`, `PauseAgent`, `ResumeAgent`, `HaltAll`, `GetRiskSnapshot` |
 | **Agent registration** | `RegisterAgent` |
-| **Streams** | `SubscribeFills`, `SubscribeEvents` |
+| **Streams** | `SubscribeFills` (with `since_fill_seq` for lossless reconnect), `SubscribeEvents` |
 | **Backtest control** | `AdvanceClock`, `GetEngineMode` |
 | **System** | `GetVenueStatus`, `GetEngineHealth` |
 
+**Fill reconnect protocol:** Fills carry a monotonic `fill_seq`. On reconnect, pass `since_fill_seq=N` to `SubscribeFills` — engine replays all fills with `seq > N` before switching to live stream.
+
 ---
 
-## 8. Pre-Merge Checklist
+## 8. Pre-Merge Checklist (Risk/Execution Code)
 
 Before any change to risk/execution code is merged:
 
-- [ ] All 7 MVP risk checks pass for orders
+- [ ] All universal risk checks pass for orders; signal-specific checks pass for signals
 - [ ] Property tests pass (no panic on valid inputs)
 - [ ] No `unwrap()` or `panic!()` without doc comment
 - [ ] No `f64` in financial math
@@ -376,6 +643,9 @@ Before any change to risk/execution code is merged:
 - [ ] No `Arc<Mutex<T>>` or `Arc<RwLock<T>>` on business state
 - [ ] No `mpsc::unbounded_channel()`
 - [ ] No `unwrap_or_default()` in financial logic
+- [ ] New channels use bounded capacity with explicit size
+- [ ] State mutations run inside Sequencer (not gRPC handler or adapter)
+- [ ] Event schema changes bump `schema_version` if modifying existing variants
 - [ ] `/hostile-review` passed
 
 ```bash
@@ -384,7 +654,19 @@ make check
 
 ---
 
-## 9. Key Documents
+## 9. Shadow Mode (Phase 2)
+
+Rust engine runs alongside Node.js executor without executing orders (`dry_run=true` always). Signal splitter forwards signals to both systems. Divergence comparator checks: risk gate agreement, approval rate, sizing, routing, state, latency, error rate. Exit criteria (all true for 7 consecutive days) before cutover. See `CORE_ENGINE_DESIGN.md` §14.7.
+
+---
+
+## 10. Alerting (14 Triggers)
+
+14 specific alerts (A-1 through A-14) at Critical/Emergency/Warning severity. Key alerts required before Phase 1 live trading: reconciliation divergence (A-1), venue disconnect (A-5), HaltAll triggered (A-10), daily P&L threshold (A-12). Full list in `CORE_ENGINE_DESIGN.md` §13.6.
+
+---
+
+## 11. Key Documents
 
 | Document | What |
 |----------|------|

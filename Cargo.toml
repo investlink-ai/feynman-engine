@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "crates/types",
-    "crates/bridge",
-    "crates/agent-risk",
-    "crates/agent-bus",
-    "crates/pipeline",
-    "crates/dashboard",
+    "crates/risk",
+    "crates/bus",
+    "crates/gateway",
+    "crates/engine-core",
+    "crates/observability",
     "crates/api",
     "bins/feynman-engine",
 ]
@@ -68,13 +68,13 @@ async-trait = "0.1"
 proptest    = "1"
 
 # ── Workspace crates ──
-types       = { path = "crates/types" }
-bridge      = { path = "crates/bridge" }
-agent-risk  = { path = "crates/agent-risk" }
-agent-bus   = { path = "crates/agent-bus" }
-pipeline    = { path = "crates/pipeline" }
-dashboard   = { path = "crates/dashboard" }
-api         = { path = "crates/api" }
+types         = { path = "crates/types" }
+risk          = { path = "crates/risk" }
+bus           = { path = "crates/bus" }
+gateway       = { path = "crates/gateway" }
+engine-core   = { path = "crates/engine-core" }
+observability = { path = "crates/observability" }
+api           = { path = "crates/api" }
 
 [profile.release]
 opt-level   = 3

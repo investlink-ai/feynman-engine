@@ -1,7 +1,7 @@
-//! Feynman-specific types that extend NautilusTrader
+//! Core types for the Feynman Capital execution engine.
 //!
-//! Types here are custom to our agent orchestration model. NautilusTrader provides
-//! the core trading types (Order, Position, Event); we add agent-centric wrappers.
+//! Identifiers, signals, positions, risk limits, and portfolio structures.
+//! All financial math uses `rust_decimal::Decimal` — no `f64` for money.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -85,6 +85,8 @@ pub struct VenueRiskLimits {
     pub venue: VenueId,
     pub max_notional: Decimal,
     pub max_positions: u32,
+    /// Max percentage of firm NAV on this venue (concentration risk).
+    pub max_pct_of_nav: Decimal,
 }
 
 /// Prediction market exposure caps.

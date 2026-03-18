@@ -16,7 +16,6 @@ graph TD
         RE[RiskEvaluator]
         MB[MessageBus]
         JE[EventJournal]
-        PS[PipelineStage]
     end
 
     subgraph Impl["Implementations"]
@@ -24,7 +23,6 @@ graph TD
         VA --> PAPER[PaperAdapter]
         VA --> SIM[SimulatedAdapter]
         RE --> ARM[AgentRiskManager]
-        RE --> NR[NautilusRisk<br/>future]
         MB --> REDIS[RedisBus]
         MB --> MEM[InMemoryBus<br/>testing]
         JE --> SQLJ[SqliteJournal]
@@ -42,15 +40,21 @@ The abstraction over all exchange interactions. One implementation per venue.
 /// Contract for all venue interactions.
 /// Implementations handle venue-native API translation, authentication,
 /// rate limiting, and WebSocket management.
+///
+/// Accepts `PipelineOrder<Routed>` — an order that has passed validation,
+/// risk checks, and routing. The type system guarantees these preconditions.
+/// See DATA_MODEL.md §3 for the full order lifecycle.
 #[async_trait]
 pub trait VenueAdapter: Send + Sync {
     /// Unique identifier for this venue (e.g., "bybit", "binance").
     fn venue_id(&self) -> &VenueId;
 
-    /// Submit an order to the venue. Returns venue's order ID on success.
+    /// Submit an order to the venue. Accepts a PipelineOrder<Routed> which
+    /// has already passed validation and risk checks (enforced by type system).
+    /// Returns venue's order ID on success.
     /// Must check dryRun before actually submitting.
     /// Must be idempotent on `order.client_order_id`.
-    async fn submit_order(&self, order: &Order) -> Result<VenueOrderAck>;
+    async fn submit_order(&self, order: &PipelineOrder<Routed>) -> Result<VenueOrderAck>;
 
     /// Cancel an order by its venue order ID.
     async fn cancel_order(&self, venue_order_id: &VenueOrderId) -> Result<CancelAck>;
@@ -72,11 +76,11 @@ pub trait VenueAdapter: Send + Sync {
     /// Get account balance.
     async fn get_balance(&self) -> Result<VenueBalance>;
 
-    /// Subscribe to fill events. Returns a stream of fills as they occur.
-    async fn subscribe_fills(&self) -> Result<mpsc::UnboundedReceiver<VenueFill>>;
+    /// Subscribe to fill events. Bounded channel — capacity set per adapter.
+    fn subscribe_fills(&self) -> mpsc::Receiver<VenueFill>;
 
-    /// Subscribe to order status updates.
-    async fn subscribe_order_updates(&self) -> Result<mpsc::UnboundedReceiver<OrderStatusUpdate>>;
+    /// Subscribe to order status updates. Bounded channel.
+    fn subscribe_order_updates(&self) -> mpsc::Receiver<OrderStatusUpdate>;
 
     /// Health check. Returns connection status and latency.
     async fn health_check(&self) -> VenueHealth;
@@ -132,22 +136,24 @@ Not all venues support all features. Use marker traits:
 
 ```rust
 /// Venue supports amending orders in-place (Bybit, Binance).
+/// Gateway checks `adapter.as_amendable().is_some()` before attempting amend.
 pub trait AmendableVenue: VenueAdapter {
-    async fn amend_order(&self, ...) -> Result<VenueOrderAck>;
+    async fn amend_order(&self, venue_order_id: &VenueOrderId, amend: &OrderAmend)
+        -> Result<VenueOrderAck>;
 }
 
-/// Venue supports WebSocket streaming (most CEXs).
+/// Venue supports WebSocket streaming (most CEXs). All channels bounded.
 pub trait StreamingVenue: VenueAdapter {
-    async fn subscribe_orderbook(&self, instrument: &InstrumentId, depth: u32)
-        -> Result<mpsc::UnboundedReceiver<OrderBookUpdate>>;
-    async fn subscribe_trades(&self, instrument: &InstrumentId)
-        -> Result<mpsc::UnboundedReceiver<PublicTrade>>;
+    fn subscribe_orderbook(&self, instrument: &InstrumentId, depth: u32)
+        -> mpsc::Receiver<OrderBookUpdate>;
+    fn subscribe_trades(&self, instrument: &InstrumentId)
+        -> mpsc::Receiver<PublicTrade>;
 }
 
 /// Venue supports funding rate queries (perpetual venues).
 pub trait FundingVenue: VenueAdapter {
     async fn get_funding_rate(&self, instrument: &InstrumentId) -> Result<FundingRate>;
-    async fn subscribe_funding(&self) -> Result<mpsc::UnboundedReceiver<FundingRate>>;
+    fn subscribe_funding(&self) -> mpsc::Receiver<FundingRate>;
 }
 ```
 
@@ -157,64 +163,67 @@ pub trait FundingVenue: VenueAdapter {
 
 Pure, synchronous, deterministic risk evaluation. No I/O.
 
+Accepts `PipelineOrder<Validated>` — an order that has already passed stateless validation. The type system prevents evaluating unvalidated orders. Returns a `RiskOutcome` that either advances the order to `RiskChecked` or rejects it.
+
 ```rust
 /// Risk evaluation contract. Implementations must be deterministic:
 /// same inputs always produce the same output.
+///
+/// Accepts PipelineOrder<Validated> (stateless validation already passed).
+/// Returns RiskOutcome: Approved (→ PipelineOrder<RiskChecked>), Resize
+/// (→ new PipelineOrder<Draft>), or Rejected (→ RejectedOrder).
 pub trait RiskEvaluator: Send + Sync {
     /// Evaluate an order against risk limits and portfolio state.
-    /// Returns approval with optional resizing, or a list of violations.
+    /// Type-safe: only validated orders can be risk-checked.
     fn evaluate(
         &self,
-        order: &Order,
+        order: PipelineOrder<Validated>,
         agent_limits: &AgentRiskLimits,
         firm_book: &FirmBook,
-    ) -> RiskDecision;
+    ) -> RiskOutcome;
 }
 
-/// Result of risk evaluation. An order is either approved (possibly resized)
-/// or rejected with specific violations.
-pub enum RiskDecision {
-    /// Order approved as-is.
-    Approved,
-    /// Order approved but resized to fit within limits.
-    Resized {
+/// Result of risk evaluation. Three outcomes — not two.
+/// See DATA_MODEL.md §3.2 for the full type definitions.
+pub enum RiskOutcome {
+    /// Order approved as-is. Carries proof and the advanced order.
+    Approved(PipelineOrder<RiskChecked>, RiskProof),
+    /// Order must be resized. Returns a new Draft with adjusted qty.
+    /// Caller must re-validate and re-risk-check the resized order.
+    Resize {
+        resized: PipelineOrder<Draft>,
         original_notional: Decimal,
         approved_notional: Decimal,
         reason: String,
     },
     /// Order rejected. Contains all violations found (not just the first).
-    Rejected {
-        violations: Vec<RiskViolation>,
-    },
+    Rejected(RejectedOrder),
 }
 ```
 
-### MVP 7-Point Checklist (AgentRiskManager)
+### Risk Checklist (AgentRiskManager)
 
 The first `RiskEvaluator` implementation. Pure arithmetic, zero latency.
+Path-aware: universal checks apply to all order paths; signal-specific checks
+apply only to `SubmitSignal` (where the engine owns sizing).
 
 ```rust
-/// The 7 mandatory checks, in order. All must pass for approval.
-/// If a check fails as "soft" (e.g., size too large), the order may be
-/// resized rather than rejected.
-pub struct MvpRiskChecklist;
+/// Risk checks split by ingress path.
+/// Universal checks run on every order. Signal-specific checks only on SubmitSignal.
+pub struct RiskChecklist;
 
-impl MvpRiskChecklist {
-    /// Check 1: Signal must define a stop loss.
-    pub fn check_stop_loss_defined(order: &Order) -> CheckResult;
+impl RiskChecklist {
+    // ── Universal checks (all paths: SubmitSignal, SubmitOrder, SubmitBatch) ──
 
-    /// Check 2: Risk/reward ratio >= 2:1.
-    /// (take_profit - entry) / (entry - stop_loss) >= 2.0
-    pub fn check_risk_reward(order: &Order) -> CheckResult;
-
-    /// Check 3: Position notional <= 5% of total NAV.
+    /// Check 1: Position notional <= 5% of total NAV.
     pub fn check_position_size(order: &Order, firm_book: &FirmBook) -> CheckResult;
 
-    /// Check 4: Max loss on this position <= 1% of total NAV.
-    /// Max loss = qty * |entry - stop_loss|
+    /// Check 2: Max loss on this position <= 1% of total NAV.
+    /// If stop_loss present: max_loss = qty * |entry - stop_loss|
+    /// If stop_loss absent: max_loss = notional (worst case)
     pub fn check_account_risk(order: &Order, firm_book: &FirmBook) -> CheckResult;
 
-    /// Check 5: Total leverage within agent limits.
+    /// Check 3: Total leverage within agent limits.
     /// gross_notional / allocated_capital <= max_leverage
     pub fn check_leverage(
         order: &Order,
@@ -222,13 +231,24 @@ impl MvpRiskChecklist {
         current_gross: Decimal,
     ) -> CheckResult;
 
-    /// Check 6: Agent drawdown < 15%.
-    /// (realized_pnl + unrealized_pnl) / allocated_capital > -0.15
+    /// Check 4: Agent drawdown within threshold.
+    /// (realized_pnl + unrealized_pnl) / allocated_capital > -max_drawdown_pct
     pub fn check_drawdown(agent_allocation: &AgentAllocation) -> CheckResult;
 
-    /// Check 7: Free capital >= 20% of total NAV after this order.
+    /// Check 5: Free capital >= 20% of total NAV after this order.
     /// (firm_book.free_capital - order.notional) / firm_book.total_nav >= 0.20
     pub fn check_cash_reserve(order: &Order, firm_book: &FirmBook) -> CheckResult;
+
+    // ── Signal-specific checks (SubmitSignal only — engine owns sizing) ──
+
+    /// Check 6: Signal must define a stop loss.
+    /// Required because the engine needs a defined exit to calculate position size.
+    /// NOT required for SubmitOrder/SubmitBatch (strategies manage their own exits).
+    pub fn check_stop_loss_defined(signal: &Signal) -> CheckResult;
+
+    /// Check 7: Risk/reward ratio >= 2:1 (when both stop_loss and take_profit present).
+    /// (take_profit - entry) / (entry - stop_loss) >= 2.0
+    pub fn check_risk_reward(signal: &Signal) -> CheckResult;
 }
 
 pub enum CheckResult {
@@ -245,7 +265,7 @@ graph TD
     ORDER[Incoming Order]
 
     ORDER --> L0[L0: Circuit Breakers<br/>Compiled limits, zero-cost<br/>max order size, halt flag]
-    L0 -->|pass| L1[L1: AgentRiskManager<br/>7-point MVP + per-agent isolation<br/>Deterministic, hot-reloadable config]
+    L0 -->|pass| L1[L1: AgentRiskManager<br/>Path-aware checks + per-agent isolation<br/>Deterministic, hot-reloadable config]
     L1 -->|pass| L2[L2: Taleb LLM Review<br/>Context-aware, correlation check<br/>Future: Gate 2+]
     L2 -->|pass| L3[L3: Feynman Human Override<br/>CIO approval for large positions<br/>Future: Gate 3+]
     L3 -->|approved| SUBMIT[Submit to Venue]
@@ -284,13 +304,13 @@ pub trait MessageBus: Send + Sync {
 
     /// Subscribe to a topic as part of a consumer group.
     /// Messages are distributed across consumers in the same group.
-    /// Returns a stream of messages.
+    /// Returns a bounded stream of messages (capacity set per subscription).
     async fn subscribe(
         &self,
         topic: &str,
         group: &str,
         consumer: &str,
-    ) -> Result<mpsc::UnboundedReceiver<BusEnvelope>>;
+    ) -> Result<mpsc::Receiver<BusEnvelope>>;
 
     /// Acknowledge that a message has been processed.
     /// Prevents redelivery to the same consumer group.
@@ -443,61 +463,73 @@ pub enum EngineEvent {
 
 ---
 
-## 6. PipelineStage Trait
+## 6. Order Pipeline (Type-State + Runtime)
 
-Composable, ordered execution pipeline.
+The pipeline is **not** a list of generic `PipelineStage` trait objects. It is a **fixed sequence of typed transitions** enforced by the type system. Each stage consumes the previous type and produces the next. This makes the pipeline order a compile-time guarantee, not a runtime convention.
 
-```rust
-/// A single stage in the execution pipeline. Stages are composed in a fixed
-/// order and each can approve, modify, or reject the order.
-#[async_trait]
-pub trait PipelineStage: Send + Sync {
-    /// Process an order through this stage.
-    /// Returns the (possibly modified) order on success,
-    /// or a rejection reason on failure.
-    async fn process(&self, ctx: &mut PipelineContext) -> Result<StageOutcome>;
+See DATA_MODEL.md §3 for the full type definitions.
 
-    /// Name of this stage for logging and metrics.
-    fn name(&self) -> &'static str;
-}
-
-pub enum StageOutcome {
-    /// Order passes this stage (possibly modified).
-    Continue,
-    /// Order is rejected at this stage.
-    Reject { reason: String },
-}
-
-/// Context passed through the pipeline. Accumulates state as stages run.
-pub struct PipelineContext {
-    pub order: Order,
-    pub firm_book: FirmBook,
-    pub agent_limits: AgentRiskLimits,
-    pub execution_mode: ExecutionMode,
-    pub dry_run: bool,
-    pub trace_id: String,
-    pub stage_results: Vec<(String, StageOutcome)>,
-}
-```
-
-### Pipeline Stage Order
+### Pipeline Flow
 
 ```mermaid
 graph LR
-    IN[Signal] --> V[1. Validate<br/>Schema + required fields]
-    V --> B[2. Bridge<br/>Signal → Order<br/>conviction → sizing]
-    B --> L0[3. L0 Circuit Breakers<br/>Halt flag, max order size]
-    L0 --> L1[4. L1 Risk Checklist<br/>7-point MVP + per-agent]
-    L1 --> R[5. Route<br/>Select venue adapter]
-    R --> S[6. Submit<br/>Send to venue]
-    S --> J[7. Journal<br/>Record event]
-    J --> PUB[8. Publish<br/>Bus notification]
-    PUB --> OUT[Done]
+    IN[Signal / SubmitOrder] --> B["1. Bridge<br/>Signal → PipelineOrder⟨Draft⟩"]
+    B --> V["2. Validate<br/>Draft → Validated"]
+    V --> L0["3. L0 Circuit Breakers<br/>(checked inside risk_check)"]
+    L0 --> L1["4. L1 Risk Gate<br/>Validated → RiskChecked"]
+    L1 --> R["5. Route<br/>RiskChecked → Routed"]
+    R --> S["6. Submit<br/>Routed → LiveOrder"]
+    S --> J["7. Journal<br/>Record event"]
+    J --> PUB["8. Publish<br/>Bus notification"]
+    PUB --> OUT["LiveOrder in Sequencer"]
 
-    V -->|reject| REJ[Rejected]
-    L0 -->|reject| REJ
-    L1 -->|reject| REJ
-    S -->|error| ERR[Error → Journal + Bus]
+    V -->|ValidationError| REJ[RejectedOrder]
+    L1 -->|RiskOutcome::Rejected| REJ
+    L1 -->|"RiskOutcome::Resize"| B2["New Draft<br/>(re-enter at step 2)"]
+    R -->|RoutingError| REJ
+    S -->|SubmissionError| REJ
+    REJ --> JREJ["Journal + Publish rejection"]
+```
+
+### Type-State Guarantees
+
+| Stage | Input Type | Output Type | What it proves |
+|-------|-----------|------------|---------------|
+| Bridge | `Signal` or `OrderRequest` | `PipelineOrder<Draft>` | Structured order created |
+| Validate | `PipelineOrder<Draft>` | `PipelineOrder<Validated>` | Qty > 0, price valid, venue supports order type |
+| Risk Check | `PipelineOrder<Validated>` | `PipelineOrder<RiskChecked>` + `RiskProof` | Risk gate approved, per-agent limits checked |
+| Route | `PipelineOrder<RiskChecked>` | `PipelineOrder<Routed>` | Venue selected, adapter resolved |
+| Submit | `PipelineOrder<Routed>` | `LiveOrder` | On venue, runtime FSM begins |
+
+**Key design choice:** The pipeline is not extensible via a trait. Adding a new stage requires a new type-state marker and a new consuming method — a deliberate code change with a compile-time impact on every call site. This is intentional for safety-critical infrastructure.
+
+### Resize Loop
+
+When the risk gate returns `RiskOutcome::Resize`, the order re-enters the pipeline as a new `PipelineOrder<Draft>` with adjusted qty/notional. The loop is bounded: if the resized order is still rejected, it becomes a `RejectedOrder`. No infinite resize cycles.
+
+```rust
+/// Pseudocode for the resize loop inside the Sequencer.
+fn process_through_pipeline(draft: PipelineOrder<Draft>) -> Result<LiveOrder, RejectedOrder> {
+    let validated = draft.validate(&caps)?;
+    match risk_gate.evaluate(validated, &limits, &firm_book) {
+        RiskOutcome::Approved(checked, proof) => {
+            let routed = checked.route(&registry, &symbol_map)?;
+            routed.submit(&adapter).await
+        }
+        RiskOutcome::Resize { resized, .. } => {
+            // One retry with resized qty. If this also fails → reject.
+            let validated = resized.validate(&caps)?;
+            match risk_gate.evaluate(validated, &limits, &firm_book) {
+                RiskOutcome::Approved(checked, proof) => {
+                    let routed = checked.route(&registry, &symbol_map)?;
+                    routed.submit(&adapter).await
+                }
+                _ => Err(RejectedOrder { reason: ResizeStillExceedsLimits, .. })
+            }
+        }
+        RiskOutcome::Rejected(rejected) => Err(rejected),
+    }
+}
 ```
 
 ---

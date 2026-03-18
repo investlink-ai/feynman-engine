@@ -11,6 +11,7 @@ service ExecutionService {
 
   // ── Order ingress (algo/ML strategies — fully specified, engine does risk only) ──
   rpc SubmitOrder(OrderRequest) returns (OrderAck);
+  // atomic=true only allowed for same-venue batches (see CORE_ENGINE_DESIGN.md §8.8)
   rpc SubmitBatch(BatchRequest) returns (BatchAck);
 
   // ── Order management ──
@@ -18,6 +19,10 @@ service ExecutionService {
   rpc AmendOrder(AmendRequest) returns (AmendAck);
   rpc GetOrder(OrderQuery) returns (OrderRecord);
   rpc ListOpenOrders(AgentFilter) returns (stream OrderRecord);
+
+  // ── History (for strategy reconnect and audit) ──
+  rpc GetFillHistory(FillHistoryRequest) returns (stream Fill);
+  rpc GetOrderHistory(OrderHistoryRequest) returns (stream OrderRecord);
 
   // ── Portfolio ──
   rpc GetFirmBook(google.protobuf.Empty) returns (FirmBook);
@@ -35,7 +40,9 @@ service ExecutionService {
   rpc RegisterAgent(AgentRegistration) returns (StatusAck);
 
   // ── Streams ──
-  rpc SubscribeFills(AgentFilter) returns (stream Fill);
+  // Fills include a monotonic fill_seq for reconnection.
+  // To resume after disconnect: SubscribeFills with last_seen_fill_seq set.
+  rpc SubscribeFills(FillSubscription) returns (stream Fill);
   rpc SubscribeEvents(EventFilter) returns (stream EngineEvent);
 
   // ── Backtest control (rejected in live/paper mode) ──
@@ -106,7 +113,11 @@ message BatchRequest {
   string batch_id = 1;         // idempotency key for the batch
   string agent = 2;
   repeated OrderRequest orders = 3;
-  bool atomic = 4;             // true = all-or-nothing; false = best-effort
+  // atomic=true: all-or-nothing RISK evaluation (not execution).
+  // CONSTRAINT: atomic=true only allowed for same-venue batches.
+  // Cross-venue batches must use atomic=false (best-effort).
+  // See CORE_ENGINE_DESIGN.md §8.8 for rationale.
+  bool atomic = 4;
   string metadata = 5;         // JSON
 }
 
@@ -251,18 +262,50 @@ message RiskViolation {
 }
 
 message Fill {
-  string order_id = 1;
-  string venue_order_id = 2;
-  string qty = 3;
-  string price = 4;
-  string fee = 5;
-  google.protobuf.Timestamp filled_at = 6;
+  uint64 fill_seq = 1;          // monotonic, engine-assigned. Used for reconnect (SubscribeFills).
+  string order_id = 2;
+  string venue_order_id = 3;
+  string qty = 4;
+  string price = 5;
+  string fee = 6;
+  string agent = 7;             // denormalized for stream filtering
+  google.protobuf.Timestamp filled_at = 8;
 }
 
 message EngineEvent {
-  string event_type = 1; // "OrderSubmitted", "OrderFilled", "RiskAlert"
-  string payload = 2;    // JSON
-  google.protobuf.Timestamp timestamp = 3;
+  uint64 event_seq = 1;         // monotonic, maps to journal seq
+  uint32 schema_version = 2;    // event schema version (for replay compatibility)
+  string event_type = 3;        // "OrderSubmitted", "OrderFilled", "RiskAlert", etc.
+  string payload = 4;           // JSON
+  google.protobuf.Timestamp timestamp = 5;
+}
+
+// ── Fill & Order history (for reconnect and audit) ──
+
+message FillSubscription {
+  optional string agent = 1;     // filter by agent (empty = all fills the caller can see)
+  optional string venue = 2;     // filter by venue
+  optional uint64 since_fill_seq = 3;  // resume from this seq (exclusive). If set, delivers
+                                        // all fills with fill_seq > since_fill_seq before
+                                        // switching to live stream. Enables lossless reconnect.
+}
+
+message FillHistoryRequest {
+  optional string agent = 1;
+  optional string venue = 2;
+  optional string instrument = 3;
+  optional google.protobuf.Timestamp from = 4;
+  optional google.protobuf.Timestamp to = 5;
+  optional uint32 limit = 6;     // max results (default: 1000)
+}
+
+message OrderHistoryRequest {
+  optional string agent = 1;
+  optional string venue = 2;
+  optional string state = 3;     // filter by state: "Filled", "Cancelled", etc.
+  optional google.protobuf.Timestamp from = 4;
+  optional google.protobuf.Timestamp to = 5;
+  optional uint32 limit = 6;
 }
 
 message AgentFilter {
@@ -273,6 +316,7 @@ message AgentFilter {
 message EventFilter {
   optional string event_type = 1;
   optional string agent = 2;
+  optional uint64 since_event_seq = 3;  // resume from this seq (same pattern as FillSubscription)
 }
 
 message VenueStatus {
@@ -285,10 +329,11 @@ message VenueStatus {
 }
 
 message HealthReport {
-  string status = 1;      // "healthy", "degraded", "unhealthy"
-  string version = 2;
-  string uptime_secs = 3;
-  repeated VenueStatus venues = 4;
+  string status = 1;      // "healthy", "degraded", "starting", "unhealthy"
+  string mode = 2;        // "live", "paper", "backtest"
+  string version = 3;
+  string uptime_secs = 4;
+  repeated VenueStatus venues = 5;
 }
 
 // ── Backtest control ──

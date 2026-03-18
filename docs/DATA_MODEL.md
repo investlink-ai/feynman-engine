@@ -97,36 +97,88 @@ pub enum Urgency { Low, Normal, High, Immediate }
 
 ---
 
-## 3. Order (Execution Model)
+## 3. Order Model (Hybrid Type-State + Runtime FSM)
 
-**This is the missing type.** The bridge converts a Signal into an Order, which is what the pipeline and venue adapters work with.
+The order lifecycle has two fundamentally different phases:
+
+| Phase | Nature | Who drives | Safety mechanism |
+|-------|--------|-----------|-----------------|
+| **Pipeline** (pre-submission) | Linear, deterministic, engine-controlled | Engine code | **Type-state** (compile-time) |
+| **Venue** (post-submission) | Event-driven, branching, external events | Exchange | **Runtime FSM** (exhaustive match) |
+
+A single FSM cannot serve both well. The pipeline needs compile-time guarantees (you cannot submit without risk approval). The venue lifecycle needs runtime flexibility (fills arrive as async events). The design uses **type-state for the pipeline** and a **runtime enum for the venue lifecycle**, connected by a consuming `submit()` that transforms one into the other.
+
+### 3.1 Pipeline Order (Type-State — Compile-Time Safety)
 
 ```rust
-/// An order ready for risk evaluation and venue submission.
-/// Created by the bridge from a Signal. Immutable once created
-/// (amendments create new orders).
-pub struct Order {
+// ── Zero-sized marker types (no runtime cost) ──
+
+/// Order just created from signal/request. Not yet validated.
+pub struct Draft;
+/// Passed stateless validation (qty > 0, price valid, venue supports order type).
+pub struct Validated;
+/// Passed risk gate. Carries cryptographic-weight proof of approval.
+pub struct RiskChecked;
+/// Venue selected, adapter resolved, ready to submit.
+pub struct Routed;
+
+/// Sealed trait — only the four marker types above implement this.
+/// External crates cannot add pipeline stages.
+mod private { pub trait Sealed {} }
+pub trait PipelineStage: private::Sealed {}
+
+impl private::Sealed for Draft {}
+impl private::Sealed for Validated {}
+impl private::Sealed for RiskChecked {}
+impl private::Sealed for Routed {}
+impl PipelineStage for Draft {}
+impl PipelineStage for Validated {}
+impl PipelineStage for RiskChecked {}
+impl PipelineStage for Routed {}
+```
+
+```rust
+/// An order progressing through the pipeline. The type parameter `S`
+/// determines which operations are available — invalid transitions
+/// are compile errors, not runtime panics.
+///
+/// Fields are immutable after creation. Resizing creates a new
+/// PipelineOrder<Draft> with adjusted qty/notional.
+pub struct PipelineOrder<S: PipelineStage> {
+    // ── Identity ──
     pub id: OrderId,
-    pub client_order_id: ClientOrderId,
-    pub signal_id: SignalId,         // traceability back to signal
+    pub client_order_id: ClientOrderId,  // idempotency key
+    pub signal_id: Option<SignalId>,     // traceability (None for SubmitOrder)
     pub agent: AgentId,
+
+    // ── Market ──
     pub instrument: InstrumentId,
-    pub venue: VenueId,             // selected by router
+    pub venue: VenueId,                  // selected by router (populated at Routed stage)
+    pub market: MarketId,                // venue-native symbol
+
+    // ── Intent ──
     pub side: Side,
     pub order_type: OrderType,
-    pub qty: Decimal,                // in base currency units
-    pub notional_usd: Decimal,       // qty * price (for risk checks)
-    pub price: Option<Decimal>,      // None for market orders
-    pub stop_loss: Decimal,          // always present (enforced by bridge)
+    pub qty: Decimal,                    // base currency units
+    pub notional_usd: Decimal,           // qty * price (for risk checks)
+    pub price: Option<Decimal>,          // None for market orders
+    pub stop_loss: Option<Decimal>,      // required for SubmitSignal, optional for SubmitOrder
     pub take_profit: Option<Decimal>,
-    pub leverage: Option<Decimal>,   // for perps
+
+    // ── Constraints ──
+    pub leverage: Option<Decimal>,
     pub time_in_force: TimeInForce,
     pub reduce_only: bool,
     pub post_only: bool,
-    pub conviction: Decimal,         // carried from signal for attribution
-    pub thesis: String,              // carried from signal for audit
+    pub dry_run: bool,                   // default: true, always
+
+    // ── Provenance ──
+    pub conviction: Option<Decimal>,     // from signal (None for SubmitOrder)
+    pub thesis: Option<String>,          // from signal (None for SubmitOrder)
     pub created_at: DateTime<Utc>,
-    pub state: OrderState,
+
+    // ── Stage-specific proof (populated as order advances) ──
+    pub(crate) _stage: PhantomData<S>,
 }
 
 pub enum OrderType {
@@ -147,108 +199,379 @@ pub enum TimeInForce {
 }
 ```
 
-### Order State Machine
+### 3.2 Pipeline Transitions (Consuming Methods)
+
+Each transition **consumes** the previous stage and returns the next. The old value is gone — you cannot use a `Draft` order after validating it.
+
+```rust
+impl PipelineOrder<Draft> {
+    /// Stateless validation: qty > 0, price valid, venue supports order type,
+    /// precision within venue limits. No I/O, no state access.
+    #[must_use]
+    pub fn validate(self, caps: &VenueCapabilities) -> Result<PipelineOrder<Validated>, ValidationError>;
+}
+
+impl PipelineOrder<Validated> {
+    /// Risk evaluation: circuit breakers → L1 risk checks → per-agent isolation.
+    /// Returns RiskChecked with proof of approval, or RejectedOrder on failure.
+    /// Deterministic, no I/O. May resize (returns new Draft if resize needed).
+    #[must_use]
+    pub fn risk_check(
+        self,
+        risk_gate: &dyn RiskEvaluator,
+        firm_book: &FirmBook,
+        agent_limits: &AgentRiskLimits,
+    ) -> RiskOutcome;
+}
+
+/// Risk check has three outcomes — not two.
+pub enum RiskOutcome {
+    /// Approved as-is. Carries proof.
+    Approved(PipelineOrder<RiskChecked>, RiskProof),
+    /// Approved but must be resized. Returns a new Draft with adjusted qty/notional.
+    /// The caller must re-validate and re-risk-check the resized order.
+    Resize {
+        resized: PipelineOrder<Draft>,
+        original_notional: Decimal,
+        approved_notional: Decimal,
+        reason: String,
+    },
+    /// Rejected. Terminal — this order is done.
+    Rejected(RejectedOrder),
+}
+
+impl PipelineOrder<RiskChecked> {
+    /// Select venue and resolve adapter. Populates venue/market fields.
+    #[must_use]
+    pub fn route(
+        self,
+        registry: &dyn AdapterRegistry,
+        symbol_map: &SymbolMap,
+    ) -> Result<PipelineOrder<Routed>, RoutingError>;
+}
+
+impl PipelineOrder<Routed> {
+    /// Submit to venue. **Consumes the pipeline order** and returns a LiveOrder
+    /// with runtime FSM for venue-driven state changes. This is the boundary
+    /// between compile-time safety and runtime flexibility.
+    ///
+    /// Checks dry_run before submission. Idempotent on client_order_id.
+    #[must_use]
+    pub async fn submit(
+        self,
+        adapter: &dyn VenueAdapter,
+    ) -> Result<LiveOrder, SubmissionError>;
+}
+```
+
+### 3.3 Pipeline State Diagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Created: Bridge creates from Signal
-    Created --> PendingRisk: Enter pipeline
-    PendingRisk --> Approved: Risk passes (all layers)
-    PendingRisk --> Resized: Risk passes with resize
-    PendingRisk --> Rejected: Risk fails
-    Resized --> Approved: Resized order re-validated
-    Approved --> Submitted: Sent to venue
-    Submitted --> Accepted: Venue ACKs
-    Submitted --> VenueRejected: Venue rejects
-    Accepted --> PartiallyFilled: Partial fill received
-    Accepted --> Filled: Full fill received
-    Accepted --> Cancelled: Cancel requested
-    Accepted --> Expired: TTL reached
-    PartiallyFilled --> Filled: Remaining filled
-    PartiallyFilled --> Cancelled: Cancel remaining
-    Rejected --> [*]
-    VenueRejected --> [*]
-    Filled --> [*]
-    Cancelled --> [*]
-    Expired --> [*]
+    [*] --> Draft: Signal bridge / SubmitOrder
+    Draft --> Validated: validate(caps)
+    Draft --> REJECTED: ValidationError
+
+    Validated --> RiskChecked: risk_check() → Approved
+    Validated --> Draft: risk_check() → Resize (new Draft)
+    Validated --> REJECTED: risk_check() → Rejected
+
+    RiskChecked --> Routed: route(registry)
+    RiskChecked --> REJECTED: RoutingError
+
+    Routed --> LiveOrder: submit(adapter)
+    Routed --> REJECTED: SubmissionError
+
+    REJECTED --> [*]
+
+    state LiveOrder {
+        [*] --> Submitted
+        Submitted --> Accepted: venue ACK
+        Submitted --> VenueRejected: venue rejects
+        Accepted --> Triggered: conditional activated
+        Accepted --> PartiallyFilled: partial fill
+        Accepted --> Filled: full fill
+        Accepted --> Cancelled: cancel
+        Accepted --> Expired: TTL
+        Triggered --> Accepted: trigger fires
+        PartiallyFilled --> Filled: final fill
+        PartiallyFilled --> Cancelled: cancel remaining
+        Filled --> [*]
+        VenueRejected --> [*]
+        Cancelled --> [*]
+        Expired --> [*]
+    }
 ```
 
+### 3.4 Proof Types
+
 ```rust
-pub enum OrderState {
-    /// Order created by bridge, not yet evaluated.
-    Created,
-    /// In the risk evaluation pipeline.
-    PendingRisk,
-    /// Approved by all risk layers.
-    Approved,
-    /// Approved but resized to fit limits.
-    Resized { original_notional: Decimal },
-    /// Sent to venue, awaiting ACK.
-    Submitted,
-    /// Venue accepted the order.
-    Accepted { venue_order_id: VenueOrderId },
-    /// Partially filled (some qty executed).
-    PartiallyFilled {
-        venue_order_id: VenueOrderId,
-        filled_qty: Decimal,
-        remaining_qty: Decimal,
-        avg_fill_price: Decimal,
-    },
-    /// Fully filled.
-    Filled {
-        venue_order_id: VenueOrderId,
-        filled_qty: Decimal,
-        avg_fill_price: Decimal,
-    },
-    /// Rejected by risk gate.
-    Rejected { violations: Vec<RiskViolation> },
-    /// Rejected by venue.
-    VenueRejected { reason: String },
-    /// Cancelled (by agent or system).
-    Cancelled { reason: String },
-    /// Expired (TTL reached).
-    Expired,
+/// Proof that the risk gate approved this order. Carried from RiskChecked
+/// through Routed and into LiveOrder for audit trail.
+pub struct RiskProof {
+    pub approved_at: DateTime<Utc>,
+    pub checks_performed: Vec<RiskCheckResult>,
+    pub warnings: Vec<RiskViolation>,  // non-blocking (soft) warnings
 }
 
-impl OrderState {
+/// Result of a single risk check.
+pub struct RiskCheckResult {
+    pub check_name: String,
+    pub passed: bool,
+    pub current_value: Decimal,
+    pub limit_value: Decimal,
+}
+```
+
+### 3.5 Rejected Order
+
+Orders can be rejected at any pipeline stage (validation, risk, routing, submission). All rejections produce a `RejectedOrder` for journaling and audit.
+
+```rust
+/// Terminal state for orders rejected before reaching a venue.
+/// Journaled as EventKind::OrderRejected.
+pub struct RejectedOrder {
+    pub id: OrderId,
+    pub agent: AgentId,
+    pub instrument: InstrumentId,
+    pub reason: RejectionReason,
+    pub at: DateTime<Utc>,
+}
+
+pub enum RejectionReason {
+    /// Failed stateless validation (qty, price, unsupported order type).
+    ValidationFailed(Vec<ValidationError>),
+    /// Circuit breaker tripped (L0).
+    CircuitBreakerTripped { breaker: String, reason: String },
+    /// Risk gate rejected (L1).
+    RiskGateRejected { violations: Vec<RiskViolation> },
+    /// No suitable venue/adapter found.
+    RoutingFailed { reason: String },
+    /// Venue rejected on submission (before entering venue lifecycle).
+    SubmissionFailed { reason: String },
+}
+```
+
+### 3.6 Live Order (Runtime FSM — Venue Lifecycle)
+
+Once submitted to a venue, the order enters a runtime FSM driven by external events (fills, cancels, expirations). Type-state is not appropriate here because transitions are data-driven and non-deterministic.
+
+```rust
+/// An order that has been submitted to a venue and is now in the
+/// venue-driven lifecycle. State changes come from venue events
+/// (fills, cancels, expirations), not engine pipeline stages.
+///
+/// Owned by the Sequencer. State mutations happen only inside
+/// Sequencer command processing.
+pub struct LiveOrder {
+    // ── Identity (immutable, carried from PipelineOrder) ──
+    pub id: OrderId,
+    pub client_order_id: ClientOrderId,
+    pub venue_order_id: VenueOrderId,
+    pub signal_id: Option<SignalId>,
+    pub agent: AgentId,
+
+    // ── Market (immutable) ──
+    pub instrument: InstrumentId,
+    pub venue: VenueId,
+    pub market: MarketId,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub original_qty: Decimal,
+    pub price: Option<Decimal>,
+
+    // ── Mutable state ──
+    pub state: VenueState,
+    pub fills: Vec<Fill>,
+
+    // ── Provenance ──
+    pub risk_proof: RiskProof,
+    pub created_at: DateTime<Utc>,
+    pub submitted_at: DateTime<Utc>,
+}
+```
+
+### 3.7 Venue State Machine (Runtime Enum)
+
+```rust
+pub enum VenueState {
+    /// Sent to venue, awaiting acknowledgment.
+    Submitted,
+
+    /// Venue acknowledged, order resting on book (limit orders).
+    Accepted { accepted_at: DateTime<Utc> },
+
+    /// Conditional order (stop/TP/trailing) accepted, waiting for trigger.
+    Triggered { triggered_at: DateTime<Utc> },
+
+    /// Some quantity executed.
+    PartiallyFilled { summary: FillSummary },
+
+    /// Fully filled. Terminal.
+    Filled { summary: FillSummary, filled_at: DateTime<Utc> },
+
+    /// Rejected by venue. Terminal.
+    VenueRejected { reason: String, rejected_at: DateTime<Utc> },
+
+    /// Cancelled (may have partial fills). Terminal.
+    Cancelled { reason: CancelReason, summary: FillSummary, cancelled_at: DateTime<Utc> },
+
+    /// Expired (GTD/Day TIF). Terminal.
+    Expired { summary: FillSummary, expired_at: DateTime<Utc> },
+}
+
+/// Aggregated fill state for an order.
+pub struct FillSummary {
+    pub filled_qty: Decimal,
+    pub remaining_qty: Decimal,
+    pub avg_fill_price: Decimal,
+    pub total_fee: Decimal,
+    pub fill_count: u32,
+}
+
+impl FillSummary {
+    pub fn empty(original_qty: Decimal) -> Self {
+        Self {
+            filled_qty: Decimal::ZERO,
+            remaining_qty: original_qty,
+            avg_fill_price: Decimal::ZERO,
+            total_fee: Decimal::ZERO,
+            fill_count: 0,
+        }
+    }
+}
+
+pub enum CancelReason {
+    UserRequested,
+    AgentRequested { agent: AgentId },
+    RiskGateKilled,
+    CircuitBreakerTripped,
+    LinkedOrderFilled,       // OCO counterpart filled
+    Timeout,
+    InsufficientBalance,
+    VenueCancelled { venue_reason: String },
+    SelfTradePreventionTriggered,
+}
+```
+
+### 3.8 Venue State Transitions (Validated at Runtime)
+
+Transitions are methods on `VenueState` that return `Result`. Invalid transitions return `Err(InvalidTransition)` — never panic. **No wildcard `_` match** on `VenueState` variants (exhaustive match enforced by CLAUDE.md rules).
+
+```rust
+/// Error for invalid state transitions. Contains forensic context.
+pub struct InvalidTransition {
+    pub order_id: OrderId,
+    pub from: String,        // current state name
+    pub attempted: String,   // attempted transition
+    pub at: DateTime<Utc>,
+}
+
+impl VenueState {
+    pub fn on_accepted(self, at: DateTime<Utc>) -> Result<Self, InvalidTransition> {
+        match self {
+            Self::Submitted => Ok(Self::Accepted { accepted_at: at }),
+            Self::Triggered { .. } => Ok(Self::Accepted { accepted_at: at }),
+            // All other states explicitly listed — no wildcard
+            Self::Accepted { .. }
+            | Self::PartiallyFilled { .. }
+            | Self::Filled { .. }
+            | Self::VenueRejected { .. }
+            | Self::Cancelled { .. }
+            | Self::Expired { .. } => Err(InvalidTransition { .. }),
+        }
+    }
+
+    pub fn on_fill(self, fill: &Fill, original_qty: Decimal) -> Result<Self, InvalidTransition> {
+        match self {
+            Self::Accepted { .. } | Self::PartiallyFilled { .. } => {
+                let mut summary = match &self {
+                    Self::PartiallyFilled { summary } => summary.clone(),
+                    _ => FillSummary::empty(original_qty),
+                };
+                // Update summary with new fill...
+                if summary.remaining_qty == Decimal::ZERO {
+                    Ok(Self::Filled { summary, filled_at: fill.timestamp })
+                } else {
+                    Ok(Self::PartiallyFilled { summary })
+                }
+            }
+            // Explicit rejection of all other states
+            Self::Submitted
+            | Self::Triggered { .. }
+            | Self::Filled { .. }
+            | Self::VenueRejected { .. }
+            | Self::Cancelled { .. }
+            | Self::Expired { .. } => Err(InvalidTransition { .. }),
+        }
+    }
+
+    pub fn on_cancel(self, reason: CancelReason, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
+    pub fn on_reject(self, reason: String, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
+    pub fn on_expire(self, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
+    pub fn on_triggered(self, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
+
     /// Is this order in a terminal state?
     pub fn is_terminal(&self) -> bool {
         matches!(self,
-            OrderState::Filled { .. }
-            | OrderState::Rejected { .. }
-            | OrderState::VenueRejected { .. }
-            | OrderState::Cancelled { .. }
-            | OrderState::Expired
+            Self::Filled { .. }
+            | Self::VenueRejected { .. }
+            | Self::Cancelled { .. }
+            | Self::Expired { .. }
         )
     }
 
-    /// Is this order live on the venue?
+    /// Is this order live on the venue (can receive fills)?
     pub fn is_live(&self) -> bool {
         matches!(self,
-            OrderState::Accepted { .. }
-            | OrderState::PartiallyFilled { .. }
+            Self::Accepted { .. }
+            | Self::PartiallyFilled { .. }
         )
     }
 }
 ```
 
-### Valid State Transitions
+### 3.9 Valid Venue State Transitions
 
-| From | To | Trigger |
-|------|----|---------|
-| Created | PendingRisk | Pipeline.process() |
-| PendingRisk | Approved | All risk checks pass |
-| PendingRisk | Resized | Risk passes with resize |
-| PendingRisk | Rejected | Any risk check fails (hard) |
-| Approved | Submitted | VenueAdapter.submit_order() |
-| Resized | Approved | Resized order re-approved |
-| Submitted | Accepted | Venue ACK received |
-| Submitted | VenueRejected | Venue rejects |
-| Accepted | PartiallyFilled | Partial fill event |
-| Accepted | Filled | Full fill event |
-| Accepted | Cancelled | Cancel request |
-| PartiallyFilled | Filled | Final fill |
-| PartiallyFilled | Cancelled | Cancel remaining |
+```
+Submitted ──► Accepted ──► PartiallyFilled ──► Filled
+    │             │              │
+    │             │              └──► Cancelled (partial fills preserved)
+    │             │              └──► Expired (partial fills preserved)
+    │             └──► Filled (single fill covers full qty)
+    │             └──► Cancelled
+    │             └──► Expired
+    └──► Triggered ──► Accepted ──► ...
+    └──► VenueRejected
+```
+
+| From | To | Trigger | Notes |
+|------|----|---------|-------|
+| Submitted | Accepted | Venue ACK | Order resting on book |
+| Submitted | Triggered | Venue ACK (conditional) | Stop/TP waiting for trigger |
+| Submitted | VenueRejected | Venue rejects | Terminal |
+| Triggered | Accepted | Trigger condition met | Now active on book |
+| Accepted | PartiallyFilled | Partial fill event | FillSummary updated |
+| Accepted | Filled | Full fill event | Terminal |
+| Accepted | Cancelled | Cancel request | Terminal |
+| Accepted | Expired | TIF expired | Terminal |
+| PartiallyFilled | Filled | Final fill | Terminal |
+| PartiallyFilled | Cancelled | Cancel remaining | Partial fills preserved |
+
+### 3.10 Design Invariants
+
+| # | Invariant | Enforcement |
+|---|-----------|------------|
+| 1 | Cannot submit without risk approval | `submit()` only exists on `PipelineOrder<Routed>`, which requires passing through `RiskChecked` |
+| 2 | Cannot skip validation | `risk_check()` only exists on `PipelineOrder<Validated>` |
+| 3 | No state mutation before fill | `LiveOrder.state` only mutated by `on_fill()` inside Sequencer |
+| 4 | Idempotent submission | `client_order_id` checked before creating `LiveOrder` |
+| 5 | Terminal states are absorbing | `on_fill()` returns `Err` on terminal states |
+| 6 | Partial fills preserved on cancel | `Cancelled` variant carries `FillSummary` |
+| 7 | Risk proof carried to audit | `LiveOrder.risk_proof` is immutable after creation |
+| 8 | Pipeline order consumed on submit | `submit()` takes `self` by value — old type is gone |
+| 9 | No wildcard match on VenueState | Every variant explicitly handled in every transition method |
+| 10 | Sequencer owns LiveOrder | No `Arc<Mutex<LiveOrder>>` — Sequencer owns `HashMap<OrderId, LiveOrder>` |
 
 ---
 
@@ -423,17 +746,26 @@ pub enum SuggestedAction {
 }
 ```
 
-### 5.4 MVP Risk Check Decision Matrix
+### 5.4 Risk Check Decision Matrix
+
+**Universal checks (all order paths):**
 
 | Check | Hard/Soft | On Fail | Resizable? |
 |-------|-----------|---------|-----------|
-| 1. Stop loss defined | Hard | Reject | No |
-| 2. R:R ≥ 2:1 | Hard | Reject | No |
-| 3. Position ≤ 5% NAV | Resize | Resize to 5% | Yes |
-| 4. Account risk ≤ 1% NAV | Resize | Resize position | Yes |
-| 5. Leverage within limits | Hard | Reject | No |
-| 6. Drawdown < 15% | Hard | Reject ALL orders for agent | No |
-| 7. Cash ≥ 20% NAV | Hard | Reject | No |
+| 1. Position ≤ 5% NAV | Resize | Resize to 5% | Yes |
+| 2. Account risk ≤ 1% NAV | Resize | Resize position | Yes |
+| 3. Leverage within limits | Hard | Reject | No |
+| 4. Drawdown within threshold | Hard | Reject ALL orders for agent | No |
+| 5. Cash ≥ 20% NAV | Hard | Reject | No |
+
+**Signal-specific checks (`SubmitSignal` only):**
+
+| Check | Hard/Soft | On Fail | Resizable? |
+|-------|-----------|---------|-----------|
+| 6. Stop loss defined | Hard | Reject signal | No |
+| 7. R:R ≥ 2:1 | Hard | Reject signal | No |
+
+Note: For account risk (check 2), if `stop_loss` is absent, `max_loss = notional` (worst case).
 
 ---
 

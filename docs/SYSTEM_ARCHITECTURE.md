@@ -8,11 +8,11 @@
 
 ## 1. Design Philosophy
 
-### 1.1 Core Principle: Nautilus-Optional
+### 1.1 Core Principle: Custom Rust Engine
 
-The engine is designed to **stand alone without NautilusTrader**. Nautilus is a powerful accelerant (order FSM, venue adapters, backtest engine), but the architecture must not collapse if the Phase 1 spike fails.
+The engine is **100% custom Rust** using per-exchange client crates for venue connectivity. NautilusTrader was evaluated and rejected on 2026-03-17 (see `HYBRID_ENGINE_ARCHITECTURE.md` for the evaluation record).
 
-**Implication:** Every interface is defined in Feynman-native types. If Nautilus works, we write thin adapters that delegate to Nautilus internals. If not, we implement those interfaces ourselves. The calling code never changes.
+**Implication:** Every interface is defined in Feynman-native types with custom implementations. The calling code targets Feynman traits — venue adapters, risk gates, and pipeline stages are all Feynman-owned.
 
 ```
                     ┌─────────────────────┐
@@ -23,9 +23,9 @@ The engine is designed to **stand alone without NautilusTrader**. Nautilus is a 
                ┌───────────────┼───────────────┐
                │               │               │
         ┌──────▼──────┐ ┌─────▼──────┐ ┌──────▼──────┐
-        │  Nautilus    │ │  Custom    │ │  Mock       │
-        │  Backend     │ │  Backend   │ │  Backend    │
-        │  (Phase 1+)  │ │  (fallback)│ │  (testing)  │
+        │  Live Venue  │ │  Paper     │ │  Mock       │
+        │  Adapters    │ │  Adapter   │ │  Backend    │
+        │  (per-venue) │ │  (sim fills)│ │  (testing)  │
         └─────────────┘ └────────────┘ └─────────────┘
 ```
 
@@ -171,33 +171,33 @@ graph LR
 ```mermaid
 graph TD
     TYPES[feynman-types<br/>Domain types, identifiers, enums]
-    RISK[feynman-agent-risk<br/>7-point MVP + per-agent isolation]
-    BUS[feynman-agent-bus<br/>Redis Streams pub/sub]
+    RISK[feynman-risk<br/>Path-aware checks + per-agent isolation]
+    BUS[feynman-bus<br/>Redis Streams pub/sub]
     VENUE[feynman-venue<br/>VenueAdapter trait + implementations]
-    BRIDGE[feynman-bridge<br/>Signal → Order translation]
-    PIPELINE[feynman-pipeline<br/>Execution pipeline stages]
+    GATEWAY[feynman-gateway<br/>Signal → Order translation]
+    ENGINECORE[feynman-engine-core<br/>Execution pipeline stages]
     JOURNAL[feynman-journal<br/>Event sourcing + WAL]
     API[feynman-api<br/>gRPC service handlers]
-    DASH[feynman-dashboard<br/>REST + WebSocket + metrics]
+    DASH[feynman-observability<br/>REST + WebSocket + metrics]
     BIN[feynman-engine binary<br/>Orchestration + lifecycle]
 
     TYPES --> RISK
     TYPES --> BUS
     TYPES --> VENUE
-    TYPES --> BRIDGE
+    TYPES --> GATEWAY
     TYPES --> JOURNAL
-    RISK --> PIPELINE
-    BUS --> PIPELINE
-    VENUE --> PIPELINE
-    BRIDGE --> PIPELINE
-    JOURNAL --> PIPELINE
-    PIPELINE --> API
-    PIPELINE --> DASH
+    RISK --> ENGINECORE
+    BUS --> ENGINECORE
+    VENUE --> ENGINECORE
+    GATEWAY --> ENGINECORE
+    JOURNAL --> ENGINECORE
+    ENGINECORE --> API
+    ENGINECORE --> DASH
     BUS --> API
     BUS --> DASH
     API --> BIN
     DASH --> BIN
-    PIPELINE --> BIN
+    ENGINECORE --> BIN
 ```
 
 ### 3.2 Component Responsibilities
@@ -205,14 +205,14 @@ graph TD
 | Component | Responsibility | Failure Mode |
 |-----------|---------------|--------------|
 | **feynman-types** | Domain types, identifiers, validation. Zero business logic. | Compile error (caught early) |
-| **feynman-agent-risk** | MVP 7-point checklist + per-agent/instrument/venue limits. Deterministic, no I/O. | Fail-closed: reject order on error |
-| **feynman-agent-bus** | Redis Streams client. Publish/subscribe/ack. Consumer groups. | Retry with backoff; queue in memory |
+| **feynman-risk** | Path-aware risk checks (universal + signal-specific) + per-agent/instrument/venue limits. Deterministic, no I/O. | Fail-closed: reject order on error |
+| **feynman-bus** | Redis Streams client. Publish/subscribe/ack. Consumer groups. | Retry with backoff; queue in memory |
 | **feynman-venue** | `VenueAdapter` trait + venue implementations. Translates orders to venue-native API. | Return error to pipeline; no retry at this layer |
-| **feynman-bridge** | Signal → Order conversion. Conviction-based sizing. Stop/take-profit mapping. | Reject signal if it can't produce valid order |
-| **feynman-pipeline** | Orchestrates: Validate → Risk → Route → Submit. Enforces stage ordering. | Reject order if any stage fails |
+| **feynman-gateway** | Signal → Order conversion. Conviction-based sizing. Stop/take-profit mapping. | Reject signal if it can't produce valid order |
+| **feynman-engine-core** | Orchestrates: Validate → Risk → Route → Submit. Enforces stage ordering. | Reject order if any stage fails |
 | **feynman-journal** | Append-only event log. WAL for crash recovery. Snapshot/restore. | Engine refuses to start if journal corrupted |
 | **feynman-api** | gRPC handlers. Request validation. Auth (which agent is calling). | Return gRPC status codes; never panic |
-| **feynman-dashboard** | HTTP REST + WebSocket SSE + Prometheus metrics. Read-only. | Degrade gracefully; engine continues without dashboard |
+| **feynman-observability** | HTTP REST + WebSocket SSE + Prometheus metrics. Read-only. | Degrade gracefully; engine continues without dashboard |
 | **feynman-engine** | Binary. Config loading, component wiring, lifecycle management, shutdown. | Graceful shutdown: drain orders, snapshot state, cancel pending |
 
 ---
@@ -283,9 +283,8 @@ gantt
 
     section feynman-engine
     Phase 0: Scaffold (types + risk + bus) :active, eng0, 2026-03-17, 14d
-    Phase 1: Nautilus Spike              :eng1, after eng0, 7d
-    Phase 1b: Core Pipeline              :eng1b, after eng1, 14d
-    Phase 2: gRPC API + MCP Bridge       :eng2, after eng1b, 14d
+    Phase 1: Core Pipeline (FSM + adapters):eng1, after eng0, 21d
+    Phase 2: gRPC API + MCP Bridge       :eng2, after eng1, 14d
     Phase 3: Shadow Mode (parallel run)  :eng3, after eng2, 21d
     Phase 4: Cutover (Bybit only)        :milestone, eng4, after eng3, 0d
 
@@ -353,22 +352,16 @@ Inherited from feynman_trading_bot and enforced in the engine:
 
 ```mermaid
 graph TD
-    L1[Level 1: Suspend Agent<br/>daily_loss > 3% per agent]
-    L2[Level 2: Halt New Positions<br/>drawdown > 12%]
-    L3[Level 3: Full Halt<br/>drawdown > 15% OR cascade]
-    L4[Level 4: Close All<br/>Manual only — force-close everything]
-    L5[Level 5: Gateway Stop<br/>Manual only — kill all processes]
+    L1["Level 1: Suspend Agent — daily_loss > 3% per agent"]
+    L2["Level 2: Halt New Positions — drawdown > 12%"]
+    L3["Level 3: Full Halt — drawdown > 15% OR cascade"]
+    L4["Level 4: Close All — Manual only, force-close everything"]
+    L5["Level 5: Gateway Stop — Manual only, kill all processes"]
 
     L1 --> L2
     L2 --> L3
     L3 --> L4
     L4 --> L5
-
-    style L1 fill:#ffd700
-    style L2 fill:#ff8c00
-    style L3 fill:#ff4500
-    style L4 fill:#dc143c
-    style L5 fill:#8b0000
 ```
 
 | Level | Trigger | Engine Action |
@@ -406,7 +399,7 @@ These are explicitly deferred and will be resolved during implementation:
 
 | Decision | Options | Resolve By |
 |----------|---------|-----------|
-| NautilusTrader Rust-only viability | Works / Needs PyO3 / Abandon | Phase 1 spike (week 3) |
+| ~~NautilusTrader Rust-only viability~~ | **Rejected** (2026-03-17). Custom Rust engine. | Resolved |
 | Event journal format | Custom binary / MessagePack / Protobuf | Phase 1b |
 | Multi-venue order routing | Round-robin / best-price / manual | Phase 4 (multi-venue) |
 | PostgreSQL migration timing | Gate 2 / Gate 3 / Gate 4 | When concurrent write pressure appears |
@@ -422,5 +415,5 @@ These are explicitly deferred and will be resolved during implementation:
 | **CONTRACTS.md** | Traits, interfaces, gRPC proto, data contracts | Developers |
 | **DATA_MODEL.md** | Type definitions, state machines, invariants | Developers |
 | **MIGRATION_PLAN.md** | Phased migration with gates, risks, fallbacks | Project planning |
-| HYBRID_ENGINE_ARCHITECTURE.md | NautilusTrader integration rationale (reference) | Architecture review |
-| CORE_ENGINE_DESIGN.md | Detailed type/venue/fee design (reference) | Deep dive |
+| HYBRID_ENGINE_ARCHITECTURE.md | ~~DEPRECATED~~ — NautilusTrader evaluation (rejected 2026-03-17, kept for history) | Reference only |
+| **CORE_ENGINE_DESIGN.md** | Canonical architecture: types, venues, pipeline, risk, concurrency | Developers |

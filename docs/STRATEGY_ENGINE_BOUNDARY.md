@@ -120,27 +120,36 @@ Strategy                          Engine
 
 ### 3.3 Batch (Portfolio Rebalance / ML)
 
-Atomic multi-leg submission. All-or-nothing risk check.
+All-or-nothing risk evaluation. Execution is best-effort (see constraints below).
 
 ```
 Strategy                          Engine
    │                                │
-   ├─ SubmitBatch(atomic=true,      │
+   ├─ SubmitBatch(atomic=false,     │
    │    orders=[                    │
-   │      Buy 0.5 BTC @ 67000,     │
-   │      Sell 10 ETH @ 3800,      │
-   │      Buy 100 SOL @ 170        │
+   │      Buy 0.5 BTC @ 67000,     │  (Bybit)
+   │      Sell 10 ETH @ 3800,      │  (Bybit)
+   │      Buy 100 SOL @ 170        │  (Hyperliquid)
    │    ]) ─────────────────────► │
    │                                ├─ risk: check ALL orders as a unit
    │                                │  (net exposure, correlation, budget)
-   │                                ├─ if any fails → reject entire batch
-   │                                ├─ execute: route each to venue
-   │ ◄── BatchAck ─────────────────┤
+   │                                ├─ execute: route each to venue independently
+   │ ◄── BatchAck(partial) ────────┤  (SOL rejected by Hyperliquid, others ok)
    │                                │
    │ ◄── Fill (BTC) ───────────────┤
    │ ◄── Fill (ETH) ───────────────┤
-   │ ◄── Fill (SOL) ───────────────┤
 ```
+
+**Batch constraints:**
+
+- `atomic=true` is **only allowed for same-venue batches**. Cross-venue atomic execution
+  is a distributed transaction without rollback — a filled order cannot be unfilled.
+  The engine rejects cross-venue `atomic=true` batches with `INVALID_ARGUMENT`.
+- `atomic=false` (default) dispatches each order independently. Per-order status in `BatchAck`.
+- In both modes, risk evaluation is all-or-nothing: if the batch as a unit would breach
+  any limit, the entire batch is rejected.
+- If a leg fails execution (venue error), other legs are NOT auto-cancelled. The strategy
+  must handle partial execution (send compensating cancels if needed).
 
 ### 3.4 Backtest Harness (HFTBacktest or Custom)
 
@@ -200,7 +209,7 @@ These are the API-level contracts that make the engine future-proof for strategy
 | 1 | **Idempotent submission** — same `client_order_id` returns same `OrderAck`, no duplicate order | Strategies retry on timeout. Engine must be safe to retry. |
 | 2 | **Risk enforcement on every path** — no RPC bypasses the risk gate | Strategy bugs don't create uncontrolled risk. |
 | 3 | **Per-agent isolation** — one agent's orders/fills/positions never leak to another | Multi-strategy safety. Agent A's loss doesn't eat Agent B's budget. |
-| 4 | **Fill delivery** — every fill is delivered via `SubscribeFills` exactly once per agent | Strategy needs reliable fill tracking for its own state. |
+| 4 | **Fill delivery with reconnect** — fills have monotonic `fill_seq`. `SubscribeFills(since_fill_seq=N)` replays all fills with seq > N before switching to live. Lossless reconnect. | Strategy needs reliable fill tracking. gRPC streams disconnect — reconnect must not lose fills. |
 | 5 | **Mode-transparent** — same RPC, same behavior, same response shape in all modes | Strategy code doesn't change between backtest and live. |
 | 6 | **Rejection is explicit** — rejected orders return reason, never silent drop | Strategy can act on rejection (adjust, retry, alert). |
 | 7 | **Portfolio reads are consistent** — `GetAgentPositions` reflects all fills up to `as_of` timestamp | Strategy decisions based on stale state are dangerous. |
@@ -320,17 +329,15 @@ Same code, different environments. Strategy code doesn't know which mode it's in
 
 ## 7. Engine API Gaps (Identified from Strategy Boundary Analysis)
 
-RPCs that may be needed but are not yet in `service.proto`:
+RPCs already implemented in `service.proto`: `AdvanceClock`, `GetFillHistory`, `GetOrderHistory`, `GetEngineMode`.
+
+**Remaining candidates (Phase 1-2):**
 
 | RPC | Purpose | Needed by |
 |-----|---------|-----------|
-| `AdvanceClock` | Sync engine's simulated clock with backtest harness | Backtest orchestrator |
-| `GetFillHistory` | Query historical fills for a time range (not just live stream) | Performance analytics, strategy state recovery |
-| `GetOrderHistory` | Query historical orders (completed/cancelled) | Audit, strategy debugging |
 | `SubscribeMarketState` | Stream engine's view of market state (funding rates, mark prices) | Strategies that need engine's market view for consistency |
-| `GetEngineMode` | Query whether engine is in live/paper/backtest mode | Sanity check — strategy should know, but defense-in-depth |
 
-These are candidates for Phase 1-2. Not blocking Phase 0.
+Not blocking Phase 0.
 
 ---
 

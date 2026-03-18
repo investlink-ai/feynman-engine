@@ -64,6 +64,29 @@ gh pr create --draft --base dev
 
 ---
 
+## Rust Standards (non-negotiable)
+
+| Rule | What it means |
+|------|---------------|
+| **Decimal only** | `rust_decimal::Decimal` for all prices, quantities, PnL. Zero `f64` in financial logic. |
+| **thiserror in libs** | `risk`, `bus`, `gateway`, `engine-core`, `observability`, `api` define typed errors with `thiserror`. |
+| **anyhow in bins** | `bins/feynman-engine` and integration tests use `anyhow::Result`. No `Box<dyn Error>`. |
+| **`#[must_use]`** | On every fn returning `RiskApproval`, `OrderAck`, `Result`. Caller must handle it. |
+| **Type-state for pipeline** | Pipeline stages (`Draft → Validated → RiskChecked → Routed → LiveOrder`) encoded in the type system. Venue lifecycle uses runtime `VenueState` enum with exhaustive match. See DATA_MODEL.md §3. |
+| **Sealed traits** | `CircuitBreaker`, `VenueAdapter` are sealed — external crates cannot implement them. |
+| **`impl Trait` in hot paths** | Static dispatch for Sequencer inner loop. `Box<dyn Trait>` only at wiring boundaries. |
+| **`pub(crate)` default** | Internal APIs use `pub(crate)`. `pub` only for crate contract surface. |
+| **Newtypes everywhere** | `OrderId`, `AgentId`, `VenueId` — never raw `String` parameters for domain IDs. |
+| **`From`/`TryFrom` only** | No standalone `to_foo()`/`from_foo()`. Use standard conversion traits. |
+| **Builder for complex configs** | Any struct with 3+ optional fields uses a builder with validation in `build()`. |
+| **No `.clone()` in hot path** | Sequencer loop: borrow, don't clone. Clone once at async task boundaries. |
+| **Clippy pedantic** | `[lints.clippy] pedantic = "warn"` in all financial crates. |
+| **Exhaustive match** | No `_` wildcard on enums you own. Every new variant is a compile error. |
+
+See `AGENTS.md §4` for code examples for each rule.
+
+---
+
 ## Operating Principles
 
 - **Architecture first.** Before writing code, check if the change touches a safety boundary (risk evaluation, order submission, state mutation). If it does, understand the failure modes first.
@@ -75,7 +98,7 @@ gh pr create --draft --base dev
 | Bug fixed → root cause | memory `anti-patterns.md` |
 | Design flaw / wrong assumption | memory `evolution-log.md` |
 
-- **Money-touching code** (agent-risk, pipeline, api, bins/feynman-engine) → run `/hostile-review` before finalizing.
+- **Money-touching code** (risk, engine-core, gateway, api, bins/feynman-engine) → run `/hostile-review` before finalizing.
 
 ---
 

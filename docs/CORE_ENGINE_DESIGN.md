@@ -26,7 +26,7 @@
 7. [Risk Architecture](#7-risk-architecture)
 8. [Execution Gateway](#8-execution-gateway)
 9. [Journal & State Recovery](#9-journal--state-recovery)
-10. [Execution Context (Backtest / Paper / Live)](#10-execution-context)
+10. [Execution Modes (Backtest / Paper / Live)](#10-execution-modes)
 11. [Message Bus](#11-message-bus)
 12. [Position Model](#12-position-model)
 13. [Observability & Dashboard](#13-observability--dashboard)
@@ -42,7 +42,7 @@
 
 | # | Principle | Rationale |
 |---|-----------|-----------|
-| 1 | **One trait, three modes** | Strategy code is identical across backtest, paper, and live. The `ExecutionContext` trait is the boundary. If strategy code compiles, it works in all modes. |
+| 1 | **One service, three modes** | The engine is a gRPC service. Same binary, same `EngineCore`, same risk pipeline in backtest, paper, and live. Mode is deployment config (`FEYNMAN_MODE`), not code. Strategies never import engine internals — the gRPC boundary is the only interface. |
 | 2 | **Venue is source of truth** | Internal state is a cache. The exchange knows what you actually hold. Reconciliation is continuous, not periodic. |
 | 3 | **Fees are first-class** | Fees determine whether a trade has edge. Fee model is identical in backtest and live. Fee estimates inform execution strategy selection. |
 | 4 | **Layered risk defense** | Layer 0 (circuit breakers, compiled-in) → Layer 1 (programmatic risk gate, configurable) → Layer 2 (LLM risk agent) → Layer 3 (human CIO). Each layer is independent. |
@@ -641,68 +641,78 @@ pub struct AlpacaParams {
 
 **Rule:** If a parameter is used by 3+ venues, promote it to the canonical model. If it's venue-specific, it stays in `VenueParams`. The adapter pattern-matches its own variant and ignores others.
 
-### 4.10 Order Lifecycle State Machine
+### 4.10 Order Lifecycle: Hybrid Type-State + Runtime FSM
+
+> **Design decision (2026-03-18):** The order lifecycle uses two complementary mechanisms:
+>
+> 1. **Type-state pipeline** (compile-time) — `PipelineOrder<Draft>` → `<Validated>` → `<RiskChecked>` → `<Routed>` — ensures orders cannot skip validation or risk checks. Invalid transitions don't compile.
+>
+> 2. **Runtime venue FSM** (`VenueState` enum) — handles event-driven venue lifecycle (fills, cancels, expirations) where transitions are non-deterministic and data-driven.
+>
+> The boundary is `submit()`: it consumes `PipelineOrder<Routed>` and produces a `LiveOrder` with a runtime `VenueState`. See **DATA_MODEL.md §3** for the canonical type definitions.
+
+#### Pipeline (Type-State — Compile-Time Safety)
 
 ```rust
-pub enum OrderState {
-    /// Created but not yet submitted to risk gate.
-    New,
+// Zero-sized marker types (sealed — external crates cannot add stages)
+pub struct Draft;       // just created
+pub struct Validated;   // passed stateless validation
+pub struct RiskChecked; // passed risk gate (carries RiskProof)
+pub struct Routed;      // venue selected, ready to submit
 
-    /// Passed risk gate, submitted to venue, awaiting acknowledgment.
-    Submitted {
-        venue_order_id: VenueOrderId,
-        submitted_at: DateTime<Utc>,
-    },
+pub struct PipelineOrder<S: PipelineStage> {
+    pub id: OrderId,
+    pub client_order_id: ClientOrderId,
+    pub agent: AgentId,
+    pub market: MarketId,
+    pub side: Side,
+    pub qty: Decimal,
+    pub pricing: OrderPricing,
+    pub dry_run: bool,           // default: true
+    // ... (see DATA_MODEL.md §3.1 for full fields)
+    _stage: PhantomData<S>,
+}
 
-    /// Acknowledged by venue, resting on book (limit orders).
-    Open {
-        venue_order_id: VenueOrderId,
-        opened_at: DateTime<Utc>,
-    },
+// Each transition consumes self and returns the next type.
+// Invalid transitions (e.g., Draft → Routed) don't compile.
+impl PipelineOrder<Draft> {
+    pub fn validate(self, caps: &VenueCapabilities) -> Result<PipelineOrder<Validated>, ValidationError>;
+}
+impl PipelineOrder<Validated> {
+    pub fn risk_check(self, ...) -> RiskOutcome;  // → RiskChecked, Resize(Draft), or Rejected
+}
+impl PipelineOrder<RiskChecked> {
+    pub fn route(self, ...) -> Result<PipelineOrder<Routed>, RoutingError>;
+}
+impl PipelineOrder<Routed> {
+    pub async fn submit(self, adapter: &dyn VenueAdapter) -> Result<LiveOrder, SubmissionError>;
+}
+```
 
-    /// Conditional/trigger order accepted, waiting for trigger condition.
-    Triggered {
-        venue_order_id: VenueOrderId,
-        // Not yet active on book — waiting for trigger price
-    },
+#### Venue Lifecycle (Runtime FSM — Event-Driven)
 
-    /// Partially filled — some quantity executed.
-    PartiallyFilled {
-        venue_order_id: VenueOrderId,
-        filled_qty: Decimal,
-        remaining_qty: Decimal,
-        avg_fill_price: Decimal,
-        total_fee: Fee,
-    },
+Once on a venue, state changes are driven by external events. The `VenueState` enum uses runtime validation with exhaustive match (no wildcards).
 
-    /// Fully filled.
-    Filled {
-        venue_order_id: VenueOrderId,
-        total_qty: Decimal,
-        avg_fill_price: Decimal,
-        total_fee: Fee,
-        filled_at: DateTime<Utc>,
-    },
+```rust
+/// Venue-driven order state. Transitions validated at runtime.
+/// Every transition method exhaustively matches all variants — no `_ =>`.
+pub enum VenueState {
+    Submitted,
+    Accepted { accepted_at: DateTime<Utc> },
+    Triggered { triggered_at: DateTime<Utc> },
+    PartiallyFilled { summary: FillSummary },
+    Filled { summary: FillSummary, filled_at: DateTime<Utc> },
+    VenueRejected { reason: String, rejected_at: DateTime<Utc> },
+    Cancelled { reason: CancelReason, summary: FillSummary, cancelled_at: DateTime<Utc> },
+    Expired { summary: FillSummary, expired_at: DateTime<Utc> },
+}
 
-    /// Cancelled (may have partial fills).
-    Cancelled {
-        reason: CancelReason,
-        filled_qty: Decimal,            // may be > 0 if partially filled before cancel
-        cancelled_at: DateTime<Utc>,
-    },
-
-    /// Rejected by venue or risk gate.
-    Rejected {
-        reason: String,
-        rejected_by: RejectedBy,
-        rejected_at: DateTime<Utc>,
-    },
-
-    /// Expired (GTD reached expiry, DAY order after close).
-    Expired {
-        filled_qty: Decimal,
-        expired_at: DateTime<Utc>,
-    },
+pub struct FillSummary {
+    pub filled_qty: Decimal,
+    pub remaining_qty: Decimal,
+    pub avg_fill_price: Decimal,
+    pub total_fee: Decimal,
+    pub fill_count: u32,
 }
 
 pub enum CancelReason {
@@ -717,38 +727,53 @@ pub enum CancelReason {
     SelfTradePreventionTriggered,
 }
 
-pub enum RejectedBy {
-    CircuitBreaker,
-    RiskGate { violations: Vec<RiskViolation> },
-    Venue { error_code: String },
-}
+// Transitions return Result — invalid transitions are Err, never panic.
+impl VenueState {
+    pub fn on_accepted(self, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
+    pub fn on_fill(self, fill: &Fill, original_qty: Decimal) -> Result<Self, InvalidTransition>;
+    pub fn on_cancel(self, reason: CancelReason, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
+    pub fn on_reject(self, reason: String, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
+    pub fn on_expire(self, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
+    pub fn on_triggered(self, at: DateTime<Utc>) -> Result<Self, InvalidTransition>;
 
-// Compile-time enforcement: only valid transitions exist as methods.
-impl OrderState {
-    pub fn on_submit(self, vid: VenueOrderId) -> Result<Self>;
-    pub fn on_open(self) -> Result<Self>;
-    pub fn on_fill(self, fill: &Fill) -> Result<Self>;
-    pub fn on_cancel(self, reason: CancelReason) -> Result<Self>;
-    pub fn on_reject(self, reason: String, by: RejectedBy) -> Result<Self>;
-    pub fn on_expire(self) -> Result<Self>;
-    // Invalid transitions: calling on_fill on a Cancelled order → Err
+    pub fn is_terminal(&self) -> bool;
+    pub fn is_live(&self) -> bool;
 }
 ```
 
-**Valid state transitions:**
+#### Rejections (Before Venue)
+
+Orders rejected during the pipeline (validation, risk, routing) never reach a venue. They become `RejectedOrder` — a separate type, not a `VenueState` variant.
+
+```rust
+pub struct RejectedOrder {
+    pub id: OrderId,
+    pub agent: AgentId,
+    pub reason: RejectionReason,
+    pub at: DateTime<Utc>,
+}
+
+pub enum RejectionReason {
+    ValidationFailed(Vec<ValidationError>),
+    CircuitBreakerTripped { breaker: String, reason: String },
+    RiskGateRejected { violations: Vec<RiskViolation> },
+    RoutingFailed { reason: String },
+    SubmissionFailed { reason: String },
+}
+```
+
+#### Valid Venue State Transitions
 
 ```
-New ──► Submitted ──► Open ──► PartiallyFilled ──► Filled
- │          │          │              │
- │          │          │              └──► Cancelled
- │          │          │              └──► Expired
- │          │          └──► Filled
- │          │          └──► Cancelled
- │          │          └──► Expired
- │          └──► Triggered ──► Open ──► ...
- │          └──► Rejected
- │          └──► Cancelled
- └──► Rejected (by risk gate, before submission)
+Submitted ──► Accepted ──► PartiallyFilled ──► Filled
+    │             │              │
+    │             │              └──► Cancelled (partial fills preserved)
+    │             │              └──► Expired
+    │             └──► Filled
+    │             └──► Cancelled
+    │             └──► Expired
+    └──► Triggered ──► Accepted ──► ...
+    └──► VenueRejected
 ```
 
 ---
@@ -799,13 +824,13 @@ pub trait VenueAdapter: Send + Sync {
 
     /// Subscribe to real-time fills via WebSocket where supported,
     /// polling fallback otherwise. Adapter handles reconnection internally.
-    fn subscribe_fills(&self) -> mpsc::UnboundedReceiver<Fill>;
+    fn subscribe_fills(&self) -> mpsc::Receiver<Fill>;
 
     fn subscribe_market_data(
         &self,
         symbol: &str,
         events: &[MarketDataSubscription],
-    ) -> mpsc::UnboundedReceiver<MarketEvent>;
+    ) -> mpsc::Receiver<MarketEvent>;
 
     // ── Fee Info ──
 
@@ -1070,19 +1095,49 @@ pub struct CircuitBreakerTrip {
 }
 ```
 
-**Hardcoded breakers (examples, exact values set at compile time):**
+**Hardcoded breakers (compiled-in, not configurable at runtime):**
 
-| Breaker | Condition | Action |
-|---------|-----------|--------|
-| Max single order size | Notional > $X | Reject |
-| Max position per symbol | Net exposure > Y contracts | Reject |
-| Max drawdown | Daily P&L < -Z% NAV | Halt all trading |
-| Max orders per minute | Rate > N/min | Reject |
-| Dry-run bypass | `dry_run == false` without explicit flag | Reject |
+| # | Breaker | Condition | Action | Reset |
+|---|---------|-----------|--------|-------|
+| CB-1 | Max single order notional | `order.notional > MAX_SINGLE_ORDER` | Reject order | N/A (per-order) |
+| CB-2 | Max position per instrument | `net_exposure(instrument) > MAX_INSTRUMENT_POSITION` | Reject order | N/A (per-order) |
+| CB-3 | Max firm gross notional | `firm.gross_notional > MAX_FIRM_GROSS` | Reject all new orders | Manual reset |
+| CB-4 | Firm daily loss | `firm.daily_pnl < -MAX_DAILY_LOSS_PCT * NAV` | **Halt all trading** | Manual reset + CIO approval |
+| CB-5 | Firm hourly loss | `firm.hourly_pnl < -MAX_HOURLY_LOSS_PCT * NAV` | **Halt all trading** | Manual reset |
+| CB-6 | Orders per minute (firm) | `firm_orders_last_60s > MAX_ORDERS_PER_MIN` | Reject new orders (fills still processed) | Auto-reset when rate drops |
+| CB-7 | Orders per minute (per-agent) | `agent_orders_last_60s > MAX_AGENT_ORDERS_PER_MIN` | Reject agent's orders | Auto-reset when rate drops |
+| CB-8 | Venue error rate | `venue_errors_last_5min / venue_requests_last_5min > 0.5` | Pause venue routing | Auto-reset when rate drops |
+| CB-9 | Venue disconnected | `venue.last_heartbeat > MAX_VENUE_DISCONNECT` | Reject orders to that venue | Auto-reset on reconnect |
+| CB-10 | Dry-run bypass | `dry_run == false` without explicit `FEYNMAN_MODE=live` | **Hard reject** (never bypassable) | N/A |
+| CB-11 | Sequencer queue depth | `sequencer_command_queue > MAX_QUEUE_DEPTH` | Reject new orders (backpressure) | Auto-reset when drained |
+
+**Circuit breaker hierarchy:** CB-4/CB-5 (loss-based) trigger `HaltAll` — the nuclear option.
+CB-1 through CB-3 and CB-6+ are per-order or per-venue — they reject without halting.
+`HaltAll` requires manual intervention: `ResumeAll` RPC or restart with CIO approval.
+
+**Values are compile-time constants** in `crates/risk/src/circuit_breaker.rs`. Changing
+them requires a code change + review + deploy. This is deliberate — the last line of
+defense should not be hot-reloadable.
 
 ### 7.2 Layer 1: Programmatic Risk Gate
 
 Stateful risk evaluation. Knows current firm book. Configurable limits (hot-reloadable by Layer 2 or Layer 3). Fast (<1ms per evaluation).
+
+**The risk gate is path-aware.** Checks are split by ingress path:
+
+**Universal checks (all paths: `SubmitSignal`, `SubmitOrder`, `SubmitBatch`):**
+1. Position notional <= 5% of NAV
+2. Account risk <= 1% of NAV (uses `stop_loss` if present; worst-case = full notional if absent)
+3. Leverage within agent limits
+4. Agent drawdown within threshold
+5. Cash reserve >= 20% of NAV
+6. Per-agent budget isolation, per-instrument/venue limits, allowed whitelists
+
+**Signal-specific checks (`SubmitSignal` only — engine owns sizing):**
+7. Stop loss defined (required for engine to calculate max loss and position size)
+8. Risk/reward >= 2:1 (when both `stop_loss` and `take_profit` are present)
+
+Algo/ML strategies via `SubmitOrder`/`SubmitBatch` manage their own exits — the engine enforces position limits and budget isolation but does not require stop losses.
 
 ```rust
 pub trait RiskGate: Send + Sync {
@@ -1151,8 +1206,9 @@ pub struct InstrumentRiskLimits {
 }
 
 pub struct VenueRiskLimits {
-    pub max_notional: Decimal,             // counterparty risk limit
+    pub max_notional: Decimal,             // counterparty/concentration risk limit
     pub max_positions: u32,
+    pub max_pct_of_nav: Decimal,           // max % of firm NAV on this venue (concentration)
 }
 
 pub struct PredictionMarketLimits {
@@ -1240,7 +1296,7 @@ pub trait ExecutionGateway: Send + Sync {
     async fn open_orders(&self) -> Result<Vec<OrderRecord>>;
 
     /// Fill stream (for downstream consumers).
-    fn fill_stream(&self) -> mpsc::UnboundedReceiver<Fill>;
+    fn fill_stream(&self) -> mpsc::Receiver<Fill>;
 }
 
 pub struct OrderAck {
@@ -1392,7 +1448,37 @@ pub enum EmulationType {
 }
 ```
 
-### 8.5 Portfolio / Signal-to-Order Generator
+### 8.5 Symbol ↔ Instrument Mapping
+
+`SubmitSignal` uses unified `InstrumentId` ("BTC"). `SubmitOrder` uses venue-native `(venue, symbol)` ("bybit", "BTCUSDT"). The engine must map between these for cross-venue exposure checks.
+
+The engine maintains a **symbol map** loaded from config:
+
+```rust
+/// Maps venue-native symbols to unified instrument identifiers.
+/// Used by the risk gate for cross-venue exposure aggregation.
+pub struct SymbolMap {
+    /// (venue, symbol) → InstrumentId
+    forward: HashMap<(VenueId, String), InstrumentId>,
+    /// InstrumentId → Vec<(venue, symbol)> for routing
+    reverse: HashMap<InstrumentId, Vec<(VenueId, String)>>,
+}
+```
+
+Strategies don't need to know unified IDs — they send venue-native symbols and the engine resolves them. If a `(venue, symbol)` pair is not in the map, the order is rejected (`INVALID_ARGUMENT`).
+
+### 8.5.1 Venue Routing (Signals)
+
+When an LLM agent sends `SubmitSignal` with `instrument="BTC"`, the engine must pick a venue. Routing policy (Phase 1 decision — Phase 0 uses a single default venue):
+
+- Available venues for that instrument (from symbol map reverse lookup)
+- Agent's `allowed_venues` whitelist
+- Venue connection health
+- Available balance on each venue
+
+The Router (in the `gateway` crate) selects the venue. The routing policy is configurable but explicit — no silent fallback to a different venue.
+
+### 8.5.2 Portfolio / Signal-to-Order Generator
 
 Converts agent signals into concrete `CanonicalOrder`s. This is the bridge between the agent world (signals with conviction) and the execution world (orders with price/qty).
 
@@ -1445,7 +1531,7 @@ pub trait PipelineStage: Send + Sync {
 /// Additional stages (e.g., fee optimizer, order dedup) can be inserted.
 ```
 
-### 8.7 Graceful Shutdown
+### 8.7 Graceful Shutdown Protocol
 
 Trading systems can't just `process::exit`. Open orders, in-flight submissions, and pending acknowledgments must be handled cleanly.
 
@@ -1468,6 +1554,91 @@ pub enum CancelPolicy {
     CancelByAgent(Vec<AgentId>),
 }
 ```
+
+**Shutdown sequence (ordered, not parallelizable):**
+
+```
+SIGTERM / HaltAll RPC received
+  │
+  ├─ 1. STOP INGRESS
+  │     Close gRPC listener (reject new connections)
+  │     Stop consuming from Redis bus
+  │     Log: "Shutdown initiated, no new orders accepted"
+  │
+  ├─ 2. DRAIN SEQUENCER
+  │     Process remaining commands in queue (bounded: queue size at time of signal)
+  │     Do NOT accept new commands from ingress (step 1 already closed)
+  │     Timeout: drain_timeout (default: 10s)
+  │
+  ├─ 3. CANCEL OR LEAVE OPEN ORDERS (per CancelPolicy)
+  │     If CancelAll: send cancel to each venue for every open order
+  │     If LeaveOpen: skip (orders survive on venue, will be reconciled on restart)
+  │     If CancelByAgent: cancel only matching agent orders
+  │     Timeout: 5s per venue (fire-and-forget after timeout — venue may not respond)
+  │
+  ├─ 4. DRAIN FILLS
+  │     Wait for in-flight fills (orders submitted before step 2)
+  │     Process any fills that arrive during drain window
+  │     Timeout: drain_timeout (default: 10s)
+  │     After timeout: log unresolved orders as "orphaned" for startup reconciliation
+  │
+  ├─ 5. FLUSH JOURNAL
+  │     Ensure all pending events are fsync'd
+  │     Write EngineShutdown event with reason
+  │
+  ├─ 6. SNAPSHOT
+  │     If snapshot_on_exit: serialize current state to snapshot store
+  │     This makes restart faster (less journal tail to replay)
+  │
+  ├─ 7. CLOSE VENUE CONNECTIONS
+  │     Close WebSocket connections to all venues
+  │     Close Redis connection
+  │
+  └─ 8. EXIT
+       Log: "Shutdown complete, X orders orphaned"
+       Exit code 0 (clean) or 1 (timeout/error during shutdown)
+```
+
+**Emergency shutdown (SIGKILL / OOM / panic):** No graceful shutdown is possible.
+The startup reconciliation protocol (§9.2.1) handles this case — it queries all venues
+for orphaned orders and reconciles state on restart.
+
+### 8.8 Cross-Venue Batch Semantics
+
+`SubmitBatch` with `atomic=true` promises all-or-nothing risk evaluation, but
+**cannot guarantee all-or-nothing execution across venues**. This is a distributed
+transaction without rollback — a filled order on Bybit cannot be "unfilled."
+
+**Constraint: `atomic=true` only allowed for same-venue batches.**
+
+```rust
+/// Validate batch request. Called before risk evaluation.
+fn validate_batch(batch: &BatchRequest) -> Result<()> {
+    if batch.atomic {
+        let venues: HashSet<_> = batch.orders.iter().map(|o| &o.venue).collect();
+        anyhow::ensure!(
+            venues.len() == 1,
+            "atomic batch must target a single venue, got: {:?}", venues
+        );
+    }
+    Ok(())
+}
+```
+
+**Cross-venue batches** (`atomic=false`) use best-effort execution:
+- Each order is risk-checked as a unit (net exposure of the batch, not individual orders)
+- Orders are dispatched to their respective venues independently
+- Each order may succeed or fail independently
+- `BatchAck` reports per-order status
+- If a leg fails, other legs are NOT automatically cancelled — the strategy must
+  handle partial execution (e.g., send compensating cancels)
+- The engine emits a `BatchPartialFill` event for monitoring
+
+**Why not compensating cancels?** Because:
+1. By the time we know leg B failed, leg A may already be filled
+2. Cancelling a filled order is impossible
+3. Automatic hedging on failure is a strategy decision, not an engine decision
+4. Implicit compensation violates Principle #11 (explicit over implicit)
 
 ---
 
@@ -1497,9 +1668,18 @@ pub enum CancelPolicy {
 ```rust
 pub struct Event {
     pub seq: u64,                   // monotonic sequence number
+    pub schema_version: u16,        // event schema version (for journal replay compatibility)
     pub timestamp: DateTime<Utc>,
     pub kind: EventKind,
 }
+
+/// Schema versioning rules:
+/// - Adding a new EventKind variant: bump minor (same schema_version, new variant is ignored by old code)
+/// - Changing fields of an existing variant: bump schema_version, write migration in journal replay
+/// - Removing a variant: never (old journals reference it). Deprecate with a comment.
+///
+/// Journal replay checks: if event.schema_version > CURRENT_SCHEMA_VERSION, return Err
+/// (don't silently skip events from a newer version — that could lose state).
 
 pub enum EventKind {
     // ── Order Lifecycle ──
@@ -1575,32 +1755,96 @@ pub trait Journal: Send + Sync {
     async fn latest_seq(&self) -> Result<u64>;
 
     /// Subscribe to new events (for real-time consumers: dashboard, bus bridge).
-    fn subscribe(&self) -> mpsc::UnboundedReceiver<Event>;
+    fn subscribe(&self) -> mpsc::Receiver<Event>;
 }
 ```
 
-### 9.2.1 Crash Recovery Protocol
+### 9.2.1 Startup & Crash Recovery Protocol
+
+The engine may restart after a clean shutdown (§8.7), a crash, or an OOM kill. In all cases,
+there may be **orphaned orders on venues** — orders the engine submitted but never received
+fills for, or fills that arrived after the engine died. The startup protocol must reconcile
+internal state with venue reality before accepting new commands.
 
 ```
 Engine starts
   │
-  ├─ 1. Load latest snapshot from StateStore
+  ├─ 1. RESTORE INTERNAL STATE
+  │     Load latest snapshot from StateStore
   │     → returns Option<(seq, state)>
   │
-  ├─ 2. If snapshot exists at seq N:
+  │     If snapshot exists at seq N:
   │       replay journal from seq N+1 → latest
   │       apply each event to state via StateStore::apply_event()
   │
-  │     If no snapshot:
-  │       query all venues for positions, balances, open orders
-  │       build state from venue truth (cold start)
-  │       write snapshot at current seq
+  │     If no snapshot (cold start):
+  │       start with empty state
+  │       (will be populated from venue truth in step 3)
   │
-  ├─ 3. Run immediate reconciliation against all venues
-  │       any divergence → PositionDivergence event → alert
+  ├─ 2. CONNECT TO ALL VENUES
+  │     Establish WebSocket + REST connections
+  │     If a venue is unreachable: log warning, mark venue as degraded
+  │     Do NOT proceed to step 4 until all venues are either connected or
+  │     explicitly marked degraded (with alert)
   │
-  └─ 4. Resume normal operation
+  ├─ 3. RECONCILE WITH VENUES (before accepting any commands)
+  │     For each connected venue:
+  │
+  │     a. POSITION RECONCILIATION
+  │        Query: adapter.get_positions()
+  │        Compare: internal positions vs venue positions
+  │        If divergence:
+  │          → PositionDivergence event → correct internal state to venue truth
+  │          → Alert: "position corrected on startup"
+  │
+  │     b. OPEN ORDER RECONCILIATION
+  │        Query: adapter.get_open_orders()
+  │        Compare: internal open orders vs venue open orders
+  │
+  │        Venue has order, engine doesn't (orphan):
+  │          → Adopt: create OrderRecord from venue data, mark as "adopted"
+  │          → Alert: "adopted orphaned order {id} on {venue}"
+  │          → Strategy: leave it resting (strategy can cancel if unwanted)
+  │
+  │        Engine has order, venue doesn't (ghost):
+  │          → Check: query venue for recent fills for that order_id
+  │          → If filled: apply fill, update position
+  │          → If cancelled/expired: mark order as cancelled
+  │          → If unknown: mark as "lost" + alert
+  │
+  │     c. FILL GAP DETECTION
+  │        Query: adapter.get_recent_fills(since: last_known_fill_time)
+  │        For each fill not in journal:
+  │          → Apply fill to state
+  │          → Journal: OrderFilled event
+  │          → Alert: "recovered missed fill {id}"
+  │
+  │     d. BALANCE RECONCILIATION
+  │        Query: adapter.get_balance()
+  │        Compare: tracked balance vs venue balance
+  │        If divergence > threshold: alert (but don't correct — balance
+  │        discrepancies may be deposits/withdrawals, not bugs)
+  │
+  ├─ 4. WRITE POST-RECONCILIATION SNAPSHOT
+  │     Snapshot at current seq
+  │     Journal: EngineStarted { version, reconciliation_summary }
+  │
+  ├─ 5. START ACCEPTING COMMANDS
+  │     Open gRPC listener
+  │     Start Redis bus consumer
+  │     Resume normal operation
+  │
+  └─ Note: NO COMMANDS ARE PROCESSED between steps 1-4.
+     The engine is not "partially up." It's either fully reconciled or not started.
 ```
+
+**Startup reconciliation is blocking.** The engine does not accept any gRPC calls or
+Redis messages until reconciliation completes. This prevents new risk checks from
+running against stale state. Health check endpoint returns `starting` during this phase.
+
+**Degraded venue startup:** If a venue is unreachable, the engine starts without it.
+Orders for that venue are rejected. When the venue reconnects, a deferred reconciliation
+runs for that venue only. Alert: "venue {id} degraded on startup."
 
 **Snapshot frequency:** Every N minutes or every M events, whichever comes first.
 Snapshots are cheap (serialize materialized state to disk). Journal tail replay
@@ -1667,66 +1911,28 @@ pub struct PnLSummary {
 
 ---
 
-## 10. Execution Context
+## 10. Execution Modes
 
-The trait that strategy code programs against. Identical interface for backtest, paper, and live.
+> **Historical note:** This section previously defined `StrategyContext`, `MarketDataProvider`,
+> `OrderSubmitter`, and `PortfolioReader` traits. These were removed when the architecture
+> decision was made that the engine is **always a service** — strategies talk via gRPC, not
+> Rust traits. The gRPC API (§7 of `service.proto`) is the strategy-facing interface.
+> See [STRATEGY_ENGINE_BOUNDARY.md](./STRATEGY_ENGINE_BOUNDARY.md) for the boundary contract.
 
-### 10.1 Core Traits (Split)
+### 10.1 Mode Configuration
 
-The monolithic `ExecutionContext` is split into focused sub-traits. This follows the Interface Segregation Principle — strategies that only need market data don't depend on order submission, and test doubles are simpler.
+The engine binary accepts a mode via env var or config:
 
 ```rust
-/// Market data provider. Used by strategies that need prices.
-pub trait MarketDataProvider: Send + Sync {
-    fn subscribe_market_data(
-        &self,
-        market: &MarketId,
-        events: &[MarketDataSubscription],
-    ) -> mpsc::UnboundedReceiver<MarketEvent>;
+pub enum EngineMode {
+    Live,      // Real venues, real fills, persisted state
+    Paper,     // Real market data, simulated fills, persisted state
+    Backtest,  // Simulated venues, simulated clock, in-memory state
 }
 
-/// Order submitter. Used by strategies that need to place orders.
-#[async_trait]
-pub trait OrderSubmitter: Send + Sync {
-    async fn submit(&self, order: CanonicalOrder) -> Result<OrderAck>;
-    async fn cancel(&self, order_id: &OrderId) -> Result<()>;
-    async fn amend(
-        &self,
-        order_id: &OrderId,
-        new_price: Option<Decimal>,
-        new_qty: Option<Decimal>,
-    ) -> Result<()>;
-    fn fill_stream(&self) -> mpsc::UnboundedReceiver<Fill>;
-}
-
-/// Portfolio reader. Used by strategies that need position/balance info.
-#[async_trait]
-pub trait PortfolioReader: Send + Sync {
-    async fn positions(&self) -> Result<Vec<StrategyPosition>>;
-    async fn positions_by_agent(&self, agent: &AgentId) -> Result<Vec<StrategyPosition>>;
-    async fn firm_book(&self) -> Result<FirmBook>;
-    async fn open_orders(&self) -> Result<Vec<OrderRecord>>;
-    async fn balance(&self, venue: &VenueId) -> Result<VenueBalance>;
-    fn estimate_fees(&self, order: &CanonicalOrder) -> Result<FeeEstimate>;
-}
-
-/// Unified strategy context — composes all sub-traits.
-/// This is what strategy code programs against. Identical for backtest, paper, live.
-#[async_trait]
-pub trait StrategyContext: MarketDataProvider + OrderSubmitter + PortfolioReader + Send + Sync {
-    fn mode(&self) -> ExecutionMode;
-    fn clock(&self) -> &dyn Clock;
-}
-
-pub enum ExecutionMode { Backtest, Paper, Live }
-
-pub enum MarketDataSubscription {
-    Trades,
-    BookUpdates { depth: usize },
-    Klines { interval: Duration },
-    FundingRate,
-    Liquidations,
-}
+// Set via: FEYNMAN_MODE=live | paper | backtest
+// Or config: [engine] mode = "paper"
+// Default: paper (safe default — never accidentally trade live)
 ```
 
 ### 10.2 Implementation Modes
@@ -1738,7 +1944,7 @@ via gRPC in all modes — they don't know which mode the engine is running in.
 | Mode | Market Data | Fills | State | Clock | Fees |
 |------|-------------|-------|-------|-------|------|
 | **Live** | WebSocket/polling from venues | Real fills from venues | Persisted (SQLite/Postgres) | Wall clock | Real fee schedules |
-| **Paper** | Live feeds from venues | Simulated against live orderbook | Persisted | Wall clock | Real fee schedules |
+| **Paper** | Venue adapter subscribes to real feeds | Simulated against live orderbook | Persisted | Wall clock | Real fee schedules |
 | **Backtest** | N/A (engine doesn't distribute data) | `SimulatedVenue` adapter | In-memory | `SimulatedClock` (advanced via `AdvanceClock` RPC) | Same fee schedules as live |
 
 **The engine is always a service.** No strategy imports `EngineCore` directly. The gRPC
@@ -1751,7 +1957,38 @@ and returns fills from its `SimulatedVenue` — same as live, different adapters
 
 See §15.7 for the full backtest architecture.
 
-### 10.3 Fill Simulation (Paper + Backtest)
+### 10.2.1 `dry_run` Override Rule
+
+The `OrderRequest` proto has a per-order `dry_run` field. The engine mode takes precedence:
+
+- **Paper/Backtest mode:** `dry_run` is always `true` regardless of per-order value. The engine ignores the per-order flag — fills are always simulated.
+- **Live mode:** per-order `dry_run` applies. Defaults to `true`. Strategy must explicitly set `dry_run=false` to submit real orders.
+
+This means a strategy running in paper mode cannot accidentally place real orders even if it sends `dry_run=false`. The mode-level guard is the outer safety boundary; the per-order flag is the inner boundary for live mode.
+
+### 10.3 Paper Mode: How Fills Are Simulated
+
+In paper mode, the venue adapter task maintains a **real WebSocket connection** to the
+venue for market data (orderbook, trades). When an order is "submitted," the adapter
+does NOT send it to the exchange. Instead, it passes the order to its local
+`FillSimulator`, which simulates fills against the live orderbook snapshot.
+
+```
+Paper Mode Venue Adapter Task
+  │
+  ├─ Real WebSocket → live orderbook updates (read-only)
+  ├─ Receives ApprovedOrder from Execution Dispatcher
+  ├─ Does NOT call venue REST API to submit
+  ├─ Calls FillSimulator.simulate(order, live_orderbook, fee_model)
+  ├─ Returns SimulatedFill to Sequencer (same channel as real fills)
+  └─ From the Sequencer's perspective, paper fills are indistinguishable from real fills
+```
+
+This means paper mode has real market data latency but no execution risk. The
+`FillSimulator` models slippage based on the live orderbook depth at the time of
+the order — not historical data.
+
+### 10.4 Fill Simulation Model
 
 The engine's internal fill simulator, used when real venue fills are not available.
 For high-fidelity fill simulation with queue-position modeling and latency effects,
@@ -2252,6 +2489,29 @@ pub enum AlertSeverity {
 
 Alert sinks (implementations): log file, dashboard panel, Telegram bot, Slack webhook, email. Start with log + dashboard, add notification channels as needed.
 
+**Specific alert triggers (must be implemented):**
+
+| # | Trigger | Severity | Condition |
+|---|---------|----------|-----------|
+| A-1 | Reconciliation divergence | Critical | Position qty differs from venue by > `divergence_threshold` |
+| A-2 | Venue disconnected | Critical | No heartbeat for > 30s |
+| A-3 | Agent approaching limit | Warning | Any risk metric > 80% of limit |
+| A-4 | Agent limit breached | Critical | Drawdown or loss limit exceeded → agent paused |
+| A-5 | Circuit breaker tripped | Emergency | Any CB-4/CB-5 (loss-based halt) |
+| A-6 | Sequencer backlog | Warning | Command queue depth > 50% of capacity for > 5s |
+| A-7 | Journal write latency | Warning | Journal append > 10ms (expected < 1ms) |
+| A-8 | Fill-to-state latency | Warning | Fill received → position updated > 1s |
+| A-9 | Orphaned order detected | Critical | Order stuck in `Submitted` > 30s without venue ack |
+| A-10 | Startup reconciliation correction | Critical | Any position corrected during startup (§9.2.1) |
+| A-11 | Missed fill recovered | Critical | Fill gap detection found fills we missed (§9.2.1 step 3c) |
+| A-12 | HaltAll triggered | Emergency | Any component calls HaltAll → all channels notified |
+| A-13 | Venue error rate spike | Warning | > 20% error rate on venue API calls in 5-min window |
+| A-14 | Daily P&L threshold | Warning | Firm daily P&L crosses -50% of max daily loss limit |
+
+**Alerting is not optional.** A-1, A-5, A-10, A-12 must be implemented before Phase 1
+(live trading). The others can be added incrementally but must be present before Phase 3
+(scaled live).
+
 ---
 
 ## 14. Verification Strategy
@@ -2430,17 +2690,64 @@ corruption before it compounds.
 
 ### 14.7 Shadow Mode
 
-Before cutting over to production:
+Before cutting over to production, the Rust engine runs in shadow mode alongside the
+current Node.js executor. Shadow mode receives the same inputs but does NOT execute
+orders — it only evaluates and logs what it *would* have done.
+
+**Architecture:**
 
 ```
-Live orders ──► Current system (executes)
-                     │
-                     └──► Rust engine (shadow mode: evaluates, does not execute)
-                              │
-                              ├──► Divergence log (did decisions differ?)
-                              ├──► Latency comparison (is Rust faster?)
-                              └──► State consistency (does Rust state match?)
+                         ┌─────────────────────────────────┐
+                         │  Redis Streams (signal bus)      │
+                         └──────────┬──────────────────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │  Signal Splitter     │
+                         │  (Redis consumer)    │
+                         └───┬─────────────┬────┘
+                             │             │
+                    ┌────────▼───┐   ┌─────▼──────────┐
+                    │ Node.js    │   │ Rust Engine     │
+                    │ Executor   │   │ (shadow mode)   │
+                    │ (executes) │   │ (evaluates      │
+                    │            │   │  only, dry_run   │
+                    │            │   │  always true)    │
+                    └────┬───────┘   └─────┬───────────┘
+                         │                 │
+                         ▼                 ▼
+                    Real fills        Shadow decisions
+                         │                 │
+                         └────────┬────────┘
+                                  ▼
+                         ┌────────────────┐
+                         │ Divergence     │
+                         │ Comparator     │
+                         │                │
+                         │ - Risk agree?  │
+                         │ - Size match?  │
+                         │ - Latency?     │
+                         │ - State drift? │
+                         └────────────────┘
 ```
+
+**Implementation:**
+1. The signal splitter is a Redis consumer that forwards every signal to both systems
+2. The Rust engine runs in `FEYNMAN_MODE=paper` with `dry_run=true` always
+3. It processes signals through the full pipeline (sizing, risk, routing) but stops before venue submission
+4. Every decision is logged to a `shadow_decisions` journal
+5. A separate comparator process reads both decision logs and reports divergences
+
+**What the comparator checks:**
+
+| Check | How | Threshold |
+|-------|-----|-----------|
+| Risk gate agreement | Same signal → same approve/reject? | Zero disagreements on rejections |
+| Risk gate approval rate | Aggregate approve rate within range? | Within 2% |
+| Position sizing | Same signal → same order qty? | Within 0.1% |
+| Venue routing | Same order → same venue? | 100% match |
+| State consistency | Rust positions vs Node positions after each fill cycle | Within `divergence_threshold` |
+| Latency | Signal-to-decision time | Rust P99 < Node P50 |
+| Error rate | Unhandled errors in Rust engine | Zero panics, zero unhandled errors |
 
 **Shadow mode exit criteria (all must be true for 7 consecutive days):**
 - Zero risk gate disagreements on orders that should have been rejected
@@ -2449,7 +2756,54 @@ Live orders ──► Current system (executes)
 - No panics or unhandled errors in Rust engine logs
 - P99 latency of Rust engine < P50 latency of current system
 
-### 14.8 Graduated Deployment Pipeline
+### 14.8 Authentication & Authorization Boundary
+
+The gRPC API must verify that callers are who they claim to be. Without this,
+any process on the network can submit orders as any agent — bypassing per-agent
+budget isolation (safety rule #6).
+
+**Phase 0-1 (development/paper):** Shared API token in `Authorization` header.
+All registered agents use the same token. Simple, sufficient for a single-machine
+deployment.
+
+```
+# Config
+[auth]
+mode = "token"          # "token", "per_agent", "mtls"
+shared_token = "..."    # from FEYNMAN_API_TOKEN env var (never in config file)
+```
+
+**Phase 2+ (live trading):** Per-agent API tokens.
+
+```rust
+/// Agent authentication. Checked on every RPC call.
+pub struct AuthContext {
+    pub agent_id: AgentId,
+    pub permissions: AgentPermissions,
+    pub token_hash: String,
+}
+
+pub struct AgentPermissions {
+    pub can_submit_orders: bool,      // all agents
+    pub can_submit_signals: bool,     // LLM agents only
+    pub can_adjust_limits: bool,      // Taleb (L2) and Feynman (L3) only
+    pub can_halt: bool,               // Taleb and Feynman only
+    pub can_register_agents: bool,    // Feynman (L3) only
+}
+```
+
+**The Taleb gate** (safety rule #8) is enforced here: `AdjustAgentLimits`, `PauseAgent`,
+`HaltAll` require `can_adjust_limits` or `can_halt` permission. These are only granted
+to Taleb's and Feynman's tokens.
+
+**Phase 3+ (multi-machine):** mTLS with per-agent client certificates. The engine
+verifies the client cert CN matches the declared `agent_id`.
+
+**Auth is NOT in the Sequencer hot path.** It's checked in the gRPC interceptor layer
+before the command reaches the Sequencer. Auth failure = gRPC `UNAUTHENTICATED` error,
+never reaches the Sequencer queue.
+
+### 14.9 Graduated Deployment Pipeline
 
 | Stage | Gate | Promotes when |
 |-------|------|--------------|
@@ -2466,7 +2820,7 @@ Live orders ──► Current system (executes)
 A bug found at stage N sends you back to stage 1 with a new property test or
 fuzz target that catches that class of bug, then you re-promote through all stages.
 
-### 14.9 What Each Verification Layer Catches
+### 14.10 What Each Verification Layer Catches
 
 | Bug class | Unit | Property | Fuzz | Replay | Shadow | Live |
 |-----------|:----:|:--------:|:----:|:------:|:------:|:----:|
@@ -2880,7 +3234,139 @@ HFTBacktest runs in the strategy layer, not inside the engine.
 Because the Sequencer is single-threaded, backtest is automatically deterministic.
 Same events in same order → same state. No lock-ordering non-determinism.
 
-### 15.8 Rules
+### 15.8 Priority Queueing
+
+The Sequencer processes commands FIFO by default. But not all commands are equal:
+an urgent liquidation signal should not wait behind 50 queued orders from a slow algo.
+
+**Two-priority channel model:**
+
+```rust
+pub struct Sequencer {
+    // High-priority channel (fills, halt, reconciliation, urgent signals)
+    priority_rx: mpsc::Receiver<SequencerCommand>,  // capacity: 256
+    // Normal-priority channel (new orders, signals, snapshots)
+    command_rx: mpsc::Receiver<SequencerCommand>,    // capacity: 1024
+    // ...
+}
+
+impl Sequencer {
+    async fn run(&mut self) {
+        loop {
+            // Always drain high-priority first
+            tokio::select! {
+                biased;  // not random — priority channel always checked first
+
+                Some(cmd) = self.priority_rx.recv() => {
+                    self.process_command(cmd);
+                }
+                Some(cmd) = self.command_rx.recv() => {
+                    self.process_command(cmd);
+                }
+            }
+        }
+    }
+}
+```
+
+**Priority routing:**
+
+| Command | Priority | Why |
+|---------|----------|-----|
+| `OnFill` | High | Fills must update state immediately — stale state = wrong risk checks |
+| `HaltAll` | High | Emergency must not wait in queue |
+| `OnReconciliation` | High | State corrections are urgent |
+| `SubmitSignal` with `urgency=Immediate` | High | Strategy requested urgent execution |
+| `SubmitOrder` / `SubmitSignal` (normal) | Normal | Standard order flow |
+| `SubmitBatch` | Normal | Batch processing |
+| `Snapshot` | Normal | Dashboard reads are not urgent |
+| `AdjustLimits` | Normal | Limit changes can wait for current commands |
+
+### 15.9 Poison Message Handling
+
+The Sequencer is the heart of the engine. If it panics, everything stops. A single
+malformed command must not crash the engine.
+
+```rust
+impl Sequencer {
+    fn process_command(&mut self, cmd: SequencerCommand) {
+        // catch_unwind boundary: panic in one command doesn't kill the Sequencer
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.process_command_inner(cmd)
+        }));
+
+        match result {
+            Ok(Ok(())) => { /* normal */ }
+            Ok(Err(e)) => {
+                // Expected error (risk rejection, validation failure)
+                // Already handled inside process_command_inner
+                error!("command processing error: {:?}", e);
+            }
+            Err(panic_payload) => {
+                // UNEXPECTED PANIC — this is a bug
+                error!("SEQUENCER PANIC on command: {:?}", panic_payload);
+                self.metrics.record_sequencer_panic();
+
+                // Alert: this is always Critical
+                self.alert_tx.send(Alert {
+                    severity: AlertSeverity::Critical,
+                    title: "Sequencer panic caught".into(),
+                    body: format!("Panic: {:?}", panic_payload),
+                    ..
+                });
+
+                // Do NOT halt — the Sequencer is still running.
+                // The panicked command is dropped (its oneshot sender drops,
+                // caller gets a channel error).
+                // Continue processing next commands.
+                //
+                // If panics happen repeatedly (>3 in 60s), THEN halt.
+                if self.panic_count_last_60s() > 3 {
+                    self.halt_all("repeated sequencer panics");
+                }
+            }
+        }
+    }
+}
+```
+
+**Rules:**
+- `catch_unwind` wraps every command, not the Sequencer loop
+- A single panic is logged + alerted but does not halt trading
+- Repeated panics (>3 in 60s) trigger `HaltAll` — something is systemically wrong
+- The panicked command's `oneshot` sender is dropped — caller receives a channel error
+- Journal still records the attempt (for forensics)
+
+### 15.10 Configuration Hot-Reload
+
+Some configuration must be changeable without restarting the engine. Restarting triggers
+the full startup reconciliation protocol (§9.2.1), which is expensive and causes downtime.
+
+**Hot-reloadable (via RPC, no restart):**
+
+| Config | RPC | Who can change |
+|--------|-----|---------------|
+| Agent risk limits | `AdjustAgentLimits` | Taleb (L2), Feynman (L3) |
+| Instrument risk limits | `AdjustInstrumentLimits` (new) | Taleb (L2), Feynman (L3) |
+| Agent pause/resume | `PauseAgent` / `ResumeAgent` | Taleb, Feynman |
+| Fee tier update | `UpdateFeeTier` (new) | Feynman (L3) |
+
+**NOT hot-reloadable (requires restart):**
+
+| Config | Why |
+|--------|-----|
+| Circuit breaker thresholds | Compiled-in. Intentionally hard to change (last line of defense). |
+| Venue adapter configuration | Adding/removing a venue changes the task topology. |
+| Channel capacities | Changing channel size requires recreating the channel. |
+| `FEYNMAN_MODE` | Switching live↔paper↔backtest is a fundamental mode change. |
+| Auth tokens | Security-sensitive. Restart ensures clean state. |
+| Journal/state store backend | Storage backend change requires migration, not hot-reload. |
+
+**Design principle:** If changing a config value could cause financial harm if done wrong
+(e.g., circuit breaker thresholds), it should NOT be hot-reloadable. The friction of a
+restart is a feature, not a bug — it forces review and reconciliation.
+
+### 15.11 Rules
 
 1. **No `Arc<Mutex<T>>` or `Arc<RwLock<T>>` on business state.** The Sequencer owns it.
 2. **No `mpsc::unbounded_channel()` in production.** All channels are bounded with explicit capacity.
@@ -2888,6 +3374,8 @@ Same events in same order → same state. No lock-ordering non-determinism.
 4. **No `.await` while holding mutable business state.** The Sequencer processes commands synchronously within its event loop; async is only for channel recv/send.
 5. **Every channel has a name, capacity, and backpressure strategy** documented in this section.
 6. **Timeouts are explicit on every channel send.** No infinite waits. If a send blocks for >5s, log error and drop the message (with event).
+7. **Fills and halts always take priority** over new order submissions (§15.8).
+8. **A single panicked command never crashes the Sequencer** (§15.9). Repeated panics halt.
 
 ---
 
@@ -2937,10 +3425,17 @@ feynman-engine/
 │   │   ├── deribit/                  # Deribit adapter
 │   │   └── simulated/                # FillSimulator for backtest/paper
 │   │
-│   ├── sequencer/                    # EventSequencer trait + impls
+│   ├── engine-core/                  # EngineCore: synchronous decision logic (§15.2)
 │   │   └── src/
-│   │       ├── lib.rs                # Trait definition + live FIFO impl
-│   │       └── backtest.rs           # Sorted/deterministic impl
+│   │       ├── lib.rs                # EngineCore struct + methods
+│   │       ├── state.rs              # EngineState, FirmBook mutations
+│   │       └── sizer.rs              # PositionSizer trait + impls
+│   │
+│   ├── sequencer/                    # Sequencer task: single-owner state loop (§15)
+│   │   └── src/
+│   │       ├── lib.rs                # Sequencer event loop, channel topology
+│   │       ├── commands.rs           # SequencerCommand enum
+│   │       └── priority.rs           # Priority routing (§15.8)
 │   │
 │   ├── gateway/                      # ExecutionGateway + ExecStrategy + Pipeline
 │   │   └── src/
@@ -2958,14 +3453,7 @@ feynman-engine/
 │   │           ├── twap.rs           # Time-weighted split
 │   │           └── depth_aware.rs    # Orderbook-aware splitting
 │   │
-│   ├── context/                      # ExecutionContext trait + impls
-│   │   └── src/
-│   │       ├── lib.rs                # Trait definition
-│   │       ├── live.rs               # Live trading context
-│   │       ├── paper.rs              # Paper trading context
-│   │       └── backtest.rs           # Backtest context
-│   │
-│   ├── reconciler/                   # Position reconciliation
+│   ├── reconciler/                   # Position reconciliation + startup protocol (§9.2.1)
 │   │   └── src/lib.rs
 │   │
 │   ├── observability/                # Metrics, tracing, dashboard data
@@ -2981,12 +3469,15 @@ feynman-engine/
 │           └── http.rs               # axum HTTP for dashboard
 │
 ├── bins/
-│   ├── feynman-engine/               # Main binary: gateway + bus + API + dashboard
-│   ├── feynman-backtest/             # Backtest runner CLI
-│   └── feynman-paper/                # Paper trading runner
+│   └── feynman-engine/               # Single binary: mode via FEYNMAN_MODE env var
+│       └── src/
+│           ├── main.rs               # Entrypoint: parse config, select mode, launch
+│           ├── config.rs             # TOML config + env var loading
+│           └── wire.rs               # Wire up crates: Sequencer + adapters + API
 │
 ├── proto/
-│   └── feynman.proto                 # gRPC service definitions
+│   └── feynman/engine/v1/
+│       └── service.proto             # gRPC service definitions
 │
 └── tests/
     ├── property/                     # proptest suites
