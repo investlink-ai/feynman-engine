@@ -1,50 +1,142 @@
-//! gateway — ExecutionGateway, PipelineStage, and OrderValidator traits.
+//! gateway — VenueAdapter, ExecutionGateway, pipeline stages, and validation.
 //!
 //! Orchestrates order processing through a composable pipeline:
-//! Validate → CircuitBreaker → RiskGate → Emulate → Route → Submit.
+//! Validate -> CircuitBreaker -> RiskGate -> Route -> Submit.
 //!
-//! - ExecutionGateway: main entry point for order submission (idempotent on OrderId)
-//! - PipelineStage: composable processing stages
-//! - OrderValidator: fast, stateless pre-validation before risk gate
+//! All venue operations are timeout-aware via `TimeoutPolicy`.
+//! Connection health is tracked via `VenueConnectionHealth`.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::fmt;
+use std::time::Duration;
 
-pub use types::{OrderId, VenueId};
+pub use types::{
+    ClientOrderId, ConnectionState, HeartbeatConfig, InstrumentId, OrderId, OrderState,
+    PipelineOrder, RiskChecked, TimeoutPolicy, VenueConnectionHealth, VenueId, VenueOrderId,
+};
 
-/// Placeholder types that will be replaced by actual types from types crate.
-#[derive(Debug, Clone)]
-pub struct CanonicalOrder;
-#[derive(Debug, Clone)]
-pub struct Fill;
-#[derive(Debug, Clone)]
-pub struct VenueCapabilities;
-#[derive(Debug, Clone)]
-pub struct RiskApproval;
+/// Typed errors for gateway operations (thiserror for libs).
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayError {
+    #[error("venue {venue_id} is not connected (state: {state})")]
+    VenueNotConnected { venue_id: String, state: String },
 
-/// Result type for gateway operations.
-pub type Result<T> = std::result::Result<T, anyhow::Error>;
+    #[error("operation timed out after {elapsed:?}: {operation}")]
+    Timeout {
+        operation: String,
+        elapsed: Duration,
+    },
 
-/// ─── Execution Gateway ───
+    #[error("venue rejected order: {reason}")]
+    VenueRejected { reason: String },
+
+    #[error("order not found: {0}")]
+    OrderNotFound(String),
+
+    #[error("venue does not support: {0}")]
+    Unsupported(String),
+
+    #[error("validation failed: {0}")]
+    Validation(String),
+
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+pub type Result<T> = std::result::Result<T, GatewayError>;
+
+// ─── Venue Adapter ───
+
+/// Adapter for a single trading venue (exchange).
 ///
+/// "Dumb adapter" — does translation only, no business logic.
+/// Each adapter instance manages one venue connection.
+///
+/// All operations respect the configured `TimeoutPolicy`.
+/// Connection health is reported via `connection_health()`.
+///
+/// Sealed trait — external crates cannot implement this.
+#[async_trait::async_trait]
+pub trait VenueAdapter: Send + Sync + sealed::Sealed {
+    /// Venue identifier.
+    fn venue_id(&self) -> &VenueId;
+
+    /// Current connection health (heartbeat, latency, state).
+    fn connection_health(&self) -> &VenueConnectionHealth;
+
+    /// Timeout policy for this venue's operations.
+    fn timeout_policy(&self) -> &TimeoutPolicy;
+
+    /// Submit an order to the venue.
+    /// Returns venue-assigned order ID on success.
+    ///
+    /// Caller must check `connection_health().is_submittable()` first.
+    /// If connection is degraded, this returns `VenueNotConnected`.
+    async fn submit_order(&self, submission: OrderSubmission) -> Result<VenueOrderAck>;
+
+    /// Cancel an order by venue order ID.
+    async fn cancel_order(&self, venue_order_id: &VenueOrderId) -> Result<()>;
+
+    /// Amend an order (if venue supports it).
+    async fn amend_order(
+        &self,
+        venue_order_id: &VenueOrderId,
+        new_price: Option<Decimal>,
+        new_qty: Option<Decimal>,
+    ) -> Result<VenueOrderAck>;
+
+    /// Query current positions on this venue.
+    async fn query_positions(&self) -> Result<Vec<VenuePosition>>;
+
+    /// Query open orders on this venue.
+    async fn query_open_orders(&self) -> Result<Vec<VenueOpenOrder>>;
+
+    /// Query account balance on this venue.
+    async fn query_balance(&self) -> Result<VenueBalance>;
+
+    /// Subscribe to fill stream. Returns a bounded receiver.
+    /// The adapter pushes fills as they arrive from the venue.
+    async fn subscribe_fills(&self) -> Result<tokio::sync::mpsc::Receiver<VenueFill>>;
+
+    /// Venue capabilities (what order types, TIF, amendments are supported).
+    fn capabilities(&self) -> &VenueCapabilities;
+
+    /// Start the connection (WebSocket, REST polling, etc).
+    async fn connect(&mut self) -> Result<()>;
+
+    /// Graceful disconnect.
+    async fn disconnect(&mut self) -> Result<()>;
+}
+
+/// Sealed trait pattern — prevents external implementation of VenueAdapter.
+mod sealed {
+    pub trait Sealed {}
+}
+
+// ─── Execution Gateway ───
+
 /// Main entry point for order submission. Orchestrates the full pipeline.
-/// Idempotent on `OrderId` — duplicate submissions return cached acknowledgment.
+///
+/// Accepts `PipelineOrder<Routed>` — the type system guarantees the order
+/// has passed validation, risk checks, and routing before venue submission.
+///
+/// Idempotent on `ClientOrderId` — duplicate submissions return cached acknowledgment.
+/// Checks connection health before routing to a venue adapter.
 #[async_trait::async_trait]
 pub trait ExecutionGateway: Send + Sync {
-    /// Submit order through the full pipeline:
-    /// Validate → CircuitBreaker → RiskGate → Emulate (if needed) → Router → Adapter
+    /// Submit a routed order through the venue adapter.
     ///
-    /// Idempotent on order.id — if the same OrderId is submitted multiple times
-    /// (e.g., on retry or restart), only one execution occurs; subsequent calls
-    /// return the cached `OrderAck`.
-    async fn submit(&self, order: CanonicalOrder) -> Result<OrderAck>;
+    /// The pipeline type ensures this order has passed:
+    /// 1. Structural validation (Draft → Validated)
+    /// 2. Circuit breaker + risk gate (Validated → RiskChecked)
+    /// 3. Venue routing (RiskChecked → Routed)
+    async fn submit(&self, order: PipelineOrder<types::Routed>) -> Result<OrderAck>;
 
     /// Cancel an open order.
     async fn cancel(&self, order_id: &OrderId) -> Result<()>;
 
     /// Amend an open order (if venue supports it).
-    /// Returns error if venue doesn't support amendments.
     async fn amend(
         &self,
         order_id: &OrderId,
@@ -53,132 +145,220 @@ pub trait ExecutionGateway: Send + Sync {
     ) -> Result<()>;
 
     /// Emergency: cancel all open orders across all venues.
-    /// Used during risk breach or manual halt.
     async fn cancel_all(&self) -> Result<u32>;
 
-    /// Get order by internal OrderId.
-    /// Returns None if order not found.
-    async fn get_order(&self, order_id: &OrderId) -> Result<Option<OrderRecord>>;
-
-    /// Get all open orders across all venues.
-    async fn open_orders(&self) -> Result<Vec<OrderRecord>>;
-
-    /// Receive fill stream. Called once at startup to subscribe to fills.
-    /// (Implementation will use appropriate async channel from tokio)
-    fn fill_stream(&self) -> std::sync::mpsc::Receiver<Fill>;
+    /// Get connection health for all venues.
+    fn venue_health(&self) -> Vec<VenueConnectionHealth>;
 }
 
-/// Acknowledgment returned after order submission.
-#[derive(Debug, Clone)]
-pub struct OrderAck {
-    /// Internal order ID
-    pub order_id: OrderId,
-    /// Current state of the order
-    pub state: OrderState,
-    /// Risk gate approval (if passed)
-    pub risk_approval: Option<RiskApproval>,
-    /// Which execution strategy was selected
-    pub strategy_selected: String,
-    /// When order was accepted
-    pub accepted_at: DateTime<Utc>,
-}
+// ─── Router ───
 
-/// Current state of an order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrderState {
-    /// Accepted, waiting for submission
-    Pending,
-    /// Submitted to venue
-    Submitted { venue_order_id: String, submitted_at: DateTime<Utc> },
-    /// Partially filled
-    PartiallyFilled { filled_qty: Decimal, remaining_qty: Decimal },
-    /// Fully filled
-    Filled { filled_qty: Decimal },
-    /// Cancelled (user or engine)
-    Cancelled { reason: String, cancelled_at: DateTime<Utc> },
-    /// Rejected by risk gate or circuit breaker
-    Rejected { reason: String, rejected_at: DateTime<Utc> },
-}
-
-/// Full order record with history.
-#[derive(Debug, Clone)]
-pub struct OrderRecord {
-    /// The original order
-    pub order: CanonicalOrder,
-    /// Current state
-    pub state: OrderState,
-    /// All fills executed against this order
-    pub fills: Vec<Fill>,
-    /// Audit trail of events
-    pub events: Vec<Event>,
-    /// When order was created
-    pub created_at: DateTime<Utc>,
-    /// When order was last modified
-    pub last_updated: DateTime<Utc>,
-}
-
-/// Audit event for order lifecycle.
-#[derive(Debug, Clone)]
-pub struct Event {
-    /// Event description
-    pub message: String,
-    /// When event occurred
-    pub timestamp: DateTime<Utc>,
-}
-
-/// ─── Pipeline Stage ───
+/// Routes a risk-checked order to a venue, producing the `RiskChecked → Routed` transition.
 ///
+/// Responsible for:
+/// 1. Selecting the target venue (may differ from the requested venue).
+/// 2. Generating a `ClientOrderId` for idempotent submission.
+/// 3. Checking venue connection health before committing.
+///
+/// The router does NOT submit the order — it only produces the routing assignment.
+/// Submission happens via `ExecutionGateway::submit()`.
+pub trait Router: Send + Sync {
+    /// Route a risk-checked order, producing a `PipelineOrder<Routed>`.
+    ///
+    /// Returns `GatewayError::VenueNotConnected` if the selected venue is unavailable.
+    fn route(
+        &self,
+        order: PipelineOrder<types::RiskChecked>,
+        now: DateTime<Utc>,
+    ) -> Result<PipelineOrder<types::Routed>>;
+}
+
+// ─── Pipeline Stage ───
+
 /// Composable processing stage. Stages are executed in order;
 /// first rejection stops the pipeline.
-///
-/// Default pipeline: [Validator, CircuitBreaker, RiskGate, Emulator, Router]
-/// Additional stages (e.g., fee optimizer, order dedup) can be inserted.
 #[async_trait::async_trait]
 pub trait PipelineStage: Send + Sync {
-    /// Name of this stage (for logging/debugging)
+    /// Name of this stage (for logging/tracing).
     fn name(&self) -> &str;
 
     /// Process order through this stage.
-    /// Returns:
-    /// - `Ok(order)` — pass to next stage (may be modified)
-    /// - `Err(reason)` — reject and stop pipeline
-    async fn process(&self, order: CanonicalOrder) -> Result<CanonicalOrder>;
+    async fn process(&self, order: OrderSubmission) -> Result<OrderSubmission>;
 }
 
-/// ─── Order Validator ───
-///
+// ─── Order Validator ───
+
 /// Fast, stateless validation before order enters the pipeline.
-/// Rejects orders that are structurally invalid regardless of current state.
-/// Runs before risk gate.
 pub trait OrderValidator: Send + Sync {
-    /// Validate order structure and venue capability compatibility.
-    /// Returns `Ok(())` if valid, or `Err(errors)` with list of violations.
     fn validate(
         &self,
-        order: &CanonicalOrder,
+        order: &OrderSubmission,
         caps: &VenueCapabilities,
     ) -> std::result::Result<(), Vec<ValidationError>>;
 }
 
-/// Validation error returned by OrderValidator.
+// ─── Types ───
+
+/// Order submission request (sent to venue adapter).
+///
+/// This is the flattened, venue-ready form extracted from `PipelineOrder<Routed>`.
+/// The adapter receives this — it doesn't know about pipeline stages.
+#[derive(Debug, Clone)]
+pub struct OrderSubmission {
+    pub order_id: OrderId,
+    pub client_order_id: ClientOrderId,
+    pub agent_id: types::AgentId,
+    pub instrument_id: InstrumentId,
+    pub venue_id: VenueId,
+    pub side: types::Side,
+    pub order_type: types::OrderType,
+    pub time_in_force: types::TimeInForce,
+    pub qty: Decimal,
+    pub price: Option<Decimal>,
+    pub trigger_price: Option<Decimal>,
+    pub stop_loss: Option<Decimal>,
+    pub take_profit: Option<Decimal>,
+    pub post_only: bool,
+    pub reduce_only: bool,
+    pub dry_run: bool,
+    pub exec_hint: types::ExecHint,
+}
+
+impl OrderSubmission {
+    /// Create an `OrderSubmission` from a routed pipeline order.
+    #[must_use]
+    pub fn from_routed(order: &PipelineOrder<types::Routed>) -> Self {
+        let core = order.core();
+        let routing = order.routing();
+        Self {
+            order_id: core.id.clone(),
+            client_order_id: routing.client_order_id.clone(),
+            agent_id: core.agent_id.clone(),
+            instrument_id: core.instrument_id.clone(),
+            venue_id: routing.venue_id.clone(),
+            side: core.side,
+            order_type: core.order_type,
+            time_in_force: core.time_in_force,
+            qty: core.qty,
+            price: core.price,
+            trigger_price: core.trigger_price,
+            stop_loss: core.stop_loss,
+            take_profit: core.take_profit,
+            post_only: core.post_only,
+            reduce_only: core.reduce_only,
+            dry_run: core.dry_run,
+            exec_hint: core.exec_hint.clone(),
+        }
+    }
+}
+
+/// Acknowledgment from venue after order submission.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct VenueOrderAck {
+    pub venue_order_id: VenueOrderId,
+    pub client_order_id: ClientOrderId,
+    pub accepted_at: DateTime<Utc>,
+}
+
+/// Fill received from venue.
+#[derive(Debug, Clone)]
+pub struct VenueFill {
+    pub venue_order_id: VenueOrderId,
+    pub client_order_id: ClientOrderId,
+    pub instrument_id: InstrumentId,
+    pub side: types::Side,
+    pub qty: Decimal,
+    pub price: Decimal,
+    pub fee: Decimal,
+    pub is_maker: bool,
+    pub filled_at: DateTime<Utc>,
+}
+
+/// Position as reported by venue.
+#[derive(Debug, Clone)]
+pub struct VenuePosition {
+    pub instrument_id: InstrumentId,
+    pub qty: Decimal,
+    pub avg_entry_price: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub margin_used: Decimal,
+}
+
+/// Open order as reported by venue.
+#[derive(Debug, Clone)]
+pub struct VenueOpenOrder {
+    pub venue_order_id: VenueOrderId,
+    pub client_order_id: Option<ClientOrderId>,
+    pub instrument_id: InstrumentId,
+    pub side: types::Side,
+    pub qty: Decimal,
+    pub filled_qty: Decimal,
+    pub price: Option<Decimal>,
+    pub state: OrderState,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Account balance as reported by venue.
+#[derive(Debug, Clone)]
+pub struct VenueBalance {
+    pub total_equity: Decimal,
+    pub available_balance: Decimal,
+    pub margin_used: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub as_of: DateTime<Utc>,
+}
+
+/// Gateway-level order acknowledgment.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct OrderAck {
+    pub order_id: OrderId,
+    pub client_order_id: ClientOrderId,
+    pub venue_order_id: VenueOrderId,
+    pub accepted_at: DateTime<Utc>,
+}
+
+/// What a venue supports.
+#[derive(Debug, Clone)]
+pub struct VenueCapabilities {
+    pub venue_id: VenueId,
+    pub supports_market_orders: bool,
+    pub supports_limit_orders: bool,
+    pub supports_stop_market: bool,
+    pub supports_stop_limit: bool,
+    pub supports_trailing_stop: bool,
+    pub supports_oco: bool,
+    pub supports_amendment: bool,
+    pub supports_reduce_only: bool,
+    pub supports_post_only: bool,
+    pub max_batch_size: Option<u32>,
+}
+
+// ─── Validation errors ───
+
 #[derive(Debug, Clone)]
 pub enum ValidationError {
-    /// Quantity is zero, negative, or below venue minimum lot size
-    InvalidQty { reason: String },
-    /// Price is negative, outside tick size, or invalid
-    InvalidPrice { reason: String },
-    /// Venue doesn't support this order type
-    UnsupportedOrderType { requested: String, venue: VenueId },
-    /// Venue doesn't support this time-in-force
-    UnsupportedTIF {
-        requested: String,
+    InvalidQty {
+        reason: String,
+    },
+    InvalidPrice {
+        reason: String,
+    },
+    UnsupportedOrderType {
+        requested: types::OrderType,
         venue: VenueId,
     },
-    /// Required field is missing
-    MissingRequiredField { field: String },
-    /// Incompatible constraint combination (e.g., post_only + market)
-    IncompatibleConstraints { reason: String },
-    /// Precision exceeds venue's decimal places
+    UnsupportedTIF {
+        requested: types::TimeInForce,
+        venue: VenueId,
+    },
+    MissingRequiredField {
+        field: String,
+    },
+    IncompatibleConstraints {
+        reason: String,
+    },
     PrecisionExceeded {
         field: String,
         max_decimals: u32,
@@ -189,29 +369,26 @@ pub enum ValidationError {
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ValidationError::InvalidQty { reason } => write!(f, "Invalid quantity: {}", reason),
-            ValidationError::InvalidPrice { reason } => write!(f, "Invalid price: {}", reason),
-            ValidationError::UnsupportedOrderType { requested, venue } => {
-                write!(f, "Order type {} not supported on {}", requested, venue.0)
+            Self::InvalidQty { reason } => write!(f, "Invalid quantity: {reason}"),
+            Self::InvalidPrice { reason } => write!(f, "Invalid price: {reason}"),
+            Self::UnsupportedOrderType { requested, venue } => {
+                write!(f, "Order type {requested} not supported on {venue}")
             }
-            ValidationError::UnsupportedTIF { requested, venue } => {
-                write!(f, "TIF {} not supported on {}", requested, venue.0)
+            Self::UnsupportedTIF { requested, venue } => {
+                write!(f, "TIF {requested} not supported on {venue}")
             }
-            ValidationError::MissingRequiredField { field } => {
-                write!(f, "Missing required field: {}", field)
+            Self::MissingRequiredField { field } => write!(f, "Missing required field: {field}"),
+            Self::IncompatibleConstraints { reason } => {
+                write!(f, "Incompatible constraints: {reason}")
             }
-            ValidationError::IncompatibleConstraints { reason } => {
-                write!(f, "Incompatible constraints: {}", reason)
-            }
-            ValidationError::PrecisionExceeded {
+            Self::PrecisionExceeded {
                 field,
                 max_decimals,
                 actual,
             } => {
                 write!(
                     f,
-                    "Field {} precision exceeded: max {}, got {}",
-                    field, max_decimals, actual
+                    "Field {field} precision exceeded: max {max_decimals}, got {actual}"
                 )
             }
         }

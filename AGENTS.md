@@ -285,6 +285,24 @@ No `mpsc::unbounded_channel()` in production code. All channels have explicit ca
 
 **Failure mode:** Unbounded queue grows silently until OOM.
 
+### 3.12 Clock Injection — No Direct `Utc::now()` in Core Path
+
+All timestamps in the Sequencer, EngineCore, RiskGate, and CircuitBreaker come from `Clock::now()`, not `Utc::now()`. The `Clock` trait is injected at construction time.
+
+```rust
+// ✓ Correct — timestamp from injected clock
+fn evaluate_order(&mut self, order: &CanonicalOrder, now: DateTime<Utc>) -> Result<ApprovedOrder>;
+
+// ✗ BANNED in core path — breaks backtest/replay determinism
+fn evaluate_order(&mut self, order: &CanonicalOrder) -> Result<ApprovedOrder> {
+    let now = Utc::now(); // wrong
+}
+```
+
+**Failure mode:** Backtest produces different results on different runs; replay timestamps don't match journal.
+
+`WallClock` is used for live and paper mode. `SimulatedClock` is used for backtest (advanced by harness via `AdvanceClock` RPC) and replay (advanced by journal timestamps). Same engine code, different clock instance.
+
 ---
 
 ## 4. Coding Guidelines

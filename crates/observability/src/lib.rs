@@ -1,90 +1,110 @@
-//! observability — Metrics (Prometheus), tracing (OpenTelemetry), and dashboard traits.
+//! observability — Metrics (Prometheus), tracing (OpenTelemetry), dashboard, and health reporting.
 //!
-//! Provides observability into engine operations:
-//! - MetricsCollector: Prometheus metrics (counters, gauges, histograms)
-//! - DashboardPublisher: Real-time events for web UI
-//! - Tracing: OpenTelemetry spans for distributed tracing
+//! All financial values in metrics use `Decimal` — no `f64` for money.
+//! Prometheus metrics use f64 (Prometheus wire format requires it),
+//! but the conversion happens at the boundary, not in business logic.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
-pub use types::{AgentId, VenueId, OrderId};
+pub use types::{
+    AgentId, EngineHealth, OrderId, OverallHealth, SubsystemHealth, SubsystemId, VenueId,
+};
 
-/// ─── Metrics Collector ───
-///
+// ─── Metrics Collector ───
+
 /// Records Prometheus metrics for monitoring and alerting.
-/// Thread-safe and non-blocking.
+///
+/// Financial values are passed as `Decimal` and converted to f64
+/// at the Prometheus boundary only. No f64 in business logic.
 pub trait MetricsCollector: Send + Sync {
-    /// Record order submission
-    fn record_order_submitted(&self, venue: &str, agent: &str);
+    /// Record order submission.
+    fn record_order_submitted(&self, venue: &VenueId, agent: &AgentId);
 
-    /// Record order fill with slippage
-    fn record_order_filled(&self, venue: &str, agent: &str, slippage_bps: f64);
+    /// Record order fill.
+    fn record_order_filled(&self, venue: &VenueId, agent: &AgentId, slippage_bps: Decimal);
 
-    /// Record order rejection
-    fn record_order_rejected(&self, venue: &str, agent: &str, reason: &str);
+    /// Record order rejection.
+    fn record_order_rejected(&self, venue: &VenueId, agent: &AgentId, reason: &str);
 
-    /// Record latency from submission to fill
-    fn record_fill_latency(&self, venue: &str, latency_ms: f64);
+    /// Record latency from submission to fill (milliseconds).
+    fn record_fill_latency(&self, venue: &VenueId, latency_ms: u64);
 
-    /// Record time spent in risk gate evaluation
-    fn record_risk_check_latency(&self, latency_us: f64);
+    /// Record time spent in risk gate evaluation (microseconds).
+    fn record_risk_check_latency(&self, latency_us: u64);
 
-    /// Set gauge: current position quantity
-    fn set_position(&self, venue: &str, instrument: &str, agent: &str, qty: f64);
+    /// Set gauge: current position quantity.
+    fn set_position(&self, venue: &VenueId, instrument: &str, agent: &AgentId, qty: Decimal);
 
-    /// Set gauge: agent P&L
-    fn set_pnl(&self, agent: &str, pnl_type: &str, value: f64);
+    /// Set gauge: agent P&L.
+    fn set_pnl(&self, agent: &AgentId, pnl_type: PnlType, value: Decimal);
 
-    /// Set gauge: firm net asset value
-    fn set_nav(&self, value: f64);
+    /// Set gauge: firm net asset value.
+    fn set_nav(&self, value: Decimal);
 
-    /// Record reconciliation divergence detected
-    fn record_reconciliation_divergence(&self, venue: &str, instrument: &str);
+    /// Record reconciliation divergence detected.
+    fn record_reconciliation_divergence(&self, venue: &VenueId, instrument: &str);
 
-    /// Set gauge: venue connection status (0 = disconnected, 1 = connected)
-    fn set_venue_connection(&self, venue: &str, connected: bool);
+    /// Set venue connection status.
+    fn set_venue_connection(&self, venue: &VenueId, state: &types::ConnectionState);
 
-    /// Record message bus activity
-    fn record_bus_message(&self, topic: &str, direction: &str);
+    /// Record message bus activity.
+    fn record_bus_message(&self, topic: &str, direction: BusDirection);
 
-    /// Set gauge: pending messages in bus topic/group
+    /// Set gauge: pending messages in bus topic/group.
     fn set_bus_pending(&self, topic: &str, group: &str, count: u64);
 
-    /// Record circuit breaker trip
+    /// Record circuit breaker trip.
     fn record_circuit_breaker_trip(&self, breaker: &str);
+
+    /// Record subsystem health change.
+    fn record_subsystem_health(&self, subsystem: SubsystemId, health: &SubsystemHealth);
+
+    /// Record mark-to-market update.
+    fn record_mtm_update(&self, instrument: &str, unrealized_pnl: Decimal);
 }
 
-/// ─── Dashboard Publisher ───
-///
+/// P&L metric type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PnlType {
+    Realized,
+    Unrealized,
+    Daily,
+}
+
+/// Bus message direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusDirection {
+    Published,
+    Received,
+}
+
+// ─── Dashboard Publisher ───
+
 /// Publishes real-time events to web UI via SSE or WebSocket.
 #[async_trait::async_trait]
 pub trait DashboardPublisher: Send + Sync {
-    /// Publish an update to the dashboard.
-    /// Called whenever state changes (fills, positions, risk limits, etc).
     async fn publish(&self, update: DashboardUpdate) -> std::result::Result<(), anyhow::Error>;
 }
 
 /// Dashboard update event.
 #[derive(Debug, Clone)]
 pub enum DashboardUpdate {
-    /// Firm-level state changed
-    FirmBookChanged(FirmBook),
-    /// Position quantity changed
-    PositionChanged(InstrumentExposure),
-    /// Order event (submitted, filled, cancelled, etc)
+    FirmBookChanged(FirmBookSummary),
+    PositionChanged(InstrumentExposureSummary),
     OrderEvent(DashboardEvent),
-    /// Venue connection status changed
     VenueStatusChanged(VenueStatus),
-    /// Risk limit violated or breached
-    RiskAlert(RiskViolation),
-    /// Agent status changed (Active, Paused, etc)
-    AgentStatusChanged { agent: AgentId, status: AgentStatusUpdate },
+    RiskAlert(RiskAlert),
+    AgentStatusChanged {
+        agent: AgentId,
+        status: AgentStatusUpdate,
+    },
+    HealthChanged(EngineHealth),
 }
 
-/// Firm-level positions and P&L.
+/// Firm-level summary for dashboard.
 #[derive(Debug, Clone)]
-pub struct FirmBook {
+pub struct FirmBookSummary {
     pub nav: Decimal,
     pub realized_pnl: Decimal,
     pub unrealized_pnl: Decimal,
@@ -94,14 +114,13 @@ pub struct FirmBook {
     pub current_drawdown_pct: Decimal,
 }
 
-/// Aggregate exposure for a single instrument across all venues and agents.
+/// Instrument exposure summary for dashboard.
 #[derive(Debug, Clone)]
-pub struct InstrumentExposure {
+pub struct InstrumentExposureSummary {
     pub instrument: String,
     pub net_qty: Decimal,
     pub notional: Decimal,
-    pub venues: Vec<String>,
-    pub agents: Vec<String>,
+    pub unrealized_pnl: Decimal,
 }
 
 /// Dashboard audit event.
@@ -114,78 +133,54 @@ pub struct DashboardEvent {
     pub agent: Option<AgentId>,
 }
 
-/// Venue connection and latency status.
+/// Venue connection and latency status for dashboard.
 #[derive(Debug, Clone)]
 pub struct VenueStatus {
     pub venue: VenueId,
-    pub connected: bool,
-    pub latency_ms: Option<f64>,
+    pub state: types::ConnectionState,
+    pub heartbeat_latency_ms: Option<u32>,
     pub open_orders: u32,
     pub balance_usd: Option<Decimal>,
     pub last_heartbeat: Option<DateTime<Utc>>,
 }
 
-/// Risk limit approaching or breached.
+/// Risk alert for dashboard.
 #[derive(Debug, Clone)]
-pub struct RiskViolation {
+pub struct RiskAlert {
     pub limit_name: String,
     pub severity: RiskSeverity,
     pub message: String,
+    pub agent: Option<AgentId>,
 }
 
 /// Risk severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RiskSeverity {
-    /// Approaching limit (>80% utilization)
     Warning,
-    /// Limit breached (>100% utilization)
     Critical,
-    /// Loss-based halt (circuit breaker)
     Emergency,
 }
 
-/// Agent status update.
+/// Agent status update for dashboard.
 #[derive(Debug, Clone)]
 pub struct AgentStatusUpdate {
     pub is_active: bool,
     pub reason: Option<String>,
 }
 
-/// ─── Tracing (OpenTelemetry) ───
-///
-/// Every order gets a trace span from signal to fill.
-/// Uses order_id as trace_id for correlation.
-///
-/// Typical span hierarchy:
-/// ```text
-/// Signal Received [span]
-///   └── Risk Check [span]
-///   └── Strategy Selected [span]
-///   └── Venue Submitted [span]
-///       └── Fill Received [span]
-/// ```
-///
-/// All spans share the same trace_id (= order_id) for correlation.
+// ─── Tracing (OpenTelemetry) ───
 
 /// Span context for OpenTelemetry tracing.
 #[derive(Debug, Clone)]
 pub struct SpanContext {
-    /// Trace ID (= OrderId for order spans)
     pub trace_id: String,
-    /// Span ID (unique within trace)
     pub span_id: String,
-    /// Parent span ID (if any)
     pub parent_span_id: Option<String>,
 }
 
-/// Helper trait for span recording (minimal interface).
+/// Helper trait for span recording.
 pub trait TraceRecorder: Send + Sync {
-    /// Record a span event.
     fn record_span(&self, name: &str, context: &SpanContext, duration_us: u64);
-
-    /// Record an attribute on the current span.
     fn record_attribute(&self, key: &str, value: &str);
-
-    /// Record an event on the current span.
     fn record_event(&self, event: &str);
 }

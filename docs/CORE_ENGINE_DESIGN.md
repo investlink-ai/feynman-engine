@@ -1,7 +1,7 @@
 # Feynman Capital — Core Engine Design
 
-**Version:** 1.2.0-draft
-**Status:** Canonical Architecture (2026-03-17) — NautilusTrader hybrid path rejected
+**Version:** 1.3.0
+**Status:** Canonical Architecture (2026-03-19) — NautilusTrader hybrid path rejected
 **Scope:** Unified Execution Engine + Message Bus + Observability + Multi-Client API
 **Language:** Rust (tokio async runtime)
 
@@ -47,13 +47,16 @@
 | 3 | **Fees are first-class** | Fees determine whether a trade has edge. Fee model is identical in backtest and live. Fee estimates inform execution strategy selection. |
 | 4 | **Layered risk defense** | Layer 0 (circuit breakers, compiled-in) → Layer 1 (programmatic risk gate, configurable) → Layer 2 (LLM risk agent) → Layer 3 (human CIO). Each layer is independent. |
 | 5 | **Journaled order path** | Every state change is written to an append-only journal. Current state is a materialized view with periodic snapshots. Crash recovery replays the journal tail. |
-| 6 | **Rust enforces correctness** | Illegal order state transitions don't compile. Financial math uses `rust_decimal`. Concurrency bugs are caught by the type system. |
+| 6 | **Make illegal states uncompilable** | Pipeline stages are type-state (`Draft → Validated → RiskChecked → Routed`). Venue lifecycle uses exhaustive `match` on `VenueState` — no `_` wildcards on owned enums. Financial math is `rust_decimal::Decimal` only. The compiler is the first risk gate. |
 | 7 | **Adapters are dumb pipes** | No business logic in venue adapters. They translate between canonical format and venue-native API. All intelligence lives in the gateway. |
 | 8 | **Design for fast-quant, build for strategic** | Contracts support sub-50ms signal-to-order latency. Current implementation targets 50ms–1s. Architecture doesn't preclude HFT-tier if needed. |
 | 9 | **Deterministic event sequencing** | All events flow through a single sequencer. Backtest and live produce identical state given identical inputs. Non-determinism is a bug. |
 | 10 | **Idempotent order submission** | `submit(order)` is idempotent on `OrderId`. Duplicate calls return cached ack. No operation in the system produces duplicate orders on retry. |
 | 11 | **Explicit over implicit** | No silent fallbacks, no hidden defaults, no magic. If a venue doesn't support trailing stops, return `Err(UnsupportedOrderType)` — don't silently emulate. If a config value is missing, fail startup — don't substitute a default. Every behavior path must be visible in the code and traceable in the logs. Implicit behavior is a production debugging nightmare. |
 | 12 | **Emulation is opt-in, not automatic** | Order emulation (trailing stop on a venue that lacks it, bracket decomposition) is available but must be explicitly requested via `exec_hint` or config. The caller decides whether emulation is acceptable — the engine never silently substitutes behavior. |
+| 13 | **No automated failover on the order path** | Components that hold order state (Sequencer, ExecutionController) fail to manual promotion. Automated failover risks split-brain on positions — a duplicated order is worse than a few seconds of downtime. Passive replicas replay the journal but do not auto-promote. |
+| 14 | **Coordinated API versioning** | The gRPC contract between strategies and engine is a coordinated deployment boundary. Breaking changes require version negotiation or synchronized rollout — never silent field reinterpretation. Strategy clients must fail loudly on version mismatch, not silently degrade. |
+| 15 | **Inverted control on the critical path** | The Sequencer pulls; handlers don't push. Event handlers respond to the Sequencer's "process next" call rather than independently mutating state. All business state lives in explicit structures owned by the Sequencer — never hidden in task-local variables or thread stacks. This makes state observable, testable, and replayable. |
 
 ---
 
@@ -188,8 +191,19 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
-pub struct WallClock;                          // Live + Paper
-pub struct SimulatedClock { current: DateTime<Utc> }  // Backtest
+pub struct WallClock;  // Live + Paper — delegates to Utc::now()
+
+/// Backtest / replay clock. Internally stores epoch milliseconds as AtomicI64
+/// so it can be advanced from an external task without locking.
+/// Panics on backward time travel (invariant: time is monotonic).
+pub struct SimulatedClock {
+    epoch_millis: AtomicI64,  // shared across task boundaries via Arc<SimulatedClock>
+}
+impl SimulatedClock {
+    pub fn set(&self, t: DateTime<Utc>);          // absolute set (panics if t < current)
+    pub fn advance(&self, d: Duration);           // advance by duration
+    pub fn advance_millis(&self, ms: i64);        // advance by milliseconds
+}
 ```
 
 ### 3.4 Deterministic Event Sequencer
@@ -795,7 +809,7 @@ pub trait VenueAdapter: Send + Sync {
 
     async fn connect(&mut self) -> Result<()>;
     async fn disconnect(&mut self) -> Result<()>;
-    fn connection_health(&self) -> ConnectionHealth;
+    fn connection_health(&self) -> &VenueConnectionHealth;
 
     // ── Execution (core — all venues must implement) ──
 
@@ -822,9 +836,9 @@ pub trait VenueAdapter: Send + Sync {
 
     async fn get_orderbook(&self, symbol: &str, depth: usize) -> Result<OrderbookSnapshot>;
 
-    /// Subscribe to real-time fills via WebSocket where supported,
-    /// polling fallback otherwise. Adapter handles reconnection internally.
-    fn subscribe_fills(&self) -> mpsc::Receiver<Fill>;
+    /// Subscribe to real-time fills. Bounded channel — backpressure to adapter.
+    /// Adapter handles WebSocket reconnection internally.
+    fn subscribe_fills(&self) -> Result<mpsc::Receiver<VenueFill>>;
 
     fn subscribe_market_data(
         &self,
@@ -871,7 +885,7 @@ pub trait StreamingVenue: Send + Sync {
         &self,
         symbol: &str,
         depth: usize,
-    ) -> mpsc::UnboundedReceiver<OrderbookDelta>;
+    ) -> mpsc::Receiver<OrderbookDelta>;  // bounded — all channels bounded, no UnboundedReceiver
 }
 
 /// Per-adapter rate limiter. Each adapter owns one.
@@ -888,23 +902,39 @@ pub trait RateLimiter: Send + Sync {
 ### 5.1.1 Connection Health & Reconnection
 
 ```rust
-/// Replaces the simple `is_connected() -> bool` with richer health status.
-/// Gateway uses this to route orders away from degraded adapters.
-pub enum ConnectionHealth {
-    Connected { latency_ms: u64 },
-    Reconnecting { attempt: u32, since: DateTime<Utc> },
-    Degraded { reason: String },
-    Disconnected { reason: String },
+/// 6-state connection lifecycle. Gateway routes orders away from non-Connected states.
+/// `is_submittable()` returns true only for `Connected`.
+/// `is_degraded()` returns true for HeartbeatLate, Stale, and Reconnecting.
+pub enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    HeartbeatLate { last_heartbeat: DateTime<Utc>, missed_count: u32 },
+    Stale        { last_heartbeat: DateTime<Utc>, stale_since: DateTime<Utc> },
+    Reconnecting { attempt: u32 },
 }
 
-/// Reconnection policy — configured per adapter.
-pub struct ReconnectionPolicy {
-    pub max_attempts: u32,
-    pub base_delay: Duration,          // exponential backoff base
-    pub max_delay: Duration,           // backoff cap
-    pub jitter: bool,                  // randomize to avoid thundering herd
+/// Per-venue health snapshot owned by the VenueAdapter.
+/// Returned by `VenueAdapter::connection_health()`.
+pub struct VenueConnectionHealth {
+    pub venue_id: VenueId,
+    pub state: ConnectionState,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub heartbeat_latency_ms: Option<u64>,
+    pub reconnect_count: u32,
+    pub connected_since: Option<DateTime<Utc>>,
 }
-```
+
+/// Heartbeat configuration — set per adapter at construction time.
+pub struct HeartbeatConfig {
+    pub interval: Duration,             // default 5s
+    pub warning_threshold: u32,         // missed heartbeats before HeartbeatLate (default 2)
+    pub stale_threshold: Duration,      // default 30s
+    pub reconnect_max_attempts: u32,
+    pub reconnect_base_delay: Duration, // exponential backoff base
+    pub reconnect_max_delay: Duration,
+    pub reconnect_jitter: bool,
+}
 ```
 
 ### 5.2 Venue Capabilities
@@ -1142,8 +1172,14 @@ Algo/ML strategies via `SubmitOrder`/`SubmitBatch` manage their own exits — th
 ```rust
 pub trait RiskGate: Send + Sync {
     /// Evaluate order against all risk limits.
-    /// Returns Ok(approved) or Err(violations).
-    fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, Vec<RiskViolation>>;
+    /// `prices` provides mark prices for notional / drawdown calculations.
+    /// `now` comes from `Clock::now()` — deterministic in backtest/replay.
+    fn evaluate(
+        &self,
+        order: &CanonicalOrder,
+        prices: &dyn PriceSource,
+        now: DateTime<Utc>,
+    ) -> Result<RiskApproval, Vec<RiskViolation>>;
 
     /// Current firm book snapshot.
     fn firm_book(&self) -> &FirmBook;
@@ -1152,10 +1188,10 @@ pub trait RiskGate: Send + Sync {
     fn update_limits(&mut self, limits: RiskLimits);
 
     /// Update internal state on fill.
-    fn on_fill(&mut self, fill: &Fill);
+    fn on_fill(&mut self, fill: &Fill, now: DateTime<Utc>);
 
-    /// Update internal state on reconciliation.
-    fn on_position_corrected(&mut self, market: &MarketId, new_qty: Decimal);
+    /// Update internal state on reconciliation (position corrected to venue truth).
+    fn on_position_corrected(&mut self, instrument: &InstrumentId, new_qty: Decimal, now: DateTime<Utc>);
 
     /// Current limits (for display/monitoring).
     fn current_limits(&self) -> &RiskLimits;
@@ -1666,96 +1702,89 @@ fn validate_batch(batch: &BatchRequest) -> Result<()> {
 ### 9.1 Event Types
 
 ```rust
-pub struct Event {
-    pub seq: u64,                   // monotonic sequence number
-    pub schema_version: u16,        // event schema version (for journal replay compatibility)
-    pub timestamp: DateTime<Utc>,
-    pub kind: EventKind,
+/// Every event produced by the Sequencer is wrapped in SequencedEvent<T>.
+/// `sequence_id` provides total ordering. `timestamp` comes from Clock::now().
+pub struct SequencedEvent<T> {
+    pub sequence_id: SequenceId,      // monotonic u64, assigned by Sequencer
+    pub timestamp: DateTime<Utc>,     // Clock::now() at assignment — deterministic in backtest
+    pub event: T,
 }
 
-/// Schema versioning rules:
-/// - Adding a new EventKind variant: bump minor (same schema_version, new variant is ignored by old code)
-/// - Changing fields of an existing variant: bump schema_version, write migration in journal replay
-/// - Removing a variant: never (old journals reference it). Deprecate with a comment.
+/// Exhaustive engine event enum. Every new variant is a compile error
+/// (no `_` wildcard matches allowed on enums we own).
 ///
-/// Journal replay checks: if event.schema_version > CURRENT_SCHEMA_VERSION, return Err
-/// (don't silently skip events from a newer version — that could lose state).
-
-pub enum EventKind {
+/// Schema versioning rules:
+/// - New variant: non-breaking (old replay code logs unknown and skips)
+/// - Field change: bump schema_version in EngineStateSnapshot, write migration
+/// - Remove variant: never — deprecate with comment, keep for old journal compat
+pub enum EngineEvent {
     // ── Order Lifecycle ──
-    OrderCreated { order: CanonicalOrder },
-    OrderSubmitted { order_id: OrderId, venue_order_id: VenueOrderId },
-    OrderOpened { order_id: OrderId },
-    OrderFilled { fill: Fill },
-    OrderCancelled { order_id: OrderId, reason: CancelReason },
-    OrderRejected { order_id: OrderId, reason: String, by: RejectedBy },
-    OrderExpired { order_id: OrderId, filled_qty: Decimal },
-    OrderAmended { order_id: OrderId, new_price: Option<Decimal>, new_qty: Option<Decimal> },
+    OrderReceived    { order_id: OrderId, agent_id: AgentId, instrument_id: InstrumentId },
+    OrderApproved    { order_id: OrderId, client_order_id: ClientOrderId },
+    OrderSubmitted   { order_id: OrderId, venue_order_id: VenueOrderId },
+    OrderFilled      { order_id: OrderId, fill_qty: Decimal, fill_price: Decimal, fee: Decimal },
+    OrderCancelled   { order_id: OrderId, reason: String },
+    OrderRejected    { order_id: OrderId, reason: String },
+    OrderExpired     { order_id: OrderId, filled_qty: Decimal },
 
     // ── Risk ──
-    RiskApproved { order_id: OrderId, approval: RiskApproval },
-    RiskRejected { order_id: OrderId, violations: Vec<RiskViolation> },
-    CircuitBreakerTripped { breaker: String, reason: String },
-    CircuitBreakerReset { breaker: String },
-    LimitsAdjusted { agent: Option<AgentId>, new_limits: serde_json::Value },
-    AgentPaused { agent: AgentId, reason: String },
-    AgentResumed { agent: AgentId },
+    RiskApproved     { order_id: OrderId, warnings: Vec<String> },
+    RiskRejected     { order_id: OrderId, violations: Vec<String> },
+    RiskResized      { order_id: OrderId, original_qty: Decimal, new_qty: Decimal, reason: String },
+    CircuitBreakerTripped { reason: String },
+    CircuitBreakerReset,
+    LimitsAdjusted   { agent: Option<AgentId> },
+    AgentPaused      { agent_id: AgentId, reason: String },
+    AgentResumed     { agent_id: AgentId },
 
     // ── Reconciliation ──
-    PositionDivergence {
-        market: MarketId,
-        internal_qty: Decimal,
-        venue_qty: Decimal,
-    },
-    PositionCorrected { market: MarketId, corrected_to: Decimal },
+    ReconciliationCompleted { venue_id: VenueId, divergence_count: u32 },
+    PositionCorrected { instrument_id: InstrumentId, engine_qty: Decimal, venue_qty: Decimal },
 
-    // ── Funding (Perpetuals) ──
-    FundingPayment {
-        market: MarketId,
-        rate: Decimal,          // funding rate (positive = longs pay shorts)
-        payment: Decimal,       // actual payment (negative = paid, positive = received)
-        position_qty: Decimal,  // position size at time of funding
-    },
+    // ── Mark-to-Market ──
+    MarkToMarketUpdated { unrealized_pnl: Decimal, nav: Decimal },
 
-    // ── Prediction Market ──
-    MarketResolved { market: MarketId, outcome: PredictionOutcome },
-    PredictionPositionSettled { market: MarketId, pnl: Decimal },
+    // ── Venue Connectivity ──
+    VenueConnected    { venue_id: VenueId },
+    VenueDisconnected { venue_id: VenueId, reason: String },
 
     // ── System ──
-    VenueConnected { venue: VenueId, account: AccountId },
-    VenueDisconnected { venue: VenueId, reason: String },
-    EngineStarted { version: String },
+    EngineStarted  { version: String },
     EngineShutdown { reason: String },
+    EngineHalted   { reason: String },
 }
 ```
 
-### 9.2 Journal Trait (Write-Ahead Log)
+### 9.2 EventJournal Trait (Write-Ahead Log)
 
 ```rust
 #[async_trait]
-pub trait Journal: Send + Sync {
-    /// Append event. Returns assigned sequence number.
-    /// Events are durable after this returns — fsync'd or equivalent.
-    async fn append(&self, event: EventKind) -> Result<u64>;
+pub trait EventJournal: Send + Sync {
+    /// Append a sequenced event. Durable after this returns (fsync'd or equivalent).
+    async fn append(&self, event: &SequencedEvent<EngineEvent>) -> Result<()>;
 
-    /// Append batch (atomic — all or none are written).
-    async fn append_batch(&self, events: Vec<EventKind>) -> Result<u64>;
+    /// Append a batch atomically — all or none are written.
+    async fn append_batch(&self, events: &[SequencedEvent<EngineEvent>]) -> Result<()>;
 
-    /// Replay events from a sequence number (for crash recovery).
-    /// Typical use: replay_from(last_snapshot_seq + 1)
-    async fn replay_from(&self, from_seq: u64) -> Result<Vec<Event>>;
+    /// Replay events from a SequenceId (inclusive). Crash recovery use case:
+    ///   replay_from(last_snapshot_seq) to catch up from last known-good state.
+    async fn replay_from(&self, from: SequenceId) -> Result<Vec<SequencedEvent<EngineEvent>>>;
 
-    /// Replay events for a specific order (for audit/forensics).
-    async fn replay_order(&self, order_id: &OrderId) -> Result<Vec<Event>>;
+    /// Replay events in a range [from, to] inclusive.
+    async fn replay_range(&self, from: SequenceId, to: SequenceId)
+        -> Result<Vec<SequencedEvent<EngineEvent>>>;
 
-    /// Replay events in time range (for regression testing).
-    async fn replay_range(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Event>>;
+    /// Save a state snapshot at the given sequence ID.
+    /// After this, replay_from only needs events after this SequenceId.
+    async fn save_snapshot(&self, sequence_id: SequenceId, snapshot: &EngineStateSnapshot)
+        -> Result<()>;
 
-    /// Latest sequence number.
-    async fn latest_seq(&self) -> Result<u64>;
+    /// Load the most recent snapshot (if any).
+    async fn load_latest_snapshot(&self)
+        -> Result<Option<(SequenceId, EngineStateSnapshot)>>;
 
-    /// Subscribe to new events (for real-time consumers: dashboard, bus bridge).
-    fn subscribe(&self) -> mpsc::Receiver<Event>;
+    /// The highest sequence ID in the journal (for startup handshake).
+    async fn latest_sequence_id(&self) -> Result<SequenceId>;
 }
 ```
 

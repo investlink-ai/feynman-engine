@@ -1,8 +1,8 @@
 # Feynman Engine — System Architecture
 
-**Version:** 2.0.0
+**Version:** 2.1.0
 **Status:** Architecture Review Complete
-**Last Updated:** 2026-03-17
+**Last Updated:** 2026-03-19
 
 ---
 
@@ -207,7 +207,7 @@ graph TD
 | **feynman-types** | Domain types, identifiers, validation. Zero business logic. | Compile error (caught early) |
 | **feynman-risk** | Path-aware risk checks (universal + signal-specific) + per-agent/instrument/venue limits. Deterministic, no I/O. | Fail-closed: reject order on error |
 | **feynman-bus** | Redis Streams client. Publish/subscribe/ack. Consumer groups. | Retry with backoff; queue in memory |
-| **feynman-venue** | `VenueAdapter` trait + venue implementations. Translates orders to venue-native API. | Return error to pipeline; no retry at this layer |
+| **feynman-venue** | `VenueAdapter` trait (sealed) + venue implementations. Translates orders to venue-native API. Returns `VenueConnectionHealth` (`ConnectionState` 6-variant enum). | Return error to pipeline; no retry at this layer |
 | **feynman-gateway** | Signal → Order conversion. Conviction-based sizing. Stop/take-profit mapping. | Reject signal if it can't produce valid order |
 | **feynman-engine-core** | Orchestrates: Validate → Risk → Route → Submit. Enforces stage ordering. | Reject order if any stage fails |
 | **feynman-journal** | Append-only event log. WAL for crash recovery. Snapshot/restore. | Engine refuses to start if journal corrupted |

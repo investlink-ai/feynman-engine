@@ -1,7 +1,7 @@
 # Feynman Engine — Data Model
 
-**Version:** 2.0.0
-**Last Updated:** 2026-03-17
+**Version:** 2.1.0
+**Last Updated:** 2026-03-19
 
 This document defines every type, state machine, and invariant in the engine. The source of truth for `crates/types/`.
 
@@ -14,13 +14,23 @@ graph TD
     subgraph Identifiers["Identifiers (newtypes)"]
         OID[OrderId]
         VOID[VenueOrderId]
-        COID[ClientOrderId]
+        COID[ClientOrderId<br/>structured, restart-safe]
         AID[AgentId]
         VID[VenueId]
         ACID[AccountId]
         IID[InstrumentId]
         SID[SignalId]
         MID[MessageId]
+        SEQID[SequenceId<br/>monotonic u64]
+        BID[BasketId]
+    end
+
+    subgraph Infra["Infrastructure"]
+        CLK[Clock trait<br/>WallClock / SimulatedClock]
+        PS[PriceSource trait<br/>sync cache lookup]
+        CS[ConnectionState enum<br/>heartbeat health]
+        EH[EngineHealth<br/>subsystem aggregation]
+        SE[SequencedEvent&lt;T&gt;<br/>event journal envelope]
     end
 
     subgraph Signal["Signal (LLM Input)"]
@@ -818,28 +828,63 @@ graph LR
 ## 7. Reconciliation Model
 
 The engine periodically reconciles local state against venue state to detect drift.
+The `Reconciler` task queries venues, produces `ReconciliationReport`s, and sends
+them to the Sequencer via `SequencerCommand::OnReconciliation`. Only the Sequencer
+mutates state.
 
 ```rust
-pub struct ReconciliationResult {
-    pub venue: VenueId,
-    pub timestamp: DateTime<Utc>,
-    pub phantom_positions: Vec<TrackedPosition>,    // local has, venue doesn't
-    pub untracked_positions: Vec<VenuePosition>,    // venue has, local doesn't
-    pub qty_mismatches: Vec<QtyMismatch>,           // both have, qty differs
-    pub balance_drift: Option<BalanceDrift>,
+/// Full report from a single reconciliation cycle for one venue.
+pub struct ReconciliationReport {
+    pub venue_id: VenueId,
+    pub account_id: AccountId,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub position_divergences: Vec<PositionDivergence>,
+    pub order_divergences: Vec<OrderDivergence>,
+    pub balance_divergence: Option<BalanceDivergence>,
 }
 
-pub struct QtyMismatch {
+impl ReconciliationReport {
+    pub fn is_clean(&self) -> bool;
+    pub fn divergence_count(&self) -> usize;
+}
+
+pub struct PositionDivergence {
     pub instrument: InstrumentId,
-    pub local_qty: Decimal,
+    pub engine_qty: Decimal,
     pub venue_qty: Decimal,
+    pub delta: Decimal,
+    pub action: ReconciliationAction,
+}
+
+pub enum OrderDivergence {
+    MissingOnVenue { order_id: OrderId, engine_state: String },
+    OrphanOnVenue { venue_order_id: VenueOrderId, venue_state: String },
+    StateMismatch { order_id: OrderId, venue_order_id: VenueOrderId,
+                    engine_state: String, venue_state: String },
+}
+
+pub struct BalanceDivergence {
+    pub engine_balance: Decimal,
+    pub venue_balance: Decimal,
     pub delta: Decimal,
 }
 
-pub struct BalanceDrift {
-    pub local_balance: Decimal,
-    pub venue_balance: Decimal,
-    pub drift_pct: Decimal,
+pub enum ReconciliationAction {
+    AcceptVenue,    // accept venue's value as truth, correct engine state
+    AlertOnly,      // human review required
+    CancelOrphan,   // cancel orphan order on venue
+}
+```
+
+### Reconciliation Configuration
+
+```rust
+pub struct ReconciliationConfig {
+    pub interval: Duration,              // default: 60s
+    pub on_reconnect: bool,              // default: true — always reconcile after reconnect
+    pub auto_correct_threshold: Decimal, // default: 0.0001 — silently auto-correct below this
+    pub halt_threshold: Decimal,         // default: 10.0 — halt if divergence exceeds this
 }
 ```
 
@@ -847,38 +892,45 @@ pub struct BalanceDrift {
 
 | Trigger | Frequency | Action on Mismatch |
 |---------|-----------|-------------------|
-| Periodic | Every 60s | Log warning, publish `risk.alerts` |
-| On startup | Once | Block trading until resolved if drift > 1% |
-| After fill | Per fill | Verify fill qty matches venue report |
+| Periodic | Every 60s (configurable) | Log warning, publish `risk.alerts` |
+| On reconnect | Every reconnect | Mandatory — can't trust state after stale connection |
+| On startup | Once | Block trading until resolved if drift > halt_threshold |
 | Manual | On demand via gRPC | Full reconciliation report |
 
 ---
 
 ## 8. Identifier Design
 
-All identifiers are newtype wrappers for compile-time safety.
+All identifiers are newtype wrappers for compile-time safety. Every newtype
+implements `Display`, `From<&str>`, `From<String>`.
 
 ```rust
-// Prevent accidentally passing an AgentId where a VenueId is expected.
 pub struct OrderId(pub String);
 pub struct VenueOrderId(pub String);
-pub struct ClientOrderId(pub String);  // NEW: for idempotent submission
+pub struct ClientOrderId(pub String);  // structured, embeds debugging context
 pub struct AgentId(pub String);
 pub struct VenueId(pub String);
 pub struct AccountId(pub String);
 pub struct InstrumentId(pub String);
 pub struct SignalId(pub String);
 pub struct MessageId(pub String);
+pub struct BasketId(pub String);       // for multi-leg order groups
+
+/// Monotonic event sequence number. Assigned by Sequencer, never reused.
+pub struct SequenceId(pub u64);
 ```
 
 ### ID Generation
 
 | ID Type | Format | Generator |
 |---------|--------|-----------|
-| OrderId | `ord_{ulid}` | Engine (on Signal receipt) |
-| ClientOrderId | `{agent}_{signal_id}_{timestamp}` | Bridge (idempotency key) |
-| SignalId | `sig_{ulid}` | Agent (via MCP) |
-| MessageId | Redis Stream ID | Redis (`XADD *`) |
+| `OrderId` | `ord_{ulid}` | Engine (on Signal receipt) |
+| `ClientOrderId` | `{agent}-{epoch_ms}-{seq:06}-r{restart_epoch:02}` | `ClientOrderIdGenerator` — owned by Sequencer |
+| `SignalId` | `sig_{ulid}` | Agent (via MCP) |
+| `MessageId` | Redis Stream ID | Redis (`XADD *`) |
+| `SequenceId` | Monotonic `u64` from 0 | `SequenceGenerator` — owned by Sequencer |
+
+The `ClientOrderId` format embeds: agent name (debug), epoch ms (timing), sequence counter (dedup), and restart epoch (cross-restart uniqueness). `ClientOrderIdGenerator::next()` takes a `DateTime<Utc>` from `Clock::now()`, never `Utc::now()` directly, ensuring backtest determinism.
 
 ---
 
@@ -915,3 +967,163 @@ pub struct ShutdownConfig {
     pub snapshot_on_shutdown: bool,
 }
 ```
+
+---
+
+## 10. Clock Abstraction
+
+All timestamps in the core path come from `Clock::now()`. No code calls `Utc::now()` directly.
+This makes backtest/replay deterministic: the simulated clock controls all time.
+
+```rust
+pub trait Clock: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+}
+
+pub struct WallClock;          // live/paper — real system time
+pub struct SimulatedClock { .. } // backtest/replay — controlled by harness
+```
+
+`SimulatedClock` is lock-free (`AtomicI64` epoch_millis). Panics if set backward — clocks don't go backward in this engine.
+
+The Sequencer owns the clock and passes `clock.now()` to every state-mutating method. The `AdvanceClock` gRPC RPC is how backtest harnesses drive `SimulatedClock` forward.
+
+---
+
+## 11. Deterministic Event Sequencing
+
+Every state-changing command processed by the Sequencer is wrapped in a `SequencedEvent` and appended to the `EventJournal`.
+
+```rust
+/// Every event journaled by the engine.
+pub struct SequencedEvent<T> {
+    pub sequence_id: SequenceId, // monotonic, never reused
+    pub timestamp: DateTime<Utc>, // from Clock::now(), not wall time
+    pub event: T,
+}
+
+/// All possible engine events. Exhaustive — no wildcard match.
+pub enum EngineEvent {
+    // 22 variants covering order lifecycle, risk, reconciliation,
+    // agent lifecycle, system events, and health events.
+    // See types/src/event.rs for full definitions.
+    OrderReceived { order_id, agent_id, instrument_id, venue_id },
+    OrderFilled { order_id, filled_qty, price, fee },
+    CircuitBreakerTripped { breaker_id, reason },
+    PositionCorrected { instrument_id, venue_id, old_qty, new_qty },
+    EngineStarted { mode },
+    // ...
+}
+```
+
+**Startup recovery:** Load latest snapshot → replay all events after that snapshot's `SequenceId` → resume from current state. The `SequenceGenerator` resumes from the highest journaled sequence ID.
+
+---
+
+## 12. Price Source / Mark-to-Market
+
+The Sequencer queries prices **synchronously** from a cache. An async task updates the cache from venue feeds. No blocking in the Sequencer hot path.
+
+```rust
+/// Synchronous price lookup — backed by in-memory cache.
+pub trait PriceSource: Send + Sync {
+    fn latest_price(&self, instrument: &InstrumentId) -> Option<PriceSnapshot>;
+    fn is_stale(&self, instrument: &InstrumentId, max_age: Duration) -> bool;
+}
+
+pub struct PriceSnapshot {
+    pub instrument: InstrumentId,
+    pub bid: Decimal,
+    pub ask: Decimal,
+    pub mid: Decimal,
+    pub last: Decimal,
+    pub observed_at: DateTime<Utc>, // venue timestamp
+    pub received_at: DateTime<Utc>, // from Clock::now()
+}
+```
+
+Mark-to-market is computed by the canonical formula:
+
+```rust
+pub struct MarkToMarketSnapshot {
+    pub unrealized_pnl: Decimal, // (mark_price - avg_entry_price) * qty
+    pub notional_value: Decimal, // qty.abs() * mark_price
+    // ...
+}
+```
+
+The `RiskGate` receives a `&dyn PriceSource` in every `evaluate()` call so drawdown breakers can use real-time values. The Sequencer calls `EngineCore::mark_to_market()` periodically (via `SequencerCommand::MarkToMarket`).
+
+---
+
+## 13. Venue Connection Health
+
+Every venue connection has an explicit health state. The engine knows when it is flying blind.
+
+```rust
+pub enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    HeartbeatLate { last_heartbeat: DateTime<Utc>, missed_count: u32 },
+    Stale { last_heartbeat: DateTime<Utc>, stale_since: DateTime<Utc> },
+    Reconnecting { attempt: u32 },
+}
+
+pub struct VenueConnectionHealth {
+    pub venue_id: VenueId,
+    pub state: ConnectionState,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub heartbeat_latency_ms: Option<u32>,
+    pub reconnect_count: u32,
+    // ...
+}
+
+impl VenueConnectionHealth {
+    pub fn is_submittable(&self) -> bool;  // only Connected
+    pub fn is_degraded(&self) -> bool;     // HeartbeatLate | Stale | Reconnecting
+}
+```
+
+`VenueAdapter::connection_health()` exposes this. The gateway checks `is_submittable()` before routing. On transition to `Stale`, reconciliation is scheduled immediately on reconnect.
+
+All venue operations have explicit timeouts via `TimeoutPolicy`. Timeout behavior: `Reconcile`, `AlertOnly`, or `CancelAndReconcile` — never silent retry.
+
+---
+
+## 14. Engine Health / Graceful Degradation
+
+Each internal subsystem reports health independently. The engine continues in degraded mode rather than halting for non-critical failures.
+
+```rust
+pub enum SubsystemId {
+    VenueConnection, MessageBus, EventJournal,
+    PriceFeed, Dashboard, Reconciler,
+}
+
+pub enum SubsystemHealth {
+    Healthy,
+    Degraded { reason: String, since: DateTime<Utc> },
+    Failed  { reason: String, since: DateTime<Utc> },
+}
+
+pub enum DegradationPolicy {
+    HaltTrading,        // VenueConnection: can't trade blind
+    PauseNewOrders,     // PriceFeed: can't size without prices
+    BufferAndContinue,  // MessageBus, EventJournal: replay on recovery
+    LogAndContinue,     // Dashboard, Reconciler: lose visibility, not trading
+}
+```
+
+Default policies per subsystem:
+
+| Subsystem | On Failure |
+|-----------|-----------|
+| `VenueConnection` | `HaltTrading` |
+| `PriceFeed` | `PauseNewOrders` |
+| `MessageBus` | `BufferAndContinue` |
+| `EventJournal` | `BufferAndContinue` |
+| `Dashboard` | `LogAndContinue` |
+| `Reconciler` | `LogAndContinue` |
+
+`EngineHealth::evaluate()` derives `OverallHealth` (Healthy / Degraded / Halted) from subsystem states and policies. Reported via `GET /health` and `GetEngineHealth` gRPC.

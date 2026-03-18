@@ -1,7 +1,7 @@
 # Feynman Engine — Contracts & Interfaces
 
-**Version:** 2.0.0
-**Last Updated:** 2026-03-17
+**Version:** 2.1.0
+**Last Updated:** 2026-03-19
 
 This document defines every trait, interface, and protocol boundary in the engine. Code to these contracts; implementations are swappable.
 
@@ -34,101 +34,92 @@ graph TD
 
 ## 2. VenueAdapter Trait
 
-The abstraction over all exchange interactions. One implementation per venue.
+The abstraction over all exchange interactions. One implementation per venue. **Sealed trait** — external crates cannot implement it. "Dumb adapter" principle: translation only, no business logic.
 
 ```rust
 /// Contract for all venue interactions.
-/// Implementations handle venue-native API translation, authentication,
-/// rate limiting, and WebSocket management.
 ///
-/// Accepts `PipelineOrder<Routed>` — an order that has passed validation,
-/// risk checks, and routing. The type system guarantees these preconditions.
-/// See DATA_MODEL.md §3 for the full order lifecycle.
+/// - Sealed: only engine crates can implement this.
+/// - All operations respect `timeout_policy()` — every async call has a deadline.
+/// - Connection health is reported via `connection_health()` — gateway checks
+///   `is_submittable()` before routing.
+/// - Accepts `OrderSubmission` (evolves to `PipelineOrder<Routed>` in Phase 1).
 #[async_trait]
-pub trait VenueAdapter: Send + Sync {
-    /// Unique identifier for this venue (e.g., "bybit", "binance").
+pub trait VenueAdapter: Send + Sync + sealed::Sealed {
     fn venue_id(&self) -> &VenueId;
 
-    /// Submit an order to the venue. Accepts a PipelineOrder<Routed> which
-    /// has already passed validation and risk checks (enforced by type system).
-    /// Returns venue's order ID on success.
-    /// Must check dryRun before actually submitting.
-    /// Must be idempotent on `order.client_order_id`.
-    async fn submit_order(&self, order: &PipelineOrder<Routed>) -> Result<VenueOrderAck>;
+    /// Current connection health. Gateway checks `is_submittable()` before routing.
+    /// On `Stale` or `Disconnected`, submission returns `VenueNotConnected`.
+    fn connection_health(&self) -> &VenueConnectionHealth;
 
-    /// Cancel an order by its venue order ID.
-    async fn cancel_order(&self, venue_order_id: &VenueOrderId) -> Result<CancelAck>;
+    /// Per-venue timeout budgets. See DATA_MODEL.md §13.
+    fn timeout_policy(&self) -> &TimeoutPolicy;
 
-    /// Amend an existing order (price/qty). Not all venues support this.
-    async fn amend_order(&self, venue_order_id: &VenueOrderId, amend: &OrderAmend)
-        -> Result<VenueOrderAck>;
+    /// Venue capabilities (supported order types, TIF, amendments).
+    fn capabilities(&self) -> &VenueCapabilities;
 
-    /// Query the status of an order.
-    async fn get_order_status(&self, venue_order_id: &VenueOrderId) -> Result<OrderStatus>;
+    /// Submit an order. Must check `dry_run` flag before sending to exchange.
+    /// Idempotent on `client_order_id`.
+    async fn submit_order(&self, submission: OrderSubmission) -> Result<VenueOrderAck>;
 
-    /// List all open orders, optionally filtered by instrument.
-    async fn list_open_orders(&self, instrument: Option<&InstrumentId>)
-        -> Result<Vec<OrderStatus>>;
+    async fn cancel_order(&self, venue_order_id: &VenueOrderId) -> Result<()>;
 
-    /// Get current positions on the venue.
-    async fn get_positions(&self) -> Result<Vec<VenuePosition>>;
+    async fn amend_order(
+        &self,
+        venue_order_id: &VenueOrderId,
+        new_price: Option<Decimal>,
+        new_qty: Option<Decimal>,
+    ) -> Result<VenueOrderAck>;
 
-    /// Get account balance.
-    async fn get_balance(&self) -> Result<VenueBalance>;
+    async fn query_positions(&self) -> Result<Vec<VenuePosition>>;
+    async fn query_open_orders(&self) -> Result<Vec<VenueOpenOrder>>;
+    async fn query_balance(&self) -> Result<VenueBalance>;
 
-    /// Subscribe to fill events. Bounded channel — capacity set per adapter.
-    fn subscribe_fills(&self) -> mpsc::Receiver<VenueFill>;
+    /// Subscribe to fill stream. **Bounded** channel — capacity set per adapter.
+    async fn subscribe_fills(&self) -> Result<mpsc::Receiver<VenueFill>>;
 
-    /// Subscribe to order status updates. Bounded channel.
-    fn subscribe_order_updates(&self) -> mpsc::Receiver<OrderStatusUpdate>;
-
-    /// Health check. Returns connection status and latency.
-    async fn health_check(&self) -> VenueHealth;
-
-    /// Graceful shutdown. Cancel pending orders if configured.
-    async fn shutdown(&self, cancel_pending: bool) -> Result<()>;
+    async fn connect(&mut self) -> Result<()>;
+    async fn disconnect(&mut self) -> Result<()>;
 }
 ```
 
 ### VenueAdapter Response Types
 
 ```rust
-/// Acknowledgment from venue after order submission.
 pub struct VenueOrderAck {
     pub venue_order_id: VenueOrderId,
     pub client_order_id: ClientOrderId,
-    pub status: VenueOrderStatus,
-    pub timestamp: DateTime<Utc>,
-}
-
-pub enum VenueOrderStatus {
-    Accepted,
-    Rejected { reason: String },
-    PartiallyFilled { filled_qty: Decimal, remaining_qty: Decimal },
-    Filled { filled_qty: Decimal },
-    Cancelled,
+    pub accepted_at: DateTime<Utc>,
 }
 
 pub struct VenueFill {
     pub venue_order_id: VenueOrderId,
     pub client_order_id: ClientOrderId,
-    pub instrument: InstrumentId,
+    pub instrument_id: InstrumentId,
     pub side: Side,
     pub qty: Decimal,
     pub price: Decimal,
     pub fee: Decimal,
-    pub fee_currency: String,
     pub is_maker: bool,
-    pub timestamp: DateTime<Utc>,
+    pub filled_at: DateTime<Utc>,
 }
 
-pub struct VenueHealth {
-    pub venue: VenueId,
-    pub connected: bool,
-    pub latency_ms: Option<u32>,
-    pub last_heartbeat: Option<DateTime<Utc>>,
+pub struct VenueBalance {
+    pub total_equity: Decimal,
+    pub available_balance: Decimal,
+    pub margin_used: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub as_of: DateTime<Utc>,
 }
 ```
+
+### Connection Health (see DATA_MODEL.md §13 for full types)
+
+`VenueConnectionHealth` tracks `ConnectionState` (6 variants), heartbeat latency, and reconnect count. `is_submittable()` returns true only in `Connected` state. On `Stale` → reconciliation is triggered on next reconnect. Heartbeat configuration via `HeartbeatConfig` (interval, warning threshold, stale threshold).
+
+### Timeout Policy (see DATA_MODEL.md §13 for full types)
+
+`TimeoutPolicy` defines per-operation deadlines: `submit_order` (10s), `cancel_order` (10s), `query_*` (15s), `fill_watchdog` (60s). On timeout: `ReconcileAndDecide` — never blind retry.
 
 ### Capability Extensions
 
@@ -159,47 +150,40 @@ pub trait FundingVenue: VenueAdapter {
 
 ---
 
-## 3. RiskEvaluator Trait
+## 3. RiskGate / RiskEvaluator Traits
 
-Pure, synchronous, deterministic risk evaluation. No I/O.
-
-Accepts `PipelineOrder<Validated>` — an order that has already passed stateless validation. The type system prevents evaluating unvalidated orders. Returns a `RiskOutcome` that either advances the order to `RiskChecked` or rejects it.
+Synchronous, stateful risk evaluation. Receives `PriceSource` for mark-to-market drawdown checks.
 
 ```rust
-/// Risk evaluation contract. Implementations must be deterministic:
-/// same inputs always produce the same output.
-///
-/// Accepts PipelineOrder<Validated> (stateless validation already passed).
-/// Returns RiskOutcome: Approved (→ PipelineOrder<RiskChecked>), Resize
-/// (→ new PipelineOrder<Draft>), or Rejected (→ RejectedOrder).
-pub trait RiskEvaluator: Send + Sync {
-    /// Evaluate an order against risk limits and portfolio state.
-    /// Type-safe: only validated orders can be risk-checked.
+/// Stateful risk evaluation. Knows current firm book. Hot-reloadable limits.
+/// All time-dependent checks receive `now` from Clock, never Utc::now().
+pub trait RiskGate: Send + Sync {
+    /// Evaluate order against all risk limits.
+    /// `prices`: sync cache for mark-to-market risk checks (drawdown, NAV).
+    /// `now`: from Sequencer's Clock::now() — deterministic in backtest.
     fn evaluate(
         &self,
-        order: PipelineOrder<Validated>,
-        agent_limits: &AgentRiskLimits,
-        firm_book: &FirmBook,
-    ) -> RiskOutcome;
+        order: &CanonicalOrder,
+        prices: &dyn PriceSource,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<RiskApproval, Vec<RiskViolation>>;
+
+    fn firm_book(&self) -> &FirmBook;
+    fn update_limits(&mut self, limits: RiskLimits);
+    fn on_fill(&mut self, fill: &Fill, now: DateTime<Utc>);
+    fn on_position_corrected(&mut self, instrument: &InstrumentId, new_qty: Decimal, now: DateTime<Utc>);
+    fn current_limits(&self) -> &RiskLimits;
 }
 
 /// Result of risk evaluation. Three outcomes — not two.
-/// See DATA_MODEL.md §3.2 for the full type definitions.
 pub enum RiskOutcome {
-    /// Order approved as-is. Carries proof and the advanced order.
-    Approved(PipelineOrder<RiskChecked>, RiskProof),
-    /// Order must be resized. Returns a new Draft with adjusted qty.
-    /// Caller must re-validate and re-risk-check the resized order.
-    Resize {
-        resized: PipelineOrder<Draft>,
-        original_notional: Decimal,
-        approved_notional: Decimal,
-        reason: String,
-    },
-    /// Order rejected. Contains all violations found (not just the first).
-    Rejected(RejectedOrder),
+    Approved { warnings: Vec<RiskViolation> },
+    Resized { new_qty: Decimal, reason: String, warnings: Vec<RiskViolation> },
+    Rejected { violations: Vec<RiskViolation> },
 }
 ```
+
+The `RiskEvaluator` (Phase 1 type-state variant) will accept `PipelineOrder<Validated>` and advance to `PipelineOrder<RiskChecked>`. See DATA_MODEL.md §3.2 for the full type definitions and resize loop semantics.
 
 ### Risk Checklist (AgentRiskManager)
 
@@ -426,40 +410,51 @@ graph LR
 
 ## 5. EventJournal Trait
 
-Append-only event log for crash recovery and audit.
+Append-only event log for crash recovery, audit, and replay. Events are wrapped in `SequencedEvent<EngineEvent>` (monotonic ID + clock timestamp + payload). See DATA_MODEL.md §11.
 
 ```rust
-/// Append-only event journal. All state-changing events are journaled
-/// before they take effect. On restart, replay from last snapshot.
+/// Append-only event journal. Events are stored with their SequenceId.
+/// On restart: load_latest_snapshot → replay_from(snapshot_sequence_id + 1).
+/// Not on the hot path — Sequencer processes first, journals after.
+/// If journal is slow → events buffer in memory (BufferAndContinue policy).
 #[async_trait]
 pub trait EventJournal: Send + Sync {
-    /// Append an event to the journal. Returns the sequence number.
-    async fn append(&self, event: &EngineEvent) -> Result<u64>;
+    async fn append(&self, event: &SequencedEvent<EngineEvent>) -> Result<()>;
+    async fn append_batch(&self, events: &[SequencedEvent<EngineEvent>]) -> Result<()>;
 
-    /// Read events from a sequence number. Used for replay on startup.
-    async fn read_from(&self, seq: u64) -> Result<Vec<(u64, EngineEvent)>>;
+    /// Replay events from sequence ID (inclusive), in order.
+    async fn replay_from(&self, from: SequenceId) -> Result<Vec<SequencedEvent<EngineEvent>>>;
+    async fn replay_range(&self, from: SequenceId, to: SequenceId)
+        -> Result<Vec<SequencedEvent<EngineEvent>>>;
 
-    /// Take a snapshot of current state. Future replays start from here.
-    async fn snapshot(&self, state: &EngineSnapshot) -> Result<u64>;
-
-    /// Load the most recent snapshot. Returns None if no snapshot exists.
-    async fn load_snapshot(&self) -> Result<Option<(u64, EngineSnapshot)>>;
-}
-
-/// Events that are journaled.
-pub enum EngineEvent {
-    SignalReceived(Signal),
-    RiskEvaluated { order_id: OrderId, decision: RiskDecision },
-    OrderSubmitted { order_id: OrderId, venue_order_id: VenueOrderId },
-    OrderFilled(VenueFill),
-    OrderCancelled { order_id: OrderId, reason: String },
-    PositionUpdated(TrackedPosition),
-    AgentStatusChanged { agent: AgentId, old: AgentStatus, new: AgentStatus },
-    ConfigReloaded { section: String },
-    EngineStarted { mode: ExecutionMode, version: String },
-    EngineShutdown { reason: String },
+    async fn save_snapshot(&self, seq: SequenceId, snapshot: &EngineStateSnapshot) -> Result<()>;
+    async fn load_latest_snapshot(&self)
+        -> Result<Option<(SequenceId, EngineStateSnapshot)>>;
+    async fn latest_sequence_id(&self) -> Result<SequenceId>;
 }
 ```
+
+`EngineEvent` is a 22-variant enum covering the full engine lifecycle. See `types/src/event.rs` for the canonical definitions. The `SequenceGenerator` (owned by Sequencer) assigns `SequenceId` values and resumes from the highest journaled ID on startup.
+
+## 5a. Reconciler Trait
+
+Queries venue state and produces `ReconciliationReport`s for the Sequencer. The Sequencer is the only entity that corrects state.
+
+```rust
+/// Queries venue for positions, orders, and balances.
+/// Compares against engine snapshot. Sends report to Sequencer.
+/// Does NOT mutate engine state — only the Sequencer does that.
+#[async_trait]
+pub trait Reconciler: Send + Sync {
+    async fn reconcile(
+        &self,
+        venue_id: &VenueId,
+        engine_snapshot: &EngineStateSnapshot,
+    ) -> Result<ReconciliationReport>;
+}
+```
+
+`ReconciliationReport` contains `Vec<PositionDivergence>`, `Vec<OrderDivergence>`, and `Option<BalanceDivergence>`. See DATA_MODEL.md §7 for full type definitions. The Sequencer processes the report via `SequencerCommand::OnReconciliation`.
 
 ---
 
