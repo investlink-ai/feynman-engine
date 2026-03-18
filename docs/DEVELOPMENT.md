@@ -30,11 +30,11 @@ cargo clippy --workspace -- -D warnings
 | Directory | Purpose |
 |-----------|---------|
 | `crates/types/` | Feynman-specific domain types (Signal, AgentAllocation, etc.) |
-| `crates/bridge/` | Signal → Nautilus order translation, sizing logic |
-| `crates/agent-risk/` | L1 agent-aware risk evaluation |
-| `crates/agent-bus/` | Redis Streams message bus implementation |
-| `crates/pipeline/` | Execution pipeline stage composition |
-| `crates/dashboard/` | REST API, SSE, Prometheus metrics |
+| `crates/gateway/` | Signal → Nautilus order translation, sizing logic |
+| `crates/risk/` | L1 agent-aware risk evaluation |
+| `crates/bus/` | Redis Streams message bus implementation |
+| `crates/engine-core/` | Execution pipeline stage composition |
+| `crates/observability/` | REST API, SSE, Prometheus metrics |
 | `crates/api/` | gRPC service implementation |
 | `bins/feynman-engine/` | Main binary entry point |
 | `tests/` | Integration, backtest, and risk tests |
@@ -47,12 +47,12 @@ cargo clippy --workspace -- -D warnings
 Follow this order to maintain dependency hygiene:
 
 1. **types** — No dependencies except std, serde. Define all domain types here.
-2. **agent-risk** — Depends on types. Risk evaluation logic.
-3. **agent-bus** — Depends on types. Redis client implementation.
-4. **bridge** — Depends on types. Translation and sizing.
-5. **pipeline** — Depends on types, agent-risk, bridge. Pipeline stages.
-6. **dashboard** — Depends on types, pipeline. Web UI.
-7. **api** — Depends on types, pipeline, dashboard. gRPC service.
+2. **risk** — Depends on types. Risk evaluation logic.
+3. **bus** — Depends on types. Redis client implementation.
+4. **gateway** — Depends on types. Translation and sizing.
+5. **engine-core** — Depends on types, risk, gateway. Pipeline stages.
+6. **observability** — Depends on types, engine-core. Web UI.
+7. **api** — Depends on types, engine-core, observability. gRPC service.
 8. **feynman-engine** (binary) — Orchestration, all crates.
 
 ## Common Tasks
@@ -298,7 +298,7 @@ gh pr create --draft
 # 1. Create the directory structure
 mkdir -p crates/newcrate/src
 
-# 2. Create Cargo.toml (template in bridge/Cargo.toml)
+# 2. Create Cargo.toml (template in gateway/Cargo.toml)
 # 3. Create src/lib.rs with doc comment
 # 4. Add to workspace root Cargo.toml members list
 # 5. Test it compiles

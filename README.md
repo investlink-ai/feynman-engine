@@ -46,11 +46,11 @@ feynman-engine/
 │
 ├── crates/                       # Individual crates (see details below)
 │   ├── types/                    # Feynman-specific types
-│   ├── bridge/                   # Signal → Order translation
-│   ├── agent-risk/               # Agent risk isolation
-│   ├── agent-bus/                # Redis Streams cross-process bus
-│   ├── pipeline/                 # Execution pipeline stages
-│   ├── dashboard/                # Web UI + observability
+│   ├── gateway/                  # Signal → Order translation
+│   ├── risk/                     # Agent risk isolation
+│   ├── bus/                      # Redis Streams cross-process bus
+│   ├── engine-core/              # Execution pipeline stages
+│   ├── observability/            # Web UI + observability
 │   └── api/                      # gRPC service
 │
 ├── bins/
@@ -71,24 +71,26 @@ feynman-engine/
 
 | Crate | Purpose |
 |-------|---------|
-| **types** | Signal, AgentId, AgentAllocation, FirmBook, etc. — types that Nautilus doesn't have |
-| **bridge** | PortfolioBridge, PositionSizer, VenueRouter — converts signals to Nautilus orders |
-| **agent-risk** | AgentRiskManager, per-agent limits, drawdown checks — L1 risk layer |
-| **agent-bus** | AgentBus trait + Redis Streams impl — cross-process agent coordination |
-| **pipeline** | PipelineStage trait, execution pipeline composition — signal validation → risk → size → submit |
-| **dashboard** | REST API (axum), SSE stream, Prometheus metrics — observability |
+| **types** | Signal, AgentId, AgentAllocation, FirmBook, custom domain types |
+| **gateway** | Signal → Order translation, position sizing, venue routing |
+| **risk** | AgentRiskManager, per-agent limits, drawdown checks — L1 risk layer |
+| **bus** | AgentBus trait + Redis Streams impl — cross-process agent coordination |
+| **engine-core** | Execution pipeline stages: validate → risk → size → route → submit |
+| **observability** | REST API (axum), SSE stream, Prometheus metrics — observability |
 | **api** | gRPC service (tonic) — network boundary for agents |
-| **feynman-engine** (binary) | Main entry point, FeynmanEngine orchestration, CLI args |
+| **feynman-engine** (binary) | Main entry point, engine orchestration, CLI args |
 
-## Key Design Decisions
+## Architecture
 
-See [HYBRID_ENGINE_ARCHITECTURE.md](#docs--architecture) for full architecture. TL;DR:
+**100% custom Rust implementation** (no external trading frameworks). See docs for full design:
 
-- **NautilusTrader core** — Orders, venue adapters, backtest engine, fee/fill models
-- **Custom service layer** — gRPC boundary, agent risk isolation, signal→order bridge, Redis bus
-- **Hybrid strategy** — ~70% NautilusTrader (proven), ~30% custom (our edge)
+- **Type-state order pipeline** — Draft → Validated → RiskChecked → Routed → LiveOrder (compile-time safety)
+- **Hybrid FSM** — Type-state for engine pipeline (linear, deterministic), runtime VenueState enum for venue lifecycle (event-driven)
+- **Per-agent risk isolation** — Budget limits, leverage caps, drawdown halts (L1 risk)
+- **Path-aware validation** — Signal-specific checks (stop loss required), order-specific checks (optional stop loss)
+- **Redis Streams bus** — Consumer groups, pending message tracking, circuit breaker coordination
 - **Three execution modes** — Backtest (historical), Paper (live data + sim), Live (real)
-- **Risk layers** — L0 (compiled circuit breakers), L1 (agent budgets), L2 (LLM Taleb), L3 (human)
+- **Decimal-only math** — No f64 in financial logic (100% Decimal)
 
 ## Development Workflow
 
@@ -263,10 +265,20 @@ grpcurl -plaintext localhost:50051 feynman.engine.v1.ExecutionService/GetFirmBoo
 
 ## Documentation
 
-- [HYBRID_ENGINE_ARCHITECTURE.md](../feynman_trading_bot/docs/HYBRID_ENGINE_ARCHITECTURE.md) — Full architecture (design, buy-vs-build, type mapping)
-- [CORE_ENGINE_DESIGN.md](../feynman_trading_bot/docs/CORE_ENGINE_DESIGN.md) — Order model, venue adapters, risk layers
-- [SOLUTION-DESIGN.md](../feynman_trading_bot/docs/SOLUTION-DESIGN.md) — Agent architecture (parent repo)
-- [MVP.md](../feynman_trading_bot/docs/MVP.md) — MVP scope and gates (parent repo)
+**Getting Started:**
+- [QUICKSTART.md](./QUICKSTART.md) — 10-minute onboarding (setup + dev loop)
+- [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) — Full developer reference (testing, debugging, Docker, CI/CD)
+- [docs/CODING_GUIDELINES.md](./docs/CODING_GUIDELINES.md) — Language standards, patterns, architecture rules
+
+**Architecture & Design:**
+- [docs/CORE_ENGINE_DESIGN.md](./docs/CORE_ENGINE_DESIGN.md) — Order FSM (type-state + runtime), venue adapters, risk layers
+- [docs/SYSTEM_ARCHITECTURE.md](./docs/SYSTEM_ARCHITECTURE.md) — High-level architecture diagram, kill switch hierarchy
+- [docs/DATA_MODEL.md](./docs/DATA_MODEL.md) — Domain types, order lifecycle, invariants
+- [docs/CONTRACTS.md](./docs/CONTRACTS.md) — Trait contracts, RPC signatures, pipeline stages
+
+**Planning:**
+- [PHASE_0_CHECKLIST.md](./PHASE_0_CHECKLIST.md) — Current sprint (scaffold, risk, bus, integration tests)
+- [ROADMAP.md](./ROADMAP.md) — 5-phase migration plan with dependency graph
 
 ## Contributing
 

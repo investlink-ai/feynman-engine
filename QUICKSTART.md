@@ -26,8 +26,8 @@ Edit code in `crates/` or `bins/`. Example:
 # Edit types
 vim crates/types/src/lib.rs
 
-# Edit bridge logic
-vim crates/bridge/src/lib.rs
+# Edit gateway logic
+vim crates/gateway/src/lib.rs
 ```
 
 ### 2. Test Locally
@@ -73,10 +73,10 @@ grpcurl -plaintext localhost:50051 \
    git commit -m "chore: initial engine scaffold"
    ```
 
-2. **Phase 0 Work** (see HYBRID_ENGINE_ARCHITECTURE.md §14.2):
+2. **Phase 0 Work** (see PHASE_0_CHECKLIST.md):
    - Complete `crates/types/` with all domain types ✓ (done)
-   - Implement `crates/agent-risk/` — AgentRiskManager
-   - Implement `crates/agent-bus/` — Redis Streams client
+   - Implement `crates/risk/` — AgentRiskManager
+   - Implement `crates/bus/` — Redis Streams client
    - Write integration tests in `tests/integration/`
 
 3. **Run Tests**:
@@ -103,4 +103,4 @@ grpcurl -plaintext localhost:50051 \
 | `error: couldn't compile proto` | Install protobuf: `brew install protobuf` |
 | `redis connection refused` | Start Redis: `docker run -p 6379:6379 redis:7-alpine` |
 
-See [DEVELOPMENT.md](./DEVELOPMENT.md) for more.
+See [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) for detailed developer reference.
