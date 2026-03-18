@@ -107,6 +107,8 @@ See `AGENTS.md §4` for code examples for each rule.
 | Document | Status | What |
 |----------|--------|------|
 | `AGENTS.md` | **READ FIRST** | Architecture, invariants, safety rules, coding guidelines |
+| `docs/DEV_WORKFLOW.md` | Canonical | Full dev loop: issue → branch → verify → PR → merge |
+| `docs/TESTING.md` | Canonical | Testing strategy: compile-fail, snapshots, property, fixtures |
 | `docs/CORE_ENGINE_DESIGN.md` | Canonical | Full architecture: types, venues, pipeline, risk, concurrency |
 | `docs/STRATEGY_ENGINE_BOUNDARY.md` | Canonical | Strategy ↔ engine contract, client types, deployment modes |
 | `.claude/rules/risk-touching.md` | Active | Auto-loaded gate for risk/execution code edits |

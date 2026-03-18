@@ -1,313 +1,187 @@
-# Development Guide
+# Development Commands Reference
 
-## Initial Setup
+Quick cheat sheet for common development tasks. For the full dev workflow (issue → branch → verify → PR → merge), see [DEV_WORKFLOW.md](./DEV_WORKFLOW.md).
+
+---
+
+## Setup
 
 ```bash
-cd feynman-engine
-
 # Verify Rust toolchain
 rustc --version  # 1.82+
 cargo --version
 
-# Install protobuf compiler (required for gRPC)
-brew install protobuf      # macOS
-# or
+# Install protobuf compiler
+brew install protobuf          # macOS
 sudo apt-get install protobuf-compiler  # Ubuntu
-
-# Build the workspace
-cargo build
-
-# Run tests
-cargo test --workspace
-
-# Check formatting and linting
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
 ```
 
-## Project Layout Overview
+---
 
-| Directory | Purpose |
-|-----------|---------|
-| `crates/types/` | Feynman-specific domain types (Signal, AgentAllocation, etc.) |
-| `crates/gateway/` | Signal → Nautilus order translation, sizing logic |
-| `crates/risk/` | L1 agent-aware risk evaluation |
-| `crates/bus/` | Redis Streams message bus implementation |
-| `crates/engine-core/` | Execution pipeline stage composition |
-| `crates/observability/` | REST API, SSE, Prometheus metrics |
-| `crates/api/` | gRPC service implementation |
-| `bins/feynman-engine/` | Main binary entry point |
-| `tests/` | Integration, backtest, and risk tests |
-| `proto/` | gRPC service definitions (.proto files) |
-| `config/` | Configuration file templates |
-| `docker/` | Dockerfile and compose files |
-
-## Crate Development Order
-
-Follow this order to maintain dependency hygiene:
-
-1. **types** — No dependencies except std, serde. Define all domain types here.
-2. **risk** — Depends on types. Risk evaluation logic.
-3. **bus** — Depends on types. Redis client implementation.
-4. **gateway** — Depends on types. Translation and sizing.
-5. **engine-core** — Depends on types, risk, gateway. Pipeline stages.
-6. **observability** — Depends on types, engine-core. Web UI.
-7. **api** — Depends on types, engine-core, observability. gRPC service.
-8. **feynman-engine** (binary) — Orchestration, all crates.
-
-## Common Tasks
-
-### Testing
+## Building & Checking
 
 ```bash
-# All tests
-cargo test --workspace --verbose
-
-# Specific crate
-cargo test -p types
-
-# Single test
-cargo test agent_allocation_arithmetic
-
-# Run with output
-cargo test -- --nocapture --test-threads=1
-
-# Property tests (slower, marked #[ignore])
-cargo test -- --ignored
-
-# Test coverage (requires `cargo-tarpaulin`)
-cargo install cargo-tarpaulin
-cargo tarpaulin --workspace --out Html
+cargo check                                # Quick syntax check (1-2s)
+cargo build                                # Debug build (fast to build, slow to run)
+cargo build --release                      # Release build (slow to build, fast to run)
+cargo build -p {crate}                     # Build specific crate
+cargo build --bin feynman-engine           # Build binary only
 ```
 
-### Code Quality
+---
+
+## Testing
 
 ```bash
-# Format (auto-fix)
-cargo fmt
-
-# Format check only
-cargo fmt --check
-
-# Linting
-cargo clippy --workspace
-
-# Strict linting (as CI does)
-cargo clippy --workspace -- -D warnings
-
-# Unused dependencies
-cargo tree --duplicates
+cargo test --workspace                     # All tests
+cargo test -p {crate}                      # Specific crate
+cargo test {test_name}                     # Single test
+cargo test -- --ignored                    # Property tests (slow, marked #[ignore])
+cargo test -- --nocapture --test-threads=1 # Run with output, serial
+cargo test --doc                           # Doc tests only
 ```
 
-### Building
+---
+
+## Code Quality
 
 ```bash
-# Debug (fast to build, slow to run)
-cargo build
+cargo fmt                                  # Format (auto-fix)
+cargo fmt --check                          # Format check only
+cargo clippy --workspace -- -D warnings   # Strict linting (as CI does)
+cargo clippy -p {crate} -- -D warnings    # Lint specific crate
+cargo tree --duplicates                    # Find duplicate dependencies
+```
 
-# Release (slow to build, fast to run)
-cargo build --release
+---
 
-# Build specific crate
-cargo build -p types
+## Full Gate (before every commit)
 
-# Build binary
-cargo build --bin feynman-engine
+```bash
+make check
+# Equivalent to:
+#   cargo fmt --check
+#   cargo clippy --workspace -- -D warnings
+#   cargo test --workspace
+```
 
-# Build and run
+---
+
+## Documentation
+
+```bash
+cargo doc --workspace --open               # Build and open docs
+cargo test --doc                           # Check doc comments compile
+```
+
+---
+
+## Running the Engine
+
+```bash
 cargo run --bin feynman-engine -- --config config/default.toml
+FEYNMAN_MODE=paper cargo run --bin feynman-engine
+FEYNMAN_MODE=backtest cargo run --bin feynman-engine
+RUST_LOG=debug cargo run --bin feynman-engine  # With debug logging
+RUST_LOG=feynman_engine=debug,types=trace cargo run --bin feynman-engine  # Module-specific
 ```
 
-### Documentation
+---
+
+## gRPC
 
 ```bash
-# Build and open documentation
-cargo doc --workspace --open
+# Proto changes: auto-generated by build script
+cargo build  # Generates code to target/debug/feynman/engine/v1/
 
-# Check doc comments compile
-cargo test --doc
-
-# Build docs for dependencies too
-cargo doc --workspace --no-deps=false --open
+# Test gRPC locally
+grpcurl -plaintext localhost:50051 feynman.engine.v1.ExecutionService/GetEngineHealth
 ```
 
-## Working with gRPC
+---
 
-The gRPC service is defined in `proto/feynman/engine/v1/service.proto`.
-
-### Proto Changes
-
-If you modify `.proto` files:
+## Docker
 
 ```bash
-# The Rust code is generated automatically by the build script (build.rs)
-# Just rebuild:
-cargo build
-
-# The generated code appears in target/debug/feynman/engine/v1/ (or release/)
-```
-
-### Testing gRPC Locally
-
-```bash
-# Terminal 1: Start the engine
-cargo run --bin feynman-engine
-
-# Terminal 2: Call a service method
-grpcurl -plaintext localhost:50051 \
-  feynman.engine.v1.ExecutionService/GetEngineHealth
-
-# Or with ghz (gRPC benchmarking tool)
-ghz --insecure --proto proto/feynman/engine/v1/service.proto \
-  --call feynman.engine.v1.ExecutionService/GetEngineHealth \
-  localhost:50051
-```
-
-## Docker Development
-
-```bash
-# Build image locally
 docker build -f docker/engine.Dockerfile -t feynman-engine:latest .
-
-# Run with docker-compose (includes Redis)
-docker compose -f docker/docker-compose.yml up -d
-
-# View logs
-docker compose logs -f engine
-
-# Health check
-grpc_health_probe -addr=localhost:50051
-
-# Stop
-docker compose down
-
-# Clean up volumes
-docker compose down -v
+docker compose -f docker/docker-compose.yml up -d      # Start engine + Redis
+docker compose logs -f engine                          # View logs
+grpc_health_probe -addr=localhost:50051               # Health check
+docker compose down -v                                # Stop and clean volumes
 ```
+
+---
 
 ## Debugging
 
-### Enable Debug Logging
-
+**Enable debug logging:**
 ```bash
-# Via environment variable
 RUST_LOG=debug cargo run --bin feynman-engine
-
-# Different modules
 RUST_LOG=feynman_engine=debug,types=trace cargo run --bin feynman-engine
 ```
 
-### Debugging in VS Code
+**VS Code debugger:**
+- Create `.vscode/launch.json` (see DEV_WORKFLOW.md §4)
+- Press F5
 
-Create `.vscode/launch.json`:
+---
 
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "lldb",
-      "request": "launch",
-      "name": "Debug feynman-engine",
-      "cargo": {
-        "args": [
-          "build",
-          "--bin=feynman-engine",
-          "--package=feynman-engine"
-        ],
-        "filter": {
-          "name": "feynman-engine",
-          "kind": "bin"
-        }
-      },
-      "args": ["--config", "config/default.toml"],
-      "cwd": "${workspaceFolder}"
-    }
-  ]
-}
-```
-
-Then press F5 to debug.
-
-## CI/CD
-
-GitHub Actions workflows are in `.github/workflows/`:
-
-- `test.yml` — `cargo test`, `cargo clippy`, `cargo fmt --check`
-- `build.yml` — `cargo build --release`, upload artifacts
-- `docker.yml` — Build and push Docker image (future)
-
-Push to `main` or `dev` to trigger CI.
-
-## Performance
-
-### Profiling
+## Profiling (Linux)
 
 ```bash
-# Compile with debug info but optimized
 RUSTFLAGS="-g" cargo build --release
-
-# Run with perf (Linux)
 perf record --call-graph=dwarf ./target/release/feynman-engine
 perf report
-
-# Benchmark (with criterion.rs)
-cargo bench
 ```
 
-### Optimization
-
-- Use `rust_decimal` for all financial math (never `f64`)
-- Avoid allocations in hot path (order submission)
-- Cache venue adapter instances
-- Use `tokio::task` for CPU-bound work (not blocking threads)
+---
 
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
 | `error: toolchain 'stable' has no component 'rust-analyzer'` | `rustup component add rust-analyzer` |
-| `error: linker 'cc' not found` | Install build tools: `xcode-select --install` (macOS) or `sudo apt-get install build-essential` (Ubuntu) |
-| `error: couldn't compile proto` | Install protobuf: `brew install protobuf` |
-| `error: no module named 'tonic_build'` | `cargo build` first (generates proto code) |
+| `error: linker 'cc' not found` | `xcode-select --install` (macOS) or `sudo apt-get install build-essential` (Ubuntu) |
+| `error: couldn't compile proto` | `brew install protobuf` |
 | Build cache stale | `cargo clean && cargo build` |
 | Tests fail but pass locally | Try `cargo test --no-default-features` |
 
-## Git Workflow
+---
 
-```bash
-# Create feature branch
-git checkout -b feat/signal-validation
+## Project Layout
 
-# Make changes, test
-cargo test --workspace
+| Directory | Purpose |
+|-----------|---------|
+| `crates/types/` | Domain types (OrderId, Signal, FirmBook, etc.) |
+| `crates/risk/` | Risk evaluation (AgentRiskManager) |
+| `crates/bus/` | Redis Streams message bus |
+| `crates/gateway/` | Signal → Order translation, sizing |
+| `crates/engine-core/` | Pipeline stages, Sequencer |
+| `crates/observability/` | REST API, SSE, Prometheus |
+| `crates/api/` | gRPC service |
+| `bins/feynman-engine/` | Main binary entry point |
+| `tests/integration/` | Integration and E2E tests |
+| `proto/` | gRPC `.proto` files |
+| `config/` | Configuration templates |
+| `docker/` | Dockerfile and docker-compose |
 
-# Commit
-git commit -m "feat: add signal validation"
-
-# Push
-git push -u origin feat/signal-validation
-
-# Open PR on GitHub
-gh pr create --draft
-```
+---
 
 ## Adding a New Crate
 
 ```bash
-# 1. Create the directory structure
-mkdir -p crates/newcrate/src
-
-# 2. Create Cargo.toml (template in gateway/Cargo.toml)
-# 3. Create src/lib.rs with doc comment
-# 4. Add to workspace root Cargo.toml members list
-# 5. Test it compiles
-cargo build -p newcrate
+mkdir -p crates/{newcrate}/src
+# Create crates/{newcrate}/Cargo.toml (copy from an existing crate)
+# Create crates/{newcrate}/src/lib.rs with doc comment
+# Add to root Cargo.toml [workspace] members list
+cargo build -p {newcrate}  # Verify it compiles
 ```
+
+---
 
 ## Resources
 
 - [Rust Book](https://doc.rust-lang.org/book/)
 - [Tokio Tutorial](https://tokio.rs/tokio/tutorial)
-- [tonic (gRPC) Examples](https://github.com/hyperium/tonic/tree/master/examples)
+- [tonic gRPC Examples](https://github.com/hyperium/tonic/tree/master/examples)
 - [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)

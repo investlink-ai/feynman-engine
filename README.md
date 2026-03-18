@@ -267,7 +267,9 @@ grpcurl -plaintext localhost:50051 feynman.engine.v1.ExecutionService/GetFirmBoo
 
 **Getting Started:**
 - [QUICKSTART.md](./QUICKSTART.md) — 10-minute onboarding (setup + dev loop)
-- [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) — Full developer reference (testing, debugging, Docker, CI/CD)
+- [docs/DEV_WORKFLOW.md](./docs/DEV_WORKFLOW.md) — Full development workflow (issue → branch → verify → PR → merge)
+- [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) — Developer reference (commands, debugging, Docker, CI/CD)
+- [docs/TESTING.md](./docs/TESTING.md) — Testing strategy (compile-fail, snapshots, property tests, fixtures)
 - [docs/CODING_GUIDELINES.md](./docs/CODING_GUIDELINES.md) — Language standards, patterns, architecture rules
 
 **Architecture & Design:**
