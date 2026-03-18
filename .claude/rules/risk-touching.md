@@ -36,6 +36,31 @@ You are editing code that evaluates trades or submits orders. Answer all questio
 - No silent fallbacks — `Err(...)` not default substitution
 - Emulation is opt-in only (`allow_emulation: true`), never automatic
 
+## Pre-Merge Checklist
+
+Before marking any money-touching PR as ready:
+
+- [ ] **Decimal only** — No `f64`/`f32` in financial logic (prices, quantities, PnL)
+- [ ] **Fail-fast** — Invalid input → `Err(...)` immediately, never silent clamp/default
+- [ ] **dryRun guard** — Every venue submission path checks `config.dry_run`
+- [ ] **Idempotency** — Retries won't create duplicate orders (use `clientOrderId` or existence check)
+- [ ] **Error propagation** — Venue errors returned to caller, not swallowed
+- [ ] **Per-agent isolation** — Risk limits are per-agent, one agent's loss doesn't starve another
+- [ ] **Pipeline order preserved** — Risk gate runs before venue submission
+- [ ] **Explicit over implicit** — No silent defaults, fallbacks, or `unwrap_or_default()` in financial logic
+- [ ] **Sequencer ownership** — State mutation only inside Sequencer task, not behind locks
+- [ ] **Bounded channels** — No `mpsc::unbounded_channel()` in production code
+- [ ] **Type-state pipeline** — Venue submission takes `PipelineOrder<Routed>`, risk-checks take `PipelineOrder<Validated>`
+- [ ] **No `Arc<Mutex<T>>` on state** — Sequencer owns business state exclusively
+- [ ] **No `unwrap()`** — Or has doc comment explaining why it's safe
+- [ ] **Property tests pass** — No valid input combination causes panic
+
+Run:
+```bash
+make check
+/hostile-review
+```
+
 ## Before finalizing
 
 Run `/hostile-review` on this file before marking the task done.
