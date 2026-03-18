@@ -19,13 +19,15 @@ Use when code or design changes make existing docs stale. Update only what chang
 |-----|---------------|
 | `docs/HYBRID_ENGINE_ARCHITECTURE.md` | Architecture decisions, NautilusTrader integration, migration phases |
 | `docs/CORE_ENGINE_DESIGN.md` | Type system, crate interfaces, risk layers, pipeline stages |
+| `docs/DEV_WORKFLOW.md` | Development process, issue workflow, verification steps |
+| `docs/TESTING.md` | Testing strategy, test types, fixtures |
 | `PHASE_0_CHECKLIST.md` | Phase 0 tasks completed, exit criteria met |
 | `DEVELOPMENT.md` | Setup steps, build/test commands, debugging procedures |
 | `QUICKSTART.md` | First-run experience changes |
 | `README.md` | Public-facing project overview, API endpoints, quick start |
-| `.agent/ARCHITECTURE.md` | Topology, crate map, type hierarchy for agent quick-reference |
-| `.agent/SAFETY_RULES.md` | New invariants discovered or existing rules refined |
-| `.agent/CODING_GUIDELINES.md` | New Rust patterns, anti-patterns, naming conventions |
+| `.claude/rules/risk-touching.md` | New invariants discovered, safety rules refined for money-touching code |
+| `AGENTS.md` | Architecture patterns, safety rules, coding guidelines |
+| `CLAUDE.md` | AI assistant workflow, development standards |
 
 ## Workflow
 
