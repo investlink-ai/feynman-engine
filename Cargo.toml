@@ -67,6 +67,9 @@ async-trait = "0.1"
 # ── Testing ──
 proptest    = "1"
 
+# ── Constraint: getrandom 0.4.x requires nightly, use 0.3.x ──
+getrandom   = { version = "<0.4", default-features = false }
+
 # ── Workspace crates ──
 types         = { path = "crates/types" }
 risk          = { path = "crates/risk" }
