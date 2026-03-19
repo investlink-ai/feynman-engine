@@ -281,7 +281,11 @@ pub mod fixtures {
         /// Signal with R:R = 1.5 — below 2:1 threshold
         pub fn signal_bad_risk_reward() -> PipelineOrder<Validated> { /* ... */ }
 
-        /// Custom order with explicit qty and stop_loss
+        /// Custom order with explicit qty and stop_loss.
+        /// Note: stop_loss is Option<Decimal> here because PipelineOrder uses OrderCore,
+        /// where stop_loss is optional (SubmitOrder path). For Signal-path tests, stop_loss
+        /// is always required — Signal.stop_loss is Decimal (non-optional). Use
+        /// signal_without_stop_loss() to test the rejection case.
         pub fn buy_at(qty: Decimal, stop_loss: Option<Decimal>) -> PipelineOrder<Validated> {
             /* ... */
         }

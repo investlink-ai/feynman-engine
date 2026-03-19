@@ -83,7 +83,7 @@ pub struct Signal {
     pub conviction: Decimal,          // 0.0–1.0, required
     pub sizing_hint: Option<Decimal>, // notional USD, optional
     pub arb_type: String,             // dispatch key: "funding_rate", "basis", "directional"
-    pub stop_loss: Option<Decimal>,   // required for perps (enforced by risk gate)
+    pub stop_loss: Decimal,            // required (non-optional) — fail-fast on missing stop_loss
     pub take_profit: Option<Decimal>,
     pub thesis: String,               // reasoning for audit trail
     pub urgency: Urgency,
@@ -172,7 +172,9 @@ pub struct PipelineOrder<S: PipelineStage> {
     pub qty: Decimal,                    // base currency units
     pub notional_usd: Decimal,           // qty * price (for risk checks)
     pub price: Option<Decimal>,          // None for market orders
-    pub stop_loss: Option<Decimal>,      // required for SubmitSignal, optional for SubmitOrder
+    pub stop_loss: Option<Decimal>,      // Option because OrderCore serves both paths:
+                                         // Signal.stop_loss is Decimal (always required),
+                                         // but SubmitOrder may omit it (None → worst-case = full notional)
     pub take_profit: Option<Decimal>,
 
     // ── Constraints ──

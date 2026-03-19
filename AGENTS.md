@@ -291,10 +291,10 @@ All timestamps in the Sequencer, EngineCore, RiskGate, and CircuitBreaker come f
 
 ```rust
 // ✓ Correct — timestamp from injected clock
-fn evaluate_order(&mut self, order: &CanonicalOrder, now: DateTime<Utc>) -> Result<ApprovedOrder>;
+fn evaluate_order(&mut self, order: &PipelineOrder<Validated>, now: DateTime<Utc>) -> Result<PipelineOrder<RiskChecked>>;
 
 // ✗ BANNED in core path — breaks backtest/replay determinism
-fn evaluate_order(&mut self, order: &CanonicalOrder) -> Result<ApprovedOrder> {
+fn evaluate_order(&mut self, order: &PipelineOrder<Validated>) -> Result<PipelineOrder<RiskChecked>> {
     let now = Utc::now(); // wrong
 }
 ```
@@ -340,7 +340,7 @@ anyhow::ensure!(
 
 ```rust
 #[must_use]
-pub fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, RiskError> { … }
+pub fn evaluate(&self, order: &PipelineOrder<Validated>) -> Result<RiskApproval, RiskError> { … }
 ```
 
 ### Code Style
@@ -470,7 +470,7 @@ impl TryFrom<SignalProto> for Signal {
 
 ```rust
 pub trait RiskEvaluator: Send + Sync {
-    fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, RiskError>;
+    fn evaluate(&self, order: &PipelineOrder<Validated>) -> Result<RiskApproval, RiskError>;
 }
 ```
 
@@ -478,7 +478,7 @@ pub trait RiskEvaluator: Send + Sync {
 
 ```rust
 // ✓ Hot path — zero-cost, monomorphised
-fn check_position<R: RiskEvaluator>(evaluator: &R, order: &CanonicalOrder) { … }
+fn check_position<R: RiskEvaluator>(evaluator: &R, order: &PipelineOrder<Validated>) { … }
 
 // ✓ Wiring boundary — runtime polymorphism acceptable
 pub struct Sequencer {
@@ -543,10 +543,10 @@ The Sequencer processes orders synchronously. No `.clone()` inside the main eval
 
 ```rust
 // ✓ Borrow, don't clone
-fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, RiskError> { … }
+fn evaluate(&self, order: &PipelineOrder<Validated>) -> Result<RiskApproval, RiskError> { … }
 
 // ✗ Avoid in hot path — allocates
-fn evaluate(&self, order: CanonicalOrder) -> Result<RiskApproval, RiskError> { … }
+fn evaluate(&self, order: PipelineOrder<Validated>) -> Result<RiskApproval, RiskError> { … }
 ```
 
 For data that must be shared across async tasks (fills, snapshots), clone once at the boundary and move ownership.

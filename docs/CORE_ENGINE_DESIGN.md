@@ -256,6 +256,8 @@ The unified model separates **intent** (what you want) from **mechanism** (how t
 
 ### 4.2 Canonical Order
 
+> **Implementation note:** In the codebase, `CanonicalOrder` is implemented as `OrderCore` (the immutable data) wrapped in `PipelineOrder<S>` (the type-state pipeline). The pipeline enforces `Draft → Validated → RiskChecked → Routed` transitions at compile time. Risk evaluation accepts `&PipelineOrder<Validated>`, venue submission accepts `PipelineOrder<Routed>`. Post-submission lifecycle is tracked by `LiveOrder` + `VenueState` FSM. See `crates/types/src/pipeline.rs` for the implementation.
+
 ```rust
 pub struct CanonicalOrder {
     // Identity
@@ -813,11 +815,11 @@ pub trait VenueAdapter: Send + Sync {
 
     // ── Execution (core — all venues must implement) ──
 
-    /// Submit order. Translates CanonicalOrder to venue-native format.
+    /// Submit order. Translates OrderSubmission (from PipelineOrder<Routed>) to venue-native format.
     /// Returns venue-assigned order ID on acknowledgment.
     /// Adapter checks for existing order via clientOrderId before submitting
     /// (idempotent: duplicate submit returns existing VenueOrderId).
-    async fn submit_order(&self, order: &CanonicalOrder) -> Result<VenueOrderId>;
+    async fn submit_order(&self, submission: OrderSubmission) -> Result<VenueOrderAck>;
 
     /// Cancel order by venue ID.
     async fn cancel_order(&self, venue_order_id: &VenueOrderId) -> Result<()>;
@@ -1019,8 +1021,8 @@ pub trait AdapterRegistry: Send + Sync {
 ```rust
 pub trait FeeModel: Send + Sync {
     /// Pre-trade estimate (for sizing and strategy selection).
-    /// Must be fast (<1μs) — called on every order evaluation.
-    fn estimate(&self, order: &CanonicalOrder) -> Result<FeeEstimate>;
+    /// Must be fast (<100μs) — called on every order evaluation.
+    fn estimate(&self, order: &OrderCore) -> Result<FeeEstimate, FeeError>;
 
     /// Post-trade actual fee calculation from fill data.
     fn calculate(&self, fill: &Fill) -> Result<Fee>;
@@ -1080,7 +1082,7 @@ The execution strategy selector uses fee estimates to choose between limit (capt
 
 ```rust
 // Pseudocode — not a trait, but the decision logic
-fn select_strategy(order: &CanonicalOrder, fees: &FeeEstimate) -> ExecStrategyPreference {
+fn select_strategy(order: &OrderCore, fees: &FeeEstimate) -> ExecStrategyPreference {
     let maker_taker_spread = fees.as_taker.net - fees.as_maker.net;
 
     match order.exec_hint.urgency {
@@ -1104,18 +1106,26 @@ fn select_strategy(order: &CanonicalOrder, fees: &FeeEstimate) -> ExecStrategyPr
 Hardcoded in the execution engine binary. Not configurable at runtime. Changed only via code deploy + review. The absolute last line of defense.
 
 ```rust
-pub trait CircuitBreaker: Send + Sync {
+/// Sealed trait — external crates cannot implement this.
+pub trait CircuitBreaker: Send + Sync + sealed::Sealed {
     /// Returns Err if order must be killed unconditionally.
-    fn check(&self, order: &CanonicalOrder) -> Result<(), CircuitBreakerTrip>;
+    /// Accepts `&PipelineOrder<Validated>` — type system guarantees structural validation passed.
+    /// `now` comes from `Clock::now()` — deterministic in backtest/replay.
+    fn check(
+        &self,
+        order: &PipelineOrder<Validated>,
+        firm_book: &FirmBook,
+        now: DateTime<Utc>,
+    ) -> Result<(), CircuitBreakerTrip>;
 
     /// System-wide kill switch. When tripped, ALL execution halts.
     fn is_halted(&self) -> bool;
 
     /// Trip the breaker manually (emergency halt).
-    fn trip(&mut self, reason: String);
+    fn trip(&mut self, reason: String, now: DateTime<Utc>);
 
     /// Reset after investigation (requires explicit action).
-    fn reset(&mut self) -> Result<()>;
+    fn reset(&mut self, now: DateTime<Utc>) -> Result<()>;
 }
 
 pub struct CircuitBreakerTrip {
@@ -1172,11 +1182,12 @@ Algo/ML strategies via `SubmitOrder`/`SubmitBatch` manage their own exits — th
 ```rust
 pub trait RiskGate: Send + Sync {
     /// Evaluate order against all risk limits.
+    /// Accepts `&PipelineOrder<Validated>` — type system guarantees structural validation passed.
     /// `prices` provides mark prices for notional / drawdown calculations.
     /// `now` comes from `Clock::now()` — deterministic in backtest/replay.
     fn evaluate(
         &self,
-        order: &CanonicalOrder,
+        order: &PipelineOrder<Validated>,
         prices: &dyn PriceSource,
         now: DateTime<Utc>,
     ) -> Result<RiskApproval, Vec<RiskViolation>>;
@@ -1199,8 +1210,8 @@ pub trait RiskGate: Send + Sync {
 
 pub struct RiskApproval {
     pub approved_at: DateTime<Utc>,
-    pub warnings: Vec<RiskViolation>,  // non-blocking warnings (approaching limits)
-    pub checks_performed: Vec<RiskCheckResult>,
+    pub warnings: Vec<RiskViolation>,           // non-blocking warnings (approaching limits)
+    pub checks_performed: Vec<RiskCheckResult>,  // each check that was evaluated
 }
 ```
 
@@ -1309,7 +1320,8 @@ pub trait ExecutionGateway: Send + Sync {
     /// Submit order through the full pipeline:
     /// Validate → Circuit breaker → Risk gate → Emulate (if needed) → Strategy selector → Adapter
     /// Idempotent on order.id — duplicate submissions return cached ack.
-    async fn submit(&self, order: CanonicalOrder) -> Result<OrderAck>;
+    /// Accepts `PipelineOrder<Routed>` — type system guarantees validation + risk + routing passed.
+    async fn submit(&self, order: PipelineOrder<Routed>) -> Result<OrderAck>;
 
     /// Cancel an open order.
     async fn cancel(&self, order_id: &OrderId) -> Result<()>;
@@ -1344,10 +1356,10 @@ pub struct OrderAck {
 }
 
 pub struct OrderRecord {
-    pub order: CanonicalOrder,
+    pub core: OrderCore,           // immutable order data (from PipelineOrder)
+    pub client_order_id: ClientOrderId,
     pub state: OrderState,
     pub fills: Vec<Fill>,
-    pub events: Vec<Event>,
     pub created_at: DateTime<Utc>,
     pub last_updated: DateTime<Utc>,
 }
@@ -1361,12 +1373,12 @@ pub trait ExecStrategy: Send + Sync {
     fn name(&self) -> &str;
 
     /// Can this strategy handle the given order on this venue?
-    fn accepts(&self, order: &CanonicalOrder, caps: &VenueCapabilities) -> bool;
+    fn accepts(&self, order: &OrderCore, caps: &VenueCapabilities) -> bool;
 
     /// Execute the order. Returns final report with all fills.
     async fn execute(
         &self,
-        order: &CanonicalOrder,
+        order: &OrderCore,
         adapter: &dyn VenueAdapter,
         fee_model: &dyn FeeModel,
         clock: &dyn Clock,
@@ -1390,7 +1402,7 @@ Fast, stateless validation before the order enters the pipeline. Catches malform
 /// Stateless order validator. Runs before risk gate.
 /// Rejects orders that are structurally invalid regardless of current state.
 pub trait OrderValidator: Send + Sync {
-    fn validate(&self, order: &CanonicalOrder, caps: &VenueCapabilities) -> Result<(), Vec<ValidationError>>;
+    fn validate(&self, order: &OrderSubmission, caps: &VenueCapabilities) -> Result<(), Vec<ValidationError>>;
 }
 
 pub enum ValidationError {
@@ -1431,15 +1443,15 @@ pub trait OrderEmulator: Send + Sync {
     /// Does NOT perform emulation — just reports the situation.
     fn check_emulation(
         &self,
-        order: &CanonicalOrder,
+        order: &OrderCore,
         caps: &VenueCapabilities,
     ) -> EmulationCheck;
 
     /// Start emulating. Only called if check_emulation returned NeedsEmulation
-    /// AND the order's allow_emulation flag is true.
+    /// AND order.exec_hint.allow_emulation is true.
     fn emulate(
         &self,
-        order: &CanonicalOrder,
+        order: &OrderCore,
         adapter: &dyn VenueAdapter,
         clock: &dyn Clock,
     ) -> Result<EmulationHandle>;
@@ -1516,7 +1528,7 @@ The Router (in the `gateway` crate) selects the venue. The routing policy is con
 
 ### 8.5.2 Portfolio / Signal-to-Order Generator
 
-Converts agent signals into concrete `CanonicalOrder`s. This is the bridge between the agent world (signals with conviction) and the execution world (orders with price/qty).
+Converts agent signals into concrete `PipelineOrder<Draft>`s (wrapped `OrderCore`). This is the bridge between the agent world (signals with conviction) and the execution world (orders with price/qty).
 
 ```rust
 /// Translates signals into orders using current portfolio state.
@@ -1525,7 +1537,7 @@ pub trait Portfolio: Send + Sync {
     /// Convert a signal into zero or more orders.
     /// May produce zero orders if the signal duplicates an existing position,
     /// or multiple orders if splitting across venues.
-    fn on_signal(&mut self, signal: &Signal) -> Result<Vec<CanonicalOrder>>;
+    fn on_signal(&mut self, signal: &Signal) -> Result<Vec<PipelineOrder<Draft>>>;
 
     /// Current firm book (read-only view).
     fn state(&self) -> &FirmBook;
@@ -1536,9 +1548,13 @@ pub struct Signal {
     pub agent: AgentId,
     pub instrument: InstrumentId,
     pub direction: Side,
-    pub conviction: Decimal,         // 0.0 – 1.0
+    pub conviction: Decimal,          // 0.0 – 1.0
     pub sizing_hint: Option<Decimal>, // optional notional target
-    pub arb_type: String,            // e.g., "funding_rate", "basis", "directional"
+    pub arb_type: String,             // e.g., "funding_rate", "basis", "directional"
+    pub stop_loss: Decimal,           // required — engine rejects signals without a stop loss
+    pub take_profit: Option<Decimal>, // optional
+    pub thesis: String,
+    pub urgency: Urgency,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }
@@ -1558,7 +1574,7 @@ pub trait PipelineStage: Send + Sync {
     /// Process order through this stage.
     /// Ok(order) = pass to next stage (may be modified).
     /// Err = reject with reason.
-    async fn process(&self, order: CanonicalOrder) -> Result<CanonicalOrder>;
+    async fn process(&self, order: OrderSubmission) -> Result<OrderSubmission>;
 }
 
 /// The full pipeline is a `Vec<Box<dyn PipelineStage>>`.
@@ -2030,7 +2046,7 @@ pub trait FillSimulator: Send + Sync {
     /// Simulate fill against orderbook state.
     fn simulate(
         &self,
-        order: &CanonicalOrder,
+        order: &OrderCore,
         book: &OrderbookSnapshot,
         fee_model: &dyn FeeModel,
     ) -> Result<SimulatedFill>;
@@ -2140,7 +2156,7 @@ pub struct ConsumerGroupInfo {
 | Topic | Publisher | Consumer(s) | Payload |
 |-------|-----------|-------------|---------|
 | `signals` | Agents (Satoshi, Graham, ...) | Risk Gate | Signal (conviction, direction, sizing) |
-| `approved_orders` | Risk Gate | Execution Gateway | CanonicalOrder (risk-approved) |
+| `approved_orders` | Risk Gate | Execution Gateway | `PipelineOrder<RiskChecked>` (risk-approved) |
 | `fills` | Execution Gateway | State Store, Agents, Dashboard | Fill |
 | `positions` | Reconciler | State Store, Risk Gate, Dashboard | Position update |
 | `risk_events` | Risk Gate, Circuit Breaker | Dashboard, Agents | Risk violations, halts |
@@ -2998,19 +3014,20 @@ pub struct EngineCore {
 impl EngineCore {
     /// Evaluate a signal: sizing → order construction.
     /// Returns zero or more orders ready for risk evaluation.
-    pub fn signal_to_orders(&mut self, signal: &Signal) -> Result<Vec<CanonicalOrder>> {
+    pub fn signal_to_orders(&mut self, signal: &Signal) -> Result<Vec<PipelineOrder<Draft>>> {
         // 1. Check agent has budget
         // 2. Size the position (conviction → notional → qty)
-        // 3. Construct CanonicalOrder(s)
+        // 3. Construct PipelineOrder<Draft>(s) from OrderCore
         // Pure logic, no I/O
     }
 
-    /// Evaluate an order against all risk limits.
-    /// Returns approval or rejection with specific violations.
-    pub fn evaluate_risk(
-        &self,
-        order: &CanonicalOrder,
-    ) -> Result<RiskApproval, Vec<RiskViolation>> {
+    /// Evaluate a validated order against all risk limits.
+    /// Returns PipelineOrder<RiskChecked> on approval.
+    pub fn evaluate_order(
+        &mut self,
+        order: PipelineOrder<Validated>,
+        now: DateTime<Utc>,
+    ) -> Result<PipelineOrder<RiskChecked>, EngineError> {
         // L0 circuit breakers + L1 agent risk gate
         // Reads self.state (firm book, limits) — consistent because single owner
         // Pure logic, no I/O
@@ -3050,7 +3067,7 @@ pub struct EngineState {
 pub enum SequencerCommand {
     /// New order request (from gRPC or bus). Includes a oneshot for the response.
     SubmitOrder {
-        order: CanonicalOrder,
+        order: PipelineOrder<Validated>,   // already validated by gRPC handler
         respond: oneshot::Sender<Result<OrderAck>>,
     },
     /// New signal (from LLM agent). Needs sizing before risk check.
@@ -3414,7 +3431,7 @@ restart is a feature, not a bug — it forces review and reconciliation.
 feynman-engine/
 ├── Cargo.toml                        # Workspace root
 ├── crates/
-│   ├── types/                        # Core types: OrderId, CanonicalOrder, Fill, etc.
+│   ├── types/                        # Core types: OrderId, OrderCore, PipelineOrder<S>, Fill, etc.
 │   │   └── src/lib.rs                # Zero external deps. Used by everything.
 │   │
 │   ├── fees/                         # FeeModel trait + implementations

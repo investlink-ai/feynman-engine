@@ -1,8 +1,9 @@
 # Feynman Engine — Roadmap & Sprint Plan
 
 **Created:** 2026-03-18
+**Last Updated:** 2026-03-19
 **Status:** Active — used to generate GitHub issues
-**Current Phase:** Phase 0 (Scaffold) ~60% complete
+**Current Phase:** Phase 0 (Scaffold) ~75% complete — P0-1 ✅ P0-2 ✅ P0-3 next
 
 ---
 
@@ -31,14 +32,14 @@
 ```mermaid
 graph TD
     %% ── Phase 0: Foundation ──
-    P0_TYPES["P0-1: types crate ✅"]
-    P0_ORDER_TYPES["P0-2: Order FSM types<br/>(PipelineOrder, LiveOrder, VenueState)"]
-    P0_RISK_IMPL["P0-3: AgentRiskManager impl<br/>(7 checks + property tests)"]
-    P0_BUS_IMPL["P0-4: RedisBus impl<br/>(XADD/XREAD/XCLAIM)"]
-    P0_RISK_TESTS["P0-5: Risk integration tests (7)"]
-    P0_BUS_TESTS["P0-6: Bus integration tests (3)"]
-    P0_DOCKER["P0-7: Docker smoke test"]
-    P0_CI["P0-8: CI green gate"]
+    P0_TYPES[P0-1: types crate ✅]
+    P0_ORDER_TYPES[P0-2: Order FSM types ✅]
+    P0_RISK_IMPL[P0-3: AgentRiskManager]
+    P0_BUS_IMPL[P0-4: RedisBus]
+    P0_RISK_TESTS[P0-5: Risk tests]
+    P0_BUS_TESTS[P0-6: Bus tests]
+    P0_DOCKER[P0-7: Docker smoke]
+    P0_CI[P0-8: CI gate]
 
     P0_TYPES --> P0_ORDER_TYPES
     P0_TYPES --> P0_RISK_IMPL
@@ -52,11 +53,11 @@ graph TD
     P0_DOCKER --> P0_CI
 
     %% ── Phase 1A: Core Pipeline ──
-    P1_CB["P1-1: Circuit breakers (L0)<br/>11 compiled-in checks"]
-    P1_SEQUENCER["P1-2: Sequencer task<br/>(single-owner state loop)"]
-    P1_JOURNAL["P1-3: Event journal (SQLite WAL)<br/>append, replay, snapshot"]
-    P1_BRIDGE["P1-4: Signal → Order bridge<br/>(conviction → sizing)"]
-    P1_PIPELINE["P1-5: Pipeline wiring<br/>(Validate → Risk → Route → Submit)"]
+    P1_CB[P1-1: Circuit breakers L0]
+    P1_SEQUENCER[P1-2: Sequencer]
+    P1_JOURNAL[P1-3: Event journal]
+    P1_BRIDGE[P1-4: Signal → Order]
+    P1_PIPELINE[P1-5: Pipeline wiring]
 
     P0_CI --> P1_CB
     P0_CI --> P1_SEQUENCER
@@ -69,9 +70,9 @@ graph TD
     P1_BRIDGE --> P1_PIPELINE
 
     %% ── Phase 1B: Venue Adapters ──
-    P1_PAPER["P1-6: PaperAdapter<br/>(simulated fills against live book)"]
-    P1_BYBIT["P1-7: BybitAdapter<br/>(REST + WebSocket)"]
-    P1_VENUE_TESTS["P1-8: Venue adapter tests<br/>(paper + bybit testnet)"]
+    P1_PAPER[P1-6: PaperAdapter]
+    P1_BYBIT[P1-7: BybitAdapter]
+    P1_VENUE_TESTS[P1-8: Adapter tests]
 
     P0_ORDER_TYPES --> P1_PAPER
     P0_ORDER_TYPES --> P1_BYBIT
@@ -81,18 +82,18 @@ graph TD
     P1_BYBIT --> P1_VENUE_TESTS
 
     %% ── Phase 1C: Integration ──
-    P1_E2E["P1-9: End-to-end pipeline test<br/>(signal → risk → paper fill)"]
+    P1_E2E[P1-9: E2E pipeline test]
 
     P1_PIPELINE --> P1_E2E
     P1_PAPER --> P1_E2E
     P1_VENUE_TESTS --> P1_E2E
 
     %% ── Phase 2: API Surface ──
-    P2_GRPC["P2-1: gRPC server (tonic)<br/>22 RPCs from service.proto"]
-    P2_AUTH["P2-2: Auth interceptor<br/>(agent identity + permissions)"]
-    P2_BRIDGE_MCP["P2-3: MCP-gRPC bridge<br/>(Node.js, OpenClaw → engine)"]
-    P2_DASH["P2-4: Dashboard server<br/>(REST + WebSocket + Prometheus)"]
-    P2_API_TESTS["P2-5: API integration tests"]
+    P2_GRPC[P2-1: gRPC server]
+    P2_AUTH[P2-2: Auth interceptor]
+    P2_BRIDGE_MCP[P2-3: MCP-gRPC bridge]
+    P2_DASH[P2-4: Dashboard]
+    P2_API_TESTS[P2-5: API tests]
 
     P1_E2E --> P2_GRPC
     P1_SEQUENCER --> P2_GRPC
@@ -104,22 +105,22 @@ graph TD
     P2_DASH --> P2_API_TESTS
 
     %% ── Phase 3: Shadow Mode ──
-    P3_SPLITTER["P3-1: Signal splitter<br/>(fork to bot + engine)"]
-    P3_PARITY["P3-2: Parity checker<br/>(compare risk decisions)"]
-    P3_MONITOR["P3-3: Shadow monitoring<br/>(7-day parity dashboard)"]
+    P3_SPLITTER[P3-1: Signal splitter]
+    P3_PARITY[P3-2: Parity checker]
+    P3_MONITOR[P3-3: Shadow monitor]
 
     P2_API_TESTS --> P3_SPLITTER
     P3_SPLITTER --> P3_PARITY
     P3_PARITY --> P3_MONITOR
 
     %% ── Phase 4: Cutover ──
-    P4_CUT["P4-1: Bybit live cutover<br/>(checklist-driven)"]
+    P4_CUT[P4-1: Bybit cutover]
 
     P3_MONITOR --> P4_CUT
 
     %% ── Styling ──
     style P0_TYPES fill:#2d8a4e
-    style P0_ORDER_TYPES fill:#c9971a
+    style P0_ORDER_TYPES fill:#2d8a4e
     style P0_RISK_IMPL fill:#c9971a
     style P0_BUS_IMPL fill:#c9971a
     style P0_RISK_TESTS fill:#c9971a
@@ -138,23 +139,27 @@ graph TD
 **Duration:** ~2 weeks
 **Predecessor:** types crate (done)
 
-| Issue | Title | Crate | Blocked By | Est | Labels |
+| Issue | Title | Crate | Blocked By | Est | Status |
 |-------|-------|-------|-----------|-----|--------|
-| P0-2 | Order FSM types: `PipelineOrder<S>`, `LiveOrder`, `VenueState`, `FillSummary`, `RejectedOrder` | `types` | P0-1 (done) | 3d | `types`, `priority-p0` |
-| P0-3 | `AgentRiskManager` implementation (7 checks + path-aware evaluation) | `risk` | P0-2 | 3d | `risk`, `priority-p0` |
-| P0-4 | `RedisBus` implementation (XADD, XREAD, XPENDING, XCLAIM, consumer groups) | `bus` | P0-1 (done) | 3d | `bus`, `priority-p0` |
-| P0-5 | Risk integration tests (7 path-aware scenarios + proptest) | `risk` | P0-3 | 2d | `risk`, `testing` |
-| P0-6 | Bus integration tests (pub/sub round-trip, redelivery, claim) | `bus` | P0-4 | 2d | `bus`, `testing` |
-| P0-7 | Docker smoke test (`docker compose up` → health check) | `infra` | P0-4 | 1d | `infra` |
-| P0-8 | CI green gate (all tests + clippy + fmt pass on push) | `infra` | P0-5, P0-6, P0-7 | 1d | `infra` |
+| P0-2 | Order FSM types: `PipelineOrder<S>`, `LiveOrder`, `VenueState`, `OrderType`, `TimeInForce`, `ExecHint`, unified `FirmBook`/`AgentAllocation`/`RiskLimits`, `Router` trait | `types`, `gateway` | P0-1 ✅ | 3d | **✅ Done** |
+| P0-3 | `AgentRiskManager` implementation (7 checks + path-aware evaluation) | `risk` | P0-2 ✅ | 3d | 🔓 Unblocked |
+| P0-4 | `RedisBus` implementation (XADD, XREAD, XPENDING, XCLAIM, consumer groups) | `bus` | P0-1 ✅ | 3d | 🔓 Unblocked |
+| P0-5 | Risk integration tests (7 path-aware scenarios + proptest) | `risk` | P0-3 | 2d | ⏳ Waiting |
+| P0-6 | Bus integration tests (pub/sub round-trip, redelivery, claim) | `bus` | P0-4 | 2d | ⏳ Waiting |
+| P0-7 | Docker smoke test (`docker compose up` → health check) | `infra` | P0-4 | 1d | ⏳ Waiting |
+| P0-8 | CI green gate (all tests + clippy + fmt pass on push) | `infra` | P0-5, P0-6, P0-7 | 1d | ⏳ Waiting |
 
-**Parallelism:** P0-2 and P0-4 can run in parallel. P0-3 depends on P0-2. P0-5/P0-6/P0-7 are independent once their predecessor ships.
+**P0-2 implementation notes (diverges from original spec in two places):**
+- `FillSummary` not created as a separate struct — fields (`filled_qty`, `remaining_qty`, `avg_fill_price`) are inlined directly into `LiveOrder` (simpler, avoids indirection)
+- `RejectedOrder` not created — rejections propagate as typed errors through the pipeline (`RiskError`, `GatewayError`). No separate wrapper needed.
+- Delivered beyond spec: `OrderType`, `TimeInForce`, `ExecHint` enums; enriched `OrderCore` with 6 new fields; canonical `FirmBook`/`AgentAllocation`/`AgentStatus`/`RiskLimits`/`FirmRiskLimits`/`RiskCheckResult` (removed 3 duplicate definitions across crates); `Router` trait in gateway; `Signal.stop_loss` made non-optional (`Decimal`); `RiskApprovalStamp` strengthened to carry typed `Vec<RiskCheckResult>` and `Vec<RiskViolation>` instead of `Vec<String>`.
+
+**Parallelism:** P0-3 and P0-4 can now run in parallel (both unblocked).
 
 ```
-Week 1:  [P0-2: Order FSM types]──────────►[P0-3: Risk impl]──────►
-         [P0-4: RedisBus impl]─────────────►[P0-6: Bus tests]──────►
-Week 2:                                     [P0-5: Risk tests]─────►[P0-8: CI gate]
-                                            [P0-7: Docker smoke]────►
+Now:     [P0-3: Risk impl]──────────────►[P0-5: Risk tests]─────►[P0-8: CI gate]
+         [P0-4: RedisBus impl]───────────►[P0-6: Bus tests]──────►
+                                          [P0-7: Docker smoke]────►
 ```
 
 **Exit criteria:** `make check` passes. All 7 risk tests + 3 bus tests green. Docker health check passes.
@@ -338,8 +343,8 @@ Planned venues (in order):
 ## Issue Dependency Graph (Compact)
 
 ```
-P0-2 ──┬──► P0-3 ──► P0-5 ──┐
-       │                      ├──► P0-8 ──┬──► P1-1 ──┐
+P0-2 ✅─┬──► P0-3 ──► P0-5 ──┐
+        │                      ├──► P0-8 ──┬──► P1-1 ──┐
 P0-4 ──┴──► P0-6 ──┐         │           ├──► P1-2 ──┤
               P0-7 ──┘────────┘           ├──► P1-3 ──┤
                                           └──► P1-4 ──┘
@@ -362,14 +367,14 @@ P0-4 ──┴──► P0-6 ──┐         │           ├──► P1-2 �
 The longest dependency chain determines the minimum calendar time:
 
 ```
-P0-2 → P0-3 → P0-5 → P0-8 → P1-2 → P1-5 → P1-9 → P2-1 → P2-5 → P3-1 → P3-3 → P4-1
- 3d     3d      2d     1d     5d      5d      3d      5d     3d      3d      5d      1d
-                                                                            = ~39 working days
-                                                                            + 21 days shadow parity
+[P0-2 ✅] → P0-3 → P0-5 → P0-8 → P1-2 → P1-5 → P1-9 → P2-1 → P2-5 → P3-1 → P3-3 → P4-1
+  done        3d      2d     1d     5d      5d      3d      5d     3d      3d      5d      1d
+                                                                           = ~36 working days remaining
+                                                                           + 21 days shadow parity
 ```
 
-**~12 weeks to cutover** (assuming single contributor, no parallelism).
-**~8 weeks to cutover** (with 2 contributors parallelizing independent tracks).
+**~11 weeks to cutover** (assuming single contributor, no parallelism).
+**~7 weeks to cutover** (with 2 contributors parallelizing independent tracks).
 
 ---
 

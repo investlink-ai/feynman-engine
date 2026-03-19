@@ -163,7 +163,7 @@ pub trait RiskGate: Send + Sync {
     /// `now`: from Sequencer's Clock::now() — deterministic in backtest.
     fn evaluate(
         &self,
-        order: &CanonicalOrder,
+        order: &PipelineOrder<Validated>,
         prices: &dyn PriceSource,
         now: DateTime<Utc>,
     ) -> std::result::Result<RiskApproval, Vec<RiskViolation>>;

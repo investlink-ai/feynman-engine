@@ -23,7 +23,7 @@ pub enum RiskError {
 
 // Mark critical return values with #[must_use]
 #[must_use]
-pub fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, RiskError> { … }
+pub fn evaluate(&self, order: &PipelineOrder<Validated>) -> Result<RiskApproval, RiskError> { … }
 ```
 
 **Binary / application code** (`bins/feynman-engine`, integration tests) — `anyhow`:
@@ -39,11 +39,15 @@ Never use `Box<dyn Error>`. Never `unwrap()` in non-test code without a doc comm
 Always use `rust_decimal::Decimal`. Zero `f64` in financial logic.
 
 ```rust
-pub struct Order {
+/// Immutable core data shared across all pipeline stages.
+pub struct OrderCore {
     pub qty: Decimal,
     pub price: Decimal,
-    pub stop_loss: Option<Decimal>,
+    pub stop_loss: Option<Decimal>,  // optional for orders
 }
+
+/// Signal.stop_loss is non-optional (Decimal, not Option<Decimal>).
+/// stop_loss is required for SubmitSignal but optional for SubmitOrder/SubmitBatch.
 ```
 
 ### Async/Await
@@ -164,7 +168,7 @@ mod private { pub trait Sealed {} }
 
 /// External crates cannot implement this trait.
 pub trait CircuitBreaker: private::Sealed + Send + Sync {
-    fn check(&self, order: &CanonicalOrder) -> Result<(), CircuitBreakerTrip>;
+    fn check(&self, order: &PipelineOrder<Validated>) -> Result<(), CircuitBreakerTrip>;
 }
 
 // Only the authoritative implementation gets Sealed
@@ -257,7 +261,7 @@ Fine-grained, single-responsibility traits:
 
 ```rust
 // Hot path — static dispatch, zero-cost
-fn check_position<R: RiskEvaluator>(evaluator: &R, order: &CanonicalOrder) { … }
+fn check_position<R: RiskEvaluator>(evaluator: &R, order: &PipelineOrder<Validated>) { … }
 
 // Wiring boundary — dynamic dispatch acceptable
 pub struct Sequencer {
@@ -307,7 +311,7 @@ Add doc comments to every public item:
 /// # Panics
 /// Never panics — returns `Result` instead.
 #[must_use]
-pub fn evaluate(&self, order: &CanonicalOrder) -> Result<RiskApproval, RiskError> { … }
+pub fn evaluate(&self, order: &PipelineOrder<Validated>) -> Result<RiskApproval, RiskError> { … }
 ```
 
 ---
