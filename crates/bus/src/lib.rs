@@ -10,6 +10,9 @@ use std::time::Duration;
 
 pub use types::MessageId;
 
+mod redis;
+pub use redis::RedisBus;
+
 /// Typed errors for bus operations (thiserror for libs).
 #[derive(Debug, thiserror::Error)]
 pub enum BusError {
@@ -25,8 +28,56 @@ pub enum BusError {
     #[error("consumer group {group} not found on topic {topic}")]
     GroupNotFound { topic: String, group: String },
 
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
+    #[error("subscribe failed on topic {topic} group {group} consumer {consumer}: {reason}")]
+    SubscribeFailed {
+        topic: String,
+        group: String,
+        consumer: String,
+        reason: String,
+    },
+
+    #[error("ack failed on topic {topic} group {group} message {message_id}: {reason}")]
+    AckFailed {
+        topic: String,
+        group: String,
+        message_id: MessageId,
+        reason: String,
+    },
+
+    #[error("pending lookup failed on topic {topic} group {group}: {reason}")]
+    PendingFailed {
+        topic: String,
+        group: String,
+        reason: String,
+    },
+
+    #[error("claim failed on topic {topic} group {group} consumer {consumer}: {reason}")]
+    ClaimFailed {
+        topic: String,
+        group: String,
+        consumer: String,
+        reason: String,
+    },
+
+    #[error("topic info lookup failed on topic {topic}: {reason}")]
+    TopicInfoFailed { topic: String, reason: String },
+
+    #[error("health check failed: {0}")]
+    HealthCheckFailed(String),
+
+    #[error("invalid stream message {message_id} on topic {topic}: {reason}")]
+    InvalidMessage {
+        topic: String,
+        message_id: MessageId,
+        reason: String,
+    },
+
+    #[error("missing field {field} in stream message {message_id} on topic {topic}")]
+    MissingField {
+        topic: String,
+        message_id: MessageId,
+        field: &'static str,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, BusError>;
@@ -74,6 +125,7 @@ pub trait MessageBus: Send + Sync {
         topic: &str,
         group: &str,
         consumer: &str,
+        min_idle: Duration,
         msg_ids: &[MessageId],
     ) -> Result<Vec<BusMessage>>;
 
