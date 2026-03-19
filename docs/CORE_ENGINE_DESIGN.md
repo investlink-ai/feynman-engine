@@ -2104,7 +2104,7 @@ pub trait MessageBus: Send + Sync {
         topic: &str,
         group: &str,
         consumer: &str,
-    ) -> Result<mpsc::UnboundedReceiver<BusMessage>>;
+    ) -> Result<mpsc::Receiver<BusMessage>>;
 
     /// Acknowledge message processing.
     async fn ack(&self, topic: &str, group: &str, msg_id: &MessageId) -> Result<()>;
@@ -2123,11 +2123,15 @@ pub trait MessageBus: Send + Sync {
         topic: &str,
         group: &str,
         consumer: &str,
+        min_idle: Duration,
         msg_ids: &[MessageId],
     ) -> Result<Vec<BusMessage>>;
 
     /// Topic metadata.
     async fn topic_info(&self, topic: &str) -> Result<TopicInfo>;
+
+    /// Check whether the Redis connection is healthy.
+    async fn health_check(&self) -> Result<()>;
 }
 
 pub struct BusMessage {

@@ -284,7 +284,7 @@ Cross-process event bus for agent coordination.
 #[async_trait]
 pub trait MessageBus: Send + Sync {
     /// Publish a message to a topic.
-    async fn publish(&self, topic: &str, payload: &BusMessage) -> Result<MessageId>;
+    async fn publish(&self, topic: &str, payload: &[u8]) -> Result<MessageId>;
 
     /// Subscribe to a topic as part of a consumer group.
     /// Messages are distributed across consumers in the same group.
@@ -294,7 +294,7 @@ pub trait MessageBus: Send + Sync {
         topic: &str,
         group: &str,
         consumer: &str,
-    ) -> Result<mpsc::Receiver<BusEnvelope>>;
+    ) -> Result<mpsc::Receiver<BusMessage>>;
 
     /// Acknowledge that a message has been processed.
     /// Prevents redelivery to the same consumer group.
@@ -306,8 +306,8 @@ pub trait MessageBus: Send + Sync {
         &self,
         topic: &str,
         group: &str,
-        min_idle_ms: u64,
-    ) -> Result<Vec<PendingMessage>>;
+        min_idle: Duration,
+    ) -> Result<Vec<BusMessage>>;
 
     /// Claim a stuck message from another consumer in the same group.
     /// Used for crash recovery.
@@ -316,37 +316,41 @@ pub trait MessageBus: Send + Sync {
         topic: &str,
         group: &str,
         consumer: &str,
+        min_idle: Duration,
         message_ids: &[MessageId],
-    ) -> Result<Vec<BusEnvelope>>;
+    ) -> Result<Vec<BusMessage>>;
+
+    /// Topic metadata and consumer-group state.
+    async fn topic_info(&self, topic: &str) -> Result<TopicInfo>;
+
+    /// Check whether the underlying Redis connection is healthy.
+    async fn health_check(&self) -> Result<()>;
 }
 ```
 
-### Bus Message Envelope
+### Bus Message
 
 ```rust
-/// Every message on the bus is wrapped in this envelope.
-/// The envelope provides routing, versioning, and traceability.
-pub struct BusEnvelope {
+/// The Redis stream entry returned to subscribers and recovery paths.
+pub struct BusMessage {
     pub id: MessageId,
     pub topic: String,
-    pub publisher: AgentId,
-    pub schema_version: String,     // e.g., "1.0"
-    pub correlation_id: Option<String>,
-    pub payload: BusMessage,
+    pub payload: Vec<u8>,
     pub published_at: DateTime<Utc>,
-    pub ttl_days: Option<u32>,
 }
 
-/// Typed message payloads. Each variant maps to a bus topic.
-pub enum BusMessage {
-    SignalSubmitted(Signal),
-    OrderApproved(OrderApproval),
-    OrderRejected(OrderRejection),
-    OrderFilled(FillEvent),
-    PortfolioSnapshot(FirmBook),
-    RiskAlert(RiskViolation),
-    Directive(AgentDirective),
-    Heartbeat(AgentHeartbeat),
+pub struct TopicInfo {
+    pub length: u64,
+    pub consumer_groups: Vec<ConsumerGroupInfo>,
+    pub oldest_message: Option<DateTime<Utc>>,
+    pub newest_message: Option<DateTime<Utc>>,
+}
+
+pub struct ConsumerGroupInfo {
+    pub name: String,
+    pub consumers: u32,
+    pub pending: u64,
+    pub last_delivered: Option<MessageId>,
 }
 ```
 

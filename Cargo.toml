@@ -44,7 +44,7 @@ tower       = "0.4"
 tower-http  = { version = "0.5", features = ["cors", "trace"] }
 
 # ── Redis (agent bus) ──
-fred        = { version = "9", features = ["tokio-runtime"] }
+fred        = "9"
 
 # ── Tracing / observability ──
 tracing                    = "0.1"
