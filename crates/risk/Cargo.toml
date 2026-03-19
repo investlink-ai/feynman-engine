@@ -18,4 +18,9 @@ async-trait.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 proptest.workspace = true
+
+[[test]]
+name = "risk"
+path = "../../tests/integration/risk.rs"

@@ -184,7 +184,7 @@ proptest! {
 
 Cross-crate behavior tests. Require external infrastructure (Redis, Docker).
 
-**Location:** `tests/integration/{name}.rs`
+**Location:** `tests/integration/{name}.rs` registered from the owning crate's `Cargo.toml`
 **Runs in CI:** When infrastructure is available (or gated behind `#[ignore]`)
 **When to write:** Bus round-trips, pipeline end-to-end, Docker smoke
 
@@ -199,6 +199,12 @@ async fn test_signal_without_stop_loss_rejected() {
     let result = rm.evaluate(&order, &book, EvaluationPath::SubmitSignal);
     assert!(matches!(result, RiskOutcome::Rejected { .. }));
 }
+```
+
+Run a workspace integration suite through its owning crate:
+
+```bash
+cargo test -p {crate} --test {name}
 ```
 
 Each integration test uses its own isolated state — no shared mutable fixtures between tests.
@@ -357,7 +363,7 @@ Tests are one part of verification. The full layered approach:
 | **Clippy** | Before commit | `cargo clippy -p {crate} -- -D warnings` | Missing `#[must_use]`, non-exhaustive match, pedantic issues |
 | **Full workspace** | Before commit | `make check` | Cross-crate breakage, formatting |
 | **Property tests** | Risk/math changes | `cargo test -- --ignored` | Edge cases, panic paths |
-| **Integration tests** | Bus/infra changes | `cargo test --test {suite} -- --ignored` | Cross-process behavior |
+| **Integration tests** | Bus/infra changes | `cargo test -p {crate} --test {suite} -- --ignored` | Cross-process behavior |
 | **Hostile review** | Money-touching PRs | `/hostile-review` | Safety invariant violations |
 
 Lower layers run in seconds. Only escalate to higher layers when the lower ones pass.
