@@ -959,9 +959,7 @@ mod tests {
         // Submitted → Accepted → PartiallyFilled → Filled
         let s = VenueState::Submitted;
         let s = s
-            .try_transition(VenueState::Accepted {
-                accepted_at: now,
-            })
+            .try_transition(VenueState::Accepted { accepted_at: now })
             .unwrap();
         let partial_fill = FillSummary {
             filled_qty: Decimal::new(5, 1),
@@ -1049,15 +1047,11 @@ mod tests {
         // Submitted → Triggered (venue accepts conditional order, waiting for trigger)
         let s = VenueState::Submitted;
         let s = s
-            .try_transition(VenueState::Triggered {
-                triggered_at: now,
-            })
+            .try_transition(VenueState::Triggered { triggered_at: now })
             .unwrap();
         // Triggered → Accepted (trigger condition met, order becomes live)
         let s = s
-            .try_transition(VenueState::Accepted {
-                accepted_at: now,
-            })
+            .try_transition(VenueState::Accepted { accepted_at: now })
             .unwrap();
         // Now the order is live and can receive fills
         assert!(!s.is_terminal());
@@ -1170,7 +1164,10 @@ mod tests {
             is_maker: true,
         };
         live.on_fill(fill, now).unwrap();
-        assert!(matches!(live.venue_state, VenueState::PartiallyFilled { .. }));
+        assert!(matches!(
+            live.venue_state,
+            VenueState::PartiallyFilled { .. }
+        ));
         assert_eq!(live.filled_qty, Decimal::new(5, 1));
 
         // Final fill
