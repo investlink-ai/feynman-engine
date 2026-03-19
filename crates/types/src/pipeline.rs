@@ -413,7 +413,8 @@ pub struct Fill {
 /// Created by consuming a `PipelineOrder<Routed>` — the type system guarantees
 /// the order passed validation, risk checks, and routing before reaching this point.
 ///
-/// State transitions are validated at runtime via `VenueState::try_transition()`.
+/// State transitions are validated at runtime via dedicated `on_*` methods.
+/// Risk approval proof is immutable—it proves the order passed all gate checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveOrder {
     pub core: OrderCore,
@@ -424,16 +425,19 @@ pub struct LiveOrder {
     pub remaining_qty: Decimal,
     pub avg_fill_price: Option<Decimal>,
     pub fills: Vec<Fill>,
+    pub risk_approval: RiskApprovalStamp,
     pub submitted_at: DateTime<Utc>,
     pub last_updated: DateTime<Utc>,
 }
 
 impl LiveOrder {
     /// Create a `LiveOrder` from a routed pipeline order at submission time.
+    /// Captures the risk approval proof for audit trail and reconciliation.
     #[must_use]
     pub fn from_routed(order: PipelineOrder<Routed>, now: DateTime<Utc>) -> Self {
         let qty = order.core.qty;
         let client_order_id = order.client_order_id().clone();
+        let risk_approval = order.risk_approval().clone();
         Self {
             core: order.core,
             client_order_id,
@@ -443,6 +447,7 @@ impl LiveOrder {
             remaining_qty: qty,
             avg_fill_price: None,
             fills: Vec::new(),
+            risk_approval,
             submitted_at: now,
             last_updated: now,
         }
@@ -464,7 +469,8 @@ impl LiveOrder {
         }
     }
 
-    /// Venue acknowledged the order.
+    /// Venue acknowledged the order (limit order resting on book).
+    /// For conditional orders, this follows the Triggered state.
     pub fn on_accepted(
         &mut self,
         venue_order_id: VenueOrderId,
@@ -478,33 +484,64 @@ impl LiveOrder {
         Ok(())
     }
 
+    /// Conditional order (stop/TP/trailing) accepted by venue, waiting for trigger.
+    /// Transition: Submitted → Triggered. The order will move to Accepted once the
+    /// trigger condition is met (e.g., price crosses threshold).
+    pub fn on_triggered(&mut self, now: DateTime<Utc>) -> std::result::Result<(), VenueStateError> {
+        self.venue_state = self
+            .venue_state
+            .try_transition(VenueState::Triggered { triggered_at: now })?;
+        self.last_updated = now;
+        Ok(())
+    }
+
     /// Process a fill from the venue.
+    /// Validates the fill before mutating state; rejects non-positive or overfilling quantities.
     pub fn on_fill(
         &mut self,
         fill: Fill,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), VenueStateError> {
-        // Update average fill price
-        let total_filled_notional =
-            self.avg_fill_price.unwrap_or(Decimal::ZERO) * self.filled_qty + fill.price * fill.qty;
-        self.filled_qty += fill.qty;
-        self.remaining_qty -= fill.qty;
-
-        if self.filled_qty > Decimal::ZERO {
-            self.avg_fill_price = Some(total_filled_notional / self.filled_qty);
+        // Validate fill before any state mutation
+        if fill.qty <= Decimal::ZERO {
+            return Err(VenueStateError::InvalidFill {
+                reason: "fill quantity must be positive".into(),
+            });
+        }
+        if fill.qty > self.remaining_qty {
+            return Err(VenueStateError::InvalidFill {
+                reason: format!(
+                    "fill quantity {} exceeds remaining {}",
+                    fill.qty, self.remaining_qty
+                ),
+            });
         }
 
-        let next_state = if self.remaining_qty <= Decimal::ZERO {
+        // Compute proposed new state (without mutating self yet)
+        let new_filled_qty = self.filled_qty + fill.qty;
+        let new_remaining_qty = self.remaining_qty - fill.qty;
+        let total_filled_notional =
+            self.avg_fill_price.unwrap_or(Decimal::ZERO) * self.filled_qty + fill.price * fill.qty;
+        let new_avg_fill_price = if new_filled_qty > Decimal::ZERO {
+            total_filled_notional / new_filled_qty
+        } else {
+            Decimal::ZERO
+        };
+
+        // Calculate total fee INCLUDING the current fill
+        let total_fee = self
+            .fills
+            .iter()
+            .map(|f| f.fee)
+            .fold(fill.fee, |acc, f| acc + f);
+
+        let next_state = if new_remaining_qty <= Decimal::ZERO {
             VenueState::Filled {
                 summary: FillSummary {
-                    filled_qty: self.filled_qty,
-                    remaining_qty: self.remaining_qty,
-                    avg_fill_price: self.avg_fill_price.unwrap_or(Decimal::ZERO),
-                    total_fee: self
-                        .fills
-                        .iter()
-                        .map(|f| f.fee)
-                        .fold(Decimal::ZERO, |acc, f| acc + f),
+                    filled_qty: new_filled_qty,
+                    remaining_qty: new_remaining_qty,
+                    avg_fill_price: new_avg_fill_price,
+                    total_fee,
                     fill_count: (self.fills.len() + 1) as u32,
                 },
                 filled_at: now,
@@ -512,20 +549,20 @@ impl LiveOrder {
         } else {
             VenueState::PartiallyFilled {
                 summary: FillSummary {
-                    filled_qty: self.filled_qty,
-                    remaining_qty: self.remaining_qty,
-                    avg_fill_price: self.avg_fill_price.unwrap_or(Decimal::ZERO),
-                    total_fee: self
-                        .fills
-                        .iter()
-                        .map(|f| f.fee)
-                        .fold(Decimal::ZERO, |acc, f| acc + f),
+                    filled_qty: new_filled_qty,
+                    remaining_qty: new_remaining_qty,
+                    avg_fill_price: new_avg_fill_price,
+                    total_fee,
                     fill_count: (self.fills.len() + 1) as u32,
                 },
             }
         };
 
+        // Only commit state after transition succeeds
         self.venue_state = self.venue_state.try_transition(next_state)?;
+        self.filled_qty = new_filled_qty;
+        self.remaining_qty = new_remaining_qty;
+        self.avg_fill_price = Some(new_avg_fill_price);
         self.fills.push(fill);
         self.last_updated = now;
         Ok(())
@@ -702,34 +739,28 @@ impl VenueState {
         matches!(self, Self::Accepted { .. } | Self::PartiallyFilled { .. })
     }
 
-    /// Validate and execute a state transition.
+    /// Validate and execute a state transition. Internal only — callers use semantic methods.
     ///
     /// Returns the new state if the transition is valid, or an error describing
-    /// why the transition is illegal.
-    pub fn try_transition(&self, to: Self) -> std::result::Result<Self, VenueStateError> {
+    /// why the transition is illegal. Enforces the canonical state machine from DATA_MODEL.md.
+    fn try_transition(&self, to: Self) -> std::result::Result<Self, VenueStateError> {
         let valid = match (self, &to) {
-            // From Submitted
+            // From Submitted: can go to Accepted, Triggered, or VenueRejected
             (Self::Submitted, Self::Accepted { .. }) => true,
+            (Self::Submitted, Self::Triggered { .. }) => true,
             (Self::Submitted, Self::VenueRejected { .. }) => true,
-            (Self::Submitted, Self::Cancelled { .. }) => true,
-            (Self::Submitted, Self::PartiallyFilled { .. }) => true,
-            (Self::Submitted, Self::Filled { .. }) => true,
-            // From Accepted
-            (Self::Accepted { .. }, Self::Triggered { .. }) => true,
+            // From Triggered: can ONLY go to Accepted (trigger fired)
+            (Self::Triggered { .. }, Self::Accepted { .. }) => true,
+            // From Accepted: can go to PartiallyFilled, Filled, Cancelled, or Expired
             (Self::Accepted { .. }, Self::PartiallyFilled { .. }) => true,
             (Self::Accepted { .. }, Self::Filled { .. }) => true,
             (Self::Accepted { .. }, Self::Cancelled { .. }) => true,
             (Self::Accepted { .. }, Self::Expired { .. }) => true,
-            // From Triggered
-            (Self::Triggered { .. }, Self::Accepted { .. }) => true,
-            (Self::Triggered { .. }, Self::PartiallyFilled { .. }) => true,
-            (Self::Triggered { .. }, Self::Filled { .. }) => true,
-            (Self::Triggered { .. }, Self::Cancelled { .. }) => true,
-            // From PartiallyFilled
+            // From PartiallyFilled: can go to Filled, Cancelled, or PartiallyFilled (more fills)
             (Self::PartiallyFilled { .. }, Self::PartiallyFilled { .. }) => true,
             (Self::PartiallyFilled { .. }, Self::Filled { .. }) => true,
             (Self::PartiallyFilled { .. }, Self::Cancelled { .. }) => true,
-            // Terminal states cannot transition
+            // Terminal states cannot transition (no wildcard — explicit enumeration)
             (Self::Filled { .. }, _) => false,
             (Self::VenueRejected { .. }, _) => false,
             (Self::Cancelled { .. }, _) => false,
@@ -764,7 +795,7 @@ impl std::fmt::Display for VenueState {
     }
 }
 
-/// Error for invalid venue state transitions.
+/// Error for invalid venue state transitions or fill events.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum VenueStateError {
     #[error("invalid venue state transition: {from} → {to}")]
@@ -772,6 +803,8 @@ pub enum VenueStateError {
         from: Box<VenueState>,
         to: Box<VenueState>,
     },
+    #[error("invalid fill: {reason}")]
+    InvalidFill { reason: String },
 }
 
 // ─── Rejected Order ───
@@ -1011,27 +1044,36 @@ mod tests {
     }
 
     #[test]
-    fn test_venue_state_triggered() {
+    fn test_venue_state_conditional_order_lifecycle() {
         let now = Utc::now();
+        // Submitted → Triggered (venue accepts conditional order, waiting for trigger)
         let s = VenueState::Submitted;
-        let s = s
-            .try_transition(VenueState::Accepted {
-                accepted_at: now,
-            })
-            .unwrap();
-        // Trigger a stop order
         let s = s
             .try_transition(VenueState::Triggered {
                 triggered_at: now,
             })
             .unwrap();
-        // Can accept again after trigger fires
+        // Triggered → Accepted (trigger condition met, order becomes live)
         let s = s
             .try_transition(VenueState::Accepted {
                 accepted_at: now,
             })
             .unwrap();
+        // Now the order is live and can receive fills
         assert!(!s.is_terminal());
+        assert!(s.is_live());
+    }
+
+    #[test]
+    fn test_venue_state_rejects_fill_while_triggered() {
+        let now = Utc::now();
+        let summary = FillSummary::empty(Decimal::new(1, 0));
+
+        // A triggered order should not transition to PartiallyFilled
+        let s = VenueState::Triggered { triggered_at: now };
+        assert!(s
+            .try_transition(VenueState::PartiallyFilled { summary })
+            .is_err());
     }
 
     #[test]
