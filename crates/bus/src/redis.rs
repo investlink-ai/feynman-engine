@@ -95,6 +95,87 @@ impl RedisBus {
         }
         Ok(messages)
     }
+
+    async fn pending_ids(
+        client: &RedisClient,
+        topic: &str,
+        group: &str,
+        min_idle: Duration,
+    ) -> Result<Vec<MessageId>> {
+        let min_idle_ms = duration_millis(min_idle, topic, group)?;
+        let mut start = String::from("-");
+        let mut ids = Vec::new();
+
+        loop {
+            let page = client
+                .xpending::<Vec<PendingEntry>, _, _, _>(
+                    topic,
+                    group,
+                    (
+                        min_idle_ms,
+                        start.clone(),
+                        String::from("+"),
+                        PENDING_PAGE_SIZE,
+                    ),
+                )
+                .await
+                .map_err(|error| map_group_or_pending_error(topic, group, error))?;
+
+            if page.is_empty() {
+                break;
+            }
+
+            let page_len = page.len();
+            for (id, _, _, _) in page {
+                start = format!("({id}");
+                ids.push(MessageId(id));
+            }
+
+            if page_len < PENDING_PAGE_SIZE as usize {
+                break;
+            }
+        }
+
+        Ok(ids)
+    }
+
+    async fn recover_pending_messages(
+        client: &RedisClient,
+        topic: &str,
+        group: &str,
+        consumer: &str,
+    ) -> Result<Vec<BusMessage>> {
+        let pending_ids = Self::pending_ids(client, topic, group, Duration::ZERO).await?;
+        if pending_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let claimed = client
+            .xclaim_values::<String, String, String, _, _, _, _>(
+                topic,
+                group,
+                consumer,
+                0,
+                ids_to_strings(&pending_ids),
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .await
+            .map_err(|error| BusError::ClaimFailed {
+                topic: topic.to_owned(),
+                group: group.to_owned(),
+                consumer: consumer.to_owned(),
+                reason: error.to_string(),
+            })?;
+
+        claimed
+            .into_iter()
+            .map(|(id, fields)| stream_entry_to_message(topic, id, fields))
+            .collect()
+    }
 }
 
 #[async_trait::async_trait]
@@ -143,6 +224,33 @@ impl MessageBus for RedisBus {
         let consumer_name = consumer.to_owned();
 
         tokio::spawn(async move {
+            let recovered_messages = match RedisBus::recover_pending_messages(
+                &client,
+                &topic_name,
+                &group_name,
+                &consumer_name,
+            )
+            .await
+            {
+                Ok(messages) => messages,
+                Err(error) => {
+                    error!(
+                        topic = %topic_name,
+                        group = %group_name,
+                        consumer = %consumer_name,
+                        error = %error,
+                        "failed to recover pending redis stream messages"
+                    );
+                    return;
+                }
+            };
+
+            for message in recovered_messages {
+                if tx.send(message).await.is_err() {
+                    return;
+                }
+            }
+
             loop {
                 let read_result: RedisResult<StreamReadResponse> = client
                     .xreadgroup_map(
@@ -177,7 +285,7 @@ impl MessageBus for RedisBus {
                                         error = %error,
                                         "failed to decode redis stream message"
                                     );
-                                    continue;
+                                    return;
                                 }
                             };
 
@@ -238,41 +346,7 @@ impl MessageBus for RedisBus {
         group: &str,
         min_idle: Duration,
     ) -> Result<Vec<BusMessage>> {
-        let min_idle_ms = duration_millis(min_idle, topic, group)?;
-        let mut start = String::from("-");
-        let mut ids = Vec::new();
-
-        loop {
-            let page = self
-                .client
-                .xpending::<Vec<PendingEntry>, _, _, _>(
-                    topic,
-                    group,
-                    (
-                        min_idle_ms,
-                        start.clone(),
-                        String::from("+"),
-                        PENDING_PAGE_SIZE,
-                    ),
-                )
-                .await
-                .map_err(|error| map_group_or_pending_error(topic, group, error))?;
-
-            if page.is_empty() {
-                break;
-            }
-
-            let page_len = page.len();
-            for (id, _, _, _) in page {
-                start = format!("({id}");
-                ids.push(MessageId(id));
-            }
-
-            if page_len < PENDING_PAGE_SIZE as usize {
-                break;
-            }
-        }
-
+        let ids = Self::pending_ids(&self.client, topic, group, min_idle).await?;
         self.fetch_messages(topic, &ids).await
     }
 
