@@ -3,6 +3,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use fred::prelude::*;
 use fred::types::XReadResponse;
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -488,7 +489,11 @@ fn value_as_u64(value: Option<&RedisValue>) -> Option<u64> {
 }
 
 fn encode_hex(payload: &[u8]) -> String {
-    payload.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut encoded = String::with_capacity(payload.len() * 2);
+    for byte in payload {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 fn decode_hex(topic: &str, message_id: &MessageId, encoded: &str) -> Result<Vec<u8>> {
