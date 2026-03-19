@@ -48,9 +48,9 @@ gh issue list --milestone "Phase 0: Scaffold" --state open
 ## 2. Branch
 
 ```bash
-# Create branch from dev
-git fetch origin dev
-git checkout -b feat/{slug} origin/dev
+# Create branch from main
+git fetch origin main
+git checkout -b feat/{slug} origin/main
 
 # Verify
 git branch --show-current  # Should print feat/{slug}
@@ -289,7 +289,7 @@ CORE_ENGINE_DESIGN.md §6.
 
 ```bash
 git push -u origin feat/{slug}
-gh pr create --draft --base dev --title "{title}" --body "$(cat <<'EOF'
+gh pr create --draft --base main --title "{title}" --body "$(cat <<'EOF'
 ## Summary
 {1-3 bullet points}
 
@@ -386,8 +386,8 @@ Any change to a running system with real capital:
 
 ```bash
 # Switch back and update
-git checkout dev
-git pull origin dev
+git checkout main
+git pull origin main
 
 # Clean up branch
 git branch -d feat/{slug}
@@ -458,8 +458,8 @@ If the next session must know it, write it to one of these surfaces.
 gh issue view {N}
 
 # === Branch ===
-git fetch origin dev
-git checkout -b feat/{slug} origin/dev
+git fetch origin main
+git checkout -b feat/{slug} origin/main
 
 # === Verify (layered) ===
 make check                               # Full gate: compile, lint, test, format
@@ -470,11 +470,11 @@ git commit -m "feat: ..."
 
 # === PR ===
 git push -u origin feat/{slug}
-gh pr create --draft --base dev --title "..." --body "Closes #N"
+gh pr create --draft --base main --title "..." --body "Closes #N"
 gh pr ready
 
 # === After merge ===
-git checkout dev && git pull origin dev
+git checkout main && git pull origin main
 git branch -d feat/{slug}
 ```
 
