@@ -159,6 +159,26 @@ struct ResizeCandidate {
 }
 
 impl AgentRiskManager {
+    fn position_nav_cap() -> Decimal {
+        dec!(0.05)
+    }
+
+    fn account_risk_nav_cap() -> Decimal {
+        dec!(0.01)
+    }
+
+    fn drawdown_halt_pct() -> Decimal {
+        dec!(-0.15)
+    }
+
+    fn cash_reserve_min_pct() -> Decimal {
+        dec!(0.20)
+    }
+
+    fn min_risk_reward_ratio() -> Decimal {
+        dec!(2)
+    }
+
     #[must_use]
     pub fn new(
         nav: Decimal,
@@ -276,6 +296,18 @@ impl AgentRiskManager {
             .instruments
             .iter()
             .find(|exposure| exposure.instrument == core.instrument_id);
+        let agent_instrument_exposure = instrument_exposure.and_then(|exposure| {
+            exposure
+                .by_agent
+                .iter()
+                .find(|agent_exposure| agent_exposure.agent == core.agent_id)
+        });
+        let venue_instrument_exposure = instrument_exposure.and_then(|exposure| {
+            exposure
+                .by_venue
+                .iter()
+                .find(|venue_exposure| venue_exposure.venue == core.venue_id)
+        });
         let current_instrument_net_qty =
             instrument_exposure.map_or(Decimal::ZERO, |exposure| exposure.net_qty);
         let current_instrument_gross_qty =
@@ -284,6 +316,28 @@ impl AgentRiskManager {
             instrument_exposure.map_or(Decimal::ZERO, |exposure| exposure.net_notional_usd);
         let current_instrument_gross_notional =
             instrument_exposure.map_or(Decimal::ZERO, |exposure| exposure.gross_notional_usd);
+        let current_agent_instrument_net_notional =
+            agent_instrument_exposure.map_or(Decimal::ZERO, |agent_exposure| {
+                Self::signed_value_from_net(
+                    agent_exposure.net_qty,
+                    agent_exposure.notional_usd.abs(),
+                )
+            });
+        let current_agent_instrument_gross_notional = agent_instrument_exposure
+            .map_or(Decimal::ZERO, |agent_exposure| {
+                agent_exposure.notional_usd.abs()
+            });
+        let current_venue_instrument_net_notional =
+            venue_instrument_exposure.map_or(Decimal::ZERO, |venue_exposure| {
+                Self::signed_value_from_net(
+                    venue_exposure.net_qty,
+                    venue_exposure.notional_usd.abs(),
+                )
+            });
+        let current_venue_instrument_gross_notional = venue_instrument_exposure
+            .map_or(Decimal::ZERO, |venue_exposure| {
+                venue_exposure.notional_usd.abs()
+            });
         let signed_order_qty = Self::signed_delta(core.side, core.qty);
         let signed_order_notional = Self::signed_delta(core.side, order_notional);
         let (projected_instrument_net_qty, projected_instrument_gross_qty) =
@@ -297,18 +351,54 @@ impl AgentRiskManager {
             current_instrument_gross_notional,
             signed_order_notional,
         );
-        let projected_firm_gross_notional = firm_book.gross_notional
-            - current_instrument_gross_notional
-            + projected_instrument_gross_notional;
+        let (_, projected_agent_instrument_gross_notional) = Self::project_net_and_gross(
+            current_agent_instrument_net_notional,
+            current_agent_instrument_gross_notional,
+            signed_order_notional,
+        );
+        let projected_agent_gross_notional = agent_allocation.used_capital
+            - current_agent_instrument_gross_notional
+            + projected_agent_instrument_gross_notional;
+        let projected_agent_free_capital =
+            agent_allocation.allocated_capital - projected_agent_gross_notional;
+        let current_venue_notional = firm_book
+            .instruments
+            .iter()
+            .flat_map(|exposure| exposure.by_venue.iter())
+            .filter(|venue_exposure| venue_exposure.venue == core.venue_id)
+            .fold(Decimal::ZERO, |acc, venue_exposure| {
+                acc + venue_exposure.notional_usd.abs()
+            });
+        let current_venue_positions = firm_book
+            .instruments
+            .iter()
+            .filter(|exposure| {
+                exposure
+                    .by_venue
+                    .iter()
+                    .any(|venue_exposure| venue_exposure.venue == core.venue_id)
+            })
+            .count() as u32;
+        let (_, projected_venue_instrument_gross_notional) = Self::project_net_and_gross(
+            current_venue_instrument_net_notional,
+            current_venue_instrument_gross_notional,
+            signed_order_notional,
+        );
+        let projected_venue_notional = current_venue_notional
+            - current_venue_instrument_gross_notional
+            + projected_venue_instrument_gross_notional;
+        let projected_venue_positions =
+            current_venue_positions + u32::from(venue_instrument_exposure.is_none());
 
         let mut hard_violations = Vec::new();
         let mut resize_candidates = Vec::new();
 
         self.check_agent_permissions(core, agent_limits, &mut hard_violations);
         self.check_agent_budget(
-            order_notional,
+            projected_agent_gross_notional,
+            projected_agent_free_capital,
+            projected_agent_instrument_gross_notional,
             agent_limits,
-            agent_allocation,
             &mut hard_violations,
         );
         self.check_position_limit(order_notional, price, effective_nav, &mut resize_candidates);
@@ -320,14 +410,14 @@ impl AgentRiskManager {
             &mut hard_violations,
         );
         self.check_leverage(
-            projected_firm_gross_notional,
+            projected_agent_gross_notional,
+            projected_agent_free_capital,
             instrument_limits,
-            agent_allocation,
             &mut hard_violations,
         );
         self.check_drawdown(firm_book, &mut hard_violations);
         self.check_cash_reserve(
-            order_notional,
+            signed_order_notional,
             effective_nav,
             firm_book,
             &mut hard_violations,
@@ -341,12 +431,10 @@ impl AgentRiskManager {
             &mut hard_violations,
         );
         Self::check_venue_limits(
-            core,
-            order_notional,
+            projected_venue_notional,
+            projected_venue_positions,
             effective_nav,
             venue_limits,
-            firm_book,
-            instrument_exposure,
             &mut hard_violations,
         );
 
@@ -391,7 +479,7 @@ impl AgentRiskManager {
             ));
         }
 
-        Ok(firm_book.nav)
+        Ok(self.nav.min(firm_book.nav))
     }
 
     fn check_agent_permissions(
@@ -427,36 +515,36 @@ impl AgentRiskManager {
 
     fn check_agent_budget(
         &self,
-        order_notional: Decimal,
+        projected_agent_gross_notional: Decimal,
+        projected_agent_free_capital: Decimal,
+        projected_agent_instrument_gross_notional: Decimal,
         agent_limits: &AgentRiskLimits,
-        agent_allocation: &AgentAllocation,
         hard_violations: &mut Vec<RiskViolation>,
     ) {
-        if order_notional > agent_allocation.free_capital {
+        if projected_agent_free_capital < Decimal::ZERO {
             hard_violations.push(Self::violation(
                 "agent_free_capital",
-                order_notional,
-                agent_allocation.free_capital,
+                projected_agent_free_capital,
+                Decimal::ZERO,
                 "reject",
                 "order exceeds the agent's free capital",
             ));
         }
 
-        if order_notional > agent_limits.max_position_notional {
+        if projected_agent_instrument_gross_notional > agent_limits.max_position_notional {
             hard_violations.push(Self::violation(
                 "agent_max_position_notional",
-                order_notional,
+                projected_agent_instrument_gross_notional,
                 agent_limits.max_position_notional,
                 "reject",
                 "order exceeds the agent's max single-position notional",
             ));
         }
 
-        let projected_gross_notional = agent_allocation.used_capital + order_notional;
-        if projected_gross_notional > agent_limits.max_gross_notional {
+        if projected_agent_gross_notional > agent_limits.max_gross_notional {
             hard_violations.push(Self::violation(
                 "agent_max_gross_notional",
-                projected_gross_notional,
+                projected_agent_gross_notional,
                 agent_limits.max_gross_notional,
                 "reject",
                 "projected agent gross notional exceeds the configured cap",
@@ -471,7 +559,7 @@ impl AgentRiskManager {
         nav: Decimal,
         resize_candidates: &mut Vec<ResizeCandidate>,
     ) {
-        let max_position_notional = nav * dec!(0.05);
+        let max_position_notional = nav * Self::position_nav_cap();
         if order_notional > max_position_notional {
             resize_candidates.push(ResizeCandidate {
                 new_qty: max_position_notional / price,
@@ -498,15 +586,15 @@ impl AgentRiskManager {
         let risk_per_unit = core
             .stop_loss
             .map_or(price, |stop_loss| (price - stop_loss).abs());
-        let max_loss_cap = nav * dec!(0.01);
+        let max_loss_cap = nav * Self::account_risk_nav_cap();
 
         if risk_per_unit <= Decimal::ZERO {
             hard_violations.push(Self::violation(
-                "account_risk_per_unit_positive",
+                "account_risk_distance_positive",
                 risk_per_unit,
                 Decimal::ZERO,
                 "reject",
-                "risk per unit must be positive to evaluate account risk",
+                "entry price and stop loss must define a positive loss distance",
             ));
             return;
         }
@@ -529,9 +617,9 @@ impl AgentRiskManager {
 
     fn check_leverage(
         &self,
-        projected_firm_gross_notional: Decimal,
+        projected_agent_gross_notional: Decimal,
+        projected_agent_free_capital: Decimal,
         instrument_limits: &InstrumentRiskLimits,
-        agent_allocation: &AgentAllocation,
         hard_violations: &mut Vec<RiskViolation>,
     ) {
         if instrument_limits.max_leverage <= Decimal::ZERO {
@@ -545,10 +633,10 @@ impl AgentRiskManager {
             return;
         }
 
-        if agent_allocation.free_capital <= Decimal::ZERO {
+        if projected_agent_free_capital <= Decimal::ZERO {
             hard_violations.push(Self::violation(
                 "agent_free_capital_positive",
-                agent_allocation.free_capital,
+                projected_agent_free_capital,
                 Decimal::ZERO,
                 "reject",
                 "agent free capital must be positive to evaluate leverage",
@@ -556,7 +644,7 @@ impl AgentRiskManager {
             return;
         }
 
-        let projected_leverage = projected_firm_gross_notional / agent_allocation.free_capital;
+        let projected_leverage = projected_agent_gross_notional / projected_agent_free_capital;
         if projected_leverage > instrument_limits.max_leverage {
             hard_violations.push(Self::violation(
                 "instrument_max_leverage",
@@ -569,11 +657,11 @@ impl AgentRiskManager {
     }
 
     fn check_drawdown(&self, firm_book: &FirmBook, hard_violations: &mut Vec<RiskViolation>) {
-        if firm_book.current_drawdown_pct < dec!(-0.15) {
+        if firm_book.current_drawdown_pct < Self::drawdown_halt_pct() {
             hard_violations.push(Self::violation(
                 "firm_drawdown_pct",
                 firm_book.current_drawdown_pct,
-                dec!(-0.15),
+                Self::drawdown_halt_pct(),
                 "halt_all",
                 "firm drawdown breached the 15% halt threshold",
             ));
@@ -582,19 +670,19 @@ impl AgentRiskManager {
 
     fn check_cash_reserve(
         &self,
-        order_notional: Decimal,
+        signed_order_notional: Decimal,
         nav: Decimal,
         firm_book: &FirmBook,
         hard_violations: &mut Vec<RiskViolation>,
     ) {
-        let projected_cash_available = firm_book.cash_available - order_notional;
+        let projected_cash_available = firm_book.cash_available - signed_order_notional;
         let projected_cash_pct = projected_cash_available / nav;
 
-        if projected_cash_pct < dec!(0.20) {
+        if projected_cash_pct < Self::cash_reserve_min_pct() {
             hard_violations.push(Self::violation(
                 "cash_reserve_pct",
                 projected_cash_pct,
-                dec!(0.20),
+                Self::cash_reserve_min_pct(),
                 "reject",
                 "projected cash reserve falls below the 20% NAV minimum",
             ));
@@ -644,39 +732,13 @@ impl AgentRiskManager {
     }
 
     fn check_venue_limits(
-        core: &OrderCore,
-        order_notional: Decimal,
+        projected_venue_notional: Decimal,
+        projected_positions: u32,
         nav: Decimal,
         venue_limits: &VenueRiskLimits,
-        firm_book: &FirmBook,
-        instrument_exposure: Option<&types::InstrumentExposure>,
         hard_violations: &mut Vec<RiskViolation>,
     ) {
-        let current_venue_notional = firm_book
-            .instruments
-            .iter()
-            .flat_map(|exposure| exposure.by_venue.iter())
-            .filter(|exposure| exposure.venue == core.venue_id)
-            .fold(Decimal::ZERO, |acc, exposure| acc + exposure.notional_usd);
-        let projected_venue_notional = current_venue_notional + order_notional;
         let projected_pct_of_nav = projected_venue_notional / nav;
-        let current_positions = firm_book
-            .instruments
-            .iter()
-            .filter(|exposure| {
-                exposure
-                    .by_venue
-                    .iter()
-                    .any(|venue| venue.venue == core.venue_id)
-            })
-            .count() as u32;
-        let instrument_already_on_venue = instrument_exposure.is_some_and(|exposure| {
-            exposure
-                .by_venue
-                .iter()
-                .any(|venue_exposure| venue_exposure.venue == core.venue_id)
-        });
-        let projected_positions = current_positions + u32::from(!instrument_already_on_venue);
 
         if projected_venue_notional > venue_limits.max_notional {
             hard_violations.push(Self::violation(
@@ -744,11 +806,11 @@ impl AgentRiskManager {
 
             let reward_distance = (take_profit - price).abs();
             let risk_reward_ratio = reward_distance / risk_distance;
-            if risk_reward_ratio < dec!(2) {
+            if risk_reward_ratio < Self::min_risk_reward_ratio() {
                 hard_violations.push(Self::violation(
                     "signal_risk_reward_ratio",
                     risk_reward_ratio,
-                    dec!(2),
+                    Self::min_risk_reward_ratio(),
                     "reject",
                     "signal risk/reward ratio is below 2:1",
                 ));
@@ -766,6 +828,14 @@ impl AgentRiskManager {
         match side {
             Side::Buy => qty,
             Side::Sell => -qty,
+        }
+    }
+
+    fn signed_value_from_net(net_qty: Decimal, absolute_value: Decimal) -> Decimal {
+        if net_qty >= Decimal::ZERO {
+            absolute_value
+        } else {
+            -absolute_value
         }
     }
 
@@ -902,9 +972,9 @@ mod tests {
         book.agent_allocations.insert(
             AgentId("satoshi".into()),
             AgentAllocation {
-                allocated_capital: dec!(10_000),
+                allocated_capital: dec!(12_000),
                 used_capital: dec!(5_000),
-                free_capital: dec!(5_000),
+                free_capital: dec!(7_000),
                 realized_pnl: Decimal::ZERO,
                 unrealized_pnl: Decimal::ZERO,
                 current_drawdown: Decimal::ZERO,
@@ -1003,6 +1073,18 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_submit_batch_without_stop_loss_approved() {
+        let manager = test_manager();
+        let book = test_firm_book();
+        let order = test_order(dec!(5), None, None);
+
+        match manager.evaluate(&order, &book, EvaluationPath::SubmitBatch) {
+            RiskOutcome::Approved { warnings } => assert!(warnings.is_empty()),
+            other => panic!("expected approved outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_evaluate_agent_budget_isolated_rejected() {
         let manager = test_manager();
         let mut book = test_firm_book();
@@ -1028,6 +1110,45 @@ mod tests {
                     .any(|v| v.check_name == "agent_free_capital"));
             }
             other => panic!("expected rejected outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_reducing_sell_frees_capital_and_cash() {
+        let manager = test_manager();
+        let mut book = test_firm_book();
+        book.cash_available = dec!(20_500);
+        book.agent_allocations.insert(
+            AgentId("satoshi".into()),
+            AgentAllocation {
+                allocated_capital: dec!(3_000),
+                used_capital: dec!(2_500),
+                free_capital: dec!(500),
+                realized_pnl: Decimal::ZERO,
+                unrealized_pnl: Decimal::ZERO,
+                current_drawdown: Decimal::ZERO,
+                max_drawdown_limit: dec!(-0.15),
+                status: AgentStatus::Active,
+            },
+        );
+        let order = test_order_with_side(Side::Sell, dec!(10), Some(dec!(105)), None);
+
+        match manager.evaluate(&order, &book, EvaluationPath::SubmitOrder) {
+            RiskOutcome::Approved { warnings } => assert!(warnings.is_empty()),
+            other => panic!("expected approved outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_leverage_is_agent_scoped() {
+        let manager = test_manager();
+        let mut book = test_firm_book();
+        book.gross_notional = dec!(100_000);
+        let order = test_order(dec!(5), Some(dec!(95)), Some(dec!(110)));
+
+        match manager.evaluate(&order, &book, EvaluationPath::SubmitOrder) {
+            RiskOutcome::Approved { warnings } => assert!(warnings.is_empty()),
+            other => panic!("expected approved outcome, got {other:?}"),
         }
     }
 
@@ -1115,7 +1236,7 @@ mod tests {
                     max_net_qty: dec!(1_000),
                     max_gross_qty: dec!(1_000),
                     max_concentration_pct: dec!(0.10),
-                    max_leverage: dec!(3),
+                    max_leverage: dec!(10),
                 },
             )]),
             HashMap::from([(
@@ -1189,12 +1310,21 @@ mod tests {
         stop_loss: Option<Decimal>,
         take_profit: Option<Decimal>,
     ) -> PipelineOrder<Validated> {
+        test_order_with_side(Side::Buy, qty, stop_loss, take_profit)
+    }
+
+    fn test_order_with_side(
+        side: Side,
+        qty: Decimal,
+        stop_loss: Option<Decimal>,
+        take_profit: Option<Decimal>,
+    ) -> PipelineOrder<Validated> {
         PipelineOrder::new(OrderCore {
             id: OrderId("ord-1".into()),
             agent_id: AgentId("satoshi".into()),
             instrument_id: InstrumentId("BTC-USD".into()),
             venue_id: VenueId("bybit".into()),
-            side: Side::Buy,
+            side,
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::GTC,
             qty,

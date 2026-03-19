@@ -208,7 +208,7 @@ impl RiskChecklist {
     pub fn check_account_risk(order: &Order, firm_book: &FirmBook) -> CheckResult;
 
     /// Check 3: Total leverage within instrument limits.
-    /// projected_gross_notional / free_capital <= instrument_limits.max_leverage
+    /// projected_agent_gross_notional / projected_agent_free_capital <= instrument_limits.max_leverage
     pub fn check_leverage(
         order: &Order,
         agent_allocation: &AgentAllocation,
@@ -220,7 +220,7 @@ impl RiskChecklist {
     pub fn check_drawdown(agent_allocation: &AgentAllocation) -> CheckResult;
 
     /// Check 5: Free capital >= 20% of total NAV after this order.
-    /// (firm_book.free_capital - order.notional) / firm_book.total_nav >= 0.20
+    /// Buys consume cash; sells release cash in the projected check.
     pub fn check_cash_reserve(order: &Order, firm_book: &FirmBook) -> CheckResult;
 
     // ── Signal-specific checks (SubmitSignal only — engine owns sizing) ──
