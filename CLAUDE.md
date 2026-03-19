@@ -48,8 +48,8 @@ RUST_LOG=debug cargo run --bin feynman-engine
 
 ```bash
 # Start work on an issue
-git fetch origin dev
-git worktree add ../feynman-engine-{slug} -b feat/{slug} origin/dev
+git fetch origin main
+git worktree add ../feynman-engine-{slug} -b feat/{slug} origin/main
 cd ../feynman-engine-{slug}
 
 # Before committing
@@ -57,7 +57,7 @@ make check
 
 # Push and PR
 git push -u origin feat/{slug}
-gh pr create --draft --base dev
+gh pr create --draft --base main
 ```
 
 **Branch naming:** `feat/`, `fix/`, `ops/`, `research/`
