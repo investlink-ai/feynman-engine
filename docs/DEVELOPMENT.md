@@ -35,6 +35,7 @@ cargo build --bin feynman-engine           # Build binary only
 ```bash
 cargo test --workspace                     # All tests
 cargo test -p {crate}                      # Specific crate
+cargo test -p {crate} --test {name}        # Named integration test owned by a crate
 cargo test {test_name}                     # Single test
 cargo test -- --ignored                    # Property tests (slow, marked #[ignore])
 cargo test -- --nocapture --test-threads=1 # Run with output, serial

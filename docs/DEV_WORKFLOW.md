@@ -158,9 +158,13 @@ Run `cargo test -- --ignored` when changing risk evaluation logic, financial mat
 Run when changing bus or infrastructure code:
 
 ```bash
-# Bus tests (requires Redis)
+# Current bus verification (the bus crate currently exposes unit tests only)
+cargo test -p bus
+
+# If a Redis-backed bus integration suite is added under tests/integration/,
+# register it from crates/bus/Cargo.toml and then run:
 docker run -d --name redis-test -p 6379:6379 redis:7-alpine
-cargo test --test bus -- --ignored
+cargo test -p bus --test {suite} -- --ignored
 docker rm -f redis-test
 
 # Docker smoke test
