@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 version     = "0.1.0"
 edition     = "2021"
-rust-version = "1.82"
+rust-version = "1.83"
 authors     = ["Feynman Capital"]
 license     = "UNLICENSED"
 
@@ -65,7 +65,10 @@ thiserror   = "1"
 async-trait = "0.1"
 
 # ── Testing ──
-proptest    = "1"
+proptest    = "<1.10"
+
+# ── Constraint: getrandom 0.4.x requires nightly, use 0.3.x ──
+getrandom   = { version = "<0.4", default-features = false }
 
 # ── Workspace crates ──
 types         = { path = "crates/types" }
