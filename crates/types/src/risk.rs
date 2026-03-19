@@ -52,7 +52,7 @@ pub struct PredictionMarketLimits {
 
 // ─── Risk violations ───
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RiskViolation {
     pub check_name: String,
     pub violation_type: ViolationType,
