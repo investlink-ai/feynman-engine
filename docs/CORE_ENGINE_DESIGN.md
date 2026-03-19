@@ -1250,6 +1250,7 @@ pub struct InstrumentRiskLimits {
     pub max_net_qty: Decimal,              // max directional exposure
     pub max_gross_qty: Decimal,            // max absolute exposure across venues
     pub max_concentration_pct: Decimal,    // max % of NAV
+    pub max_leverage: Decimal,             // max leverage allowed for this instrument
 }
 
 pub struct VenueRiskLimits {

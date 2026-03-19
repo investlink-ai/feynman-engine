@@ -708,9 +708,20 @@ pub struct AgentRiskLimits {
     pub max_drawdown_pct: Decimal,       // e.g., 3.0 = 3%
     pub max_daily_loss: Decimal,         // absolute USD
     pub max_open_orders: u32,
-    pub max_leverage: Decimal,           // e.g., 3.0x
     pub allowed_instruments: Vec<InstrumentId>,
     pub allowed_venues: Vec<VenueId>,
+}
+```
+
+### 5.1.1 InstrumentRiskLimits
+
+```rust
+pub struct InstrumentRiskLimits {
+    pub instrument: InstrumentId,
+    pub max_net_qty: Decimal,
+    pub max_gross_qty: Decimal,
+    pub max_concentration_pct: Decimal,
+    pub max_leverage: Decimal,           // leverage cap for this instrument
 }
 ```
 

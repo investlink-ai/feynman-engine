@@ -29,6 +29,7 @@ pub struct InstrumentRiskLimits {
     pub max_net_qty: Decimal,
     pub max_gross_qty: Decimal,
     pub max_concentration_pct: Decimal,
+    pub max_leverage: Decimal,
 }
 
 /// Per-venue counterparty risk.

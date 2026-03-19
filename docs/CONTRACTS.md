@@ -207,12 +207,12 @@ impl RiskChecklist {
     /// If stop_loss absent: max_loss = notional (worst case)
     pub fn check_account_risk(order: &Order, firm_book: &FirmBook) -> CheckResult;
 
-    /// Check 3: Total leverage within agent limits.
-    /// gross_notional / allocated_capital <= max_leverage
+    /// Check 3: Total leverage within instrument limits.
+    /// projected_gross_notional / free_capital <= instrument_limits.max_leverage
     pub fn check_leverage(
         order: &Order,
-        agent_limits: &AgentRiskLimits,
-        current_gross: Decimal,
+        agent_allocation: &AgentAllocation,
+        instrument_limits: &InstrumentRiskLimits,
     ) -> CheckResult;
 
     /// Check 4: Agent drawdown within threshold.
