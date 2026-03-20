@@ -34,8 +34,7 @@ impl RecordingJournal {
 
 #[derive(Clone, Copy)]
 enum JournalFailureMode {
-    AppendBatch,
-    SaveSnapshot,
+    PersistCommit,
 }
 
 #[derive(Clone)]
@@ -57,12 +56,20 @@ impl EventJournal for FailingJournal {
         &self,
         events: &[crate::SequencedEvent<EngineEvent>],
     ) -> std::result::Result<(), crate::EngineError> {
-        if matches!(self.failure_mode, JournalFailureMode::AppendBatch) {
+        self.inner.append_batch(events).await
+    }
+
+    async fn persist_commit(
+        &self,
+        events: &[crate::SequencedEvent<EngineEvent>],
+        snapshot: Option<&EngineStateSnapshot>,
+    ) -> std::result::Result<(), crate::EngineError> {
+        if matches!(self.failure_mode, JournalFailureMode::PersistCommit) {
             return Err(crate::EngineError::Journal(
-                "simulated append failure".to_owned(),
+                "simulated persist_commit failure".to_owned(),
             ));
         }
-        self.inner.append_batch(events).await
+        self.inner.persist_commit(events, snapshot).await
     }
 
     async fn replay_from(
@@ -85,11 +92,6 @@ impl EventJournal for FailingJournal {
         sequence_id: SequenceId,
         snapshot: &EngineStateSnapshot,
     ) -> std::result::Result<(), crate::EngineError> {
-        if matches!(self.failure_mode, JournalFailureMode::SaveSnapshot) {
-            return Err(crate::EngineError::Journal(
-                "simulated snapshot failure".to_owned(),
-            ));
-        }
         self.inner.save_snapshot(sequence_id, snapshot).await
     }
 
@@ -127,6 +129,19 @@ impl EventJournal for RecordingJournal {
             .expect("journal lock")
             .events
             .extend_from_slice(events);
+        Ok(())
+    }
+
+    async fn persist_commit(
+        &self,
+        events: &[crate::SequencedEvent<EngineEvent>],
+        snapshot: Option<&EngineStateSnapshot>,
+    ) -> std::result::Result<(), crate::EngineError> {
+        let mut state = self.state.lock().expect("journal lock");
+        state.events.extend_from_slice(events);
+        if let Some(snapshot) = snapshot {
+            state.snapshot = Some((snapshot.sequence_id, snapshot.clone()));
+        }
         Ok(())
     }
 
@@ -658,7 +673,7 @@ async fn test_journal_append_failure_stops_sequencer() {
     let now = fixed_time();
     let journal = FailingJournal {
         inner: RecordingJournal::default(),
-        failure_mode: JournalFailureMode::AppendBatch,
+        failure_mode: JournalFailureMode::PersistCommit,
     };
     let core = TestCore::new(now);
     let clock = types::SimulatedClock::new(now);
@@ -686,7 +701,7 @@ async fn test_snapshot_persistence_failure_stops_sequencer() {
     let now = fixed_time();
     let journal = FailingJournal {
         inner: RecordingJournal::default(),
-        failure_mode: JournalFailureMode::SaveSnapshot,
+        failure_mode: JournalFailureMode::PersistCommit,
     };
     let core = TestCore::new(now);
     let clock = types::SimulatedClock::new(now);

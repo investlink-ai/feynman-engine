@@ -419,13 +419,18 @@ Append-only event log for crash recovery, audit, and replay. Events are wrapped 
 ```rust
 /// Append-only event journal. Events are stored with their SequenceId.
 /// The Sequencer persists journal entries and snapshots as part of the commit
-/// path; append/snapshot failures fail the runtime closed instead of buffering.
+/// path; `persist_commit()` should land them in one durable transaction.
 /// Startup currently restores the latest persisted snapshot and rejects any
 /// unapplied journal tail until replay bootstrap is implemented.
 #[async_trait]
 pub trait EventJournal: Send + Sync {
     async fn append(&self, event: &SequencedEvent<EngineEvent>) -> Result<()>;
     async fn append_batch(&self, events: &[SequencedEvent<EngineEvent>]) -> Result<()>;
+    async fn persist_commit(
+        &self,
+        events: &[SequencedEvent<EngineEvent>],
+        snapshot: Option<&EngineStateSnapshot>,
+    ) -> Result<()>;
 
     /// Replay events from sequence ID (inclusive), in order.
     async fn replay_from(&self, from: SequenceId) -> Result<Vec<SequencedEvent<EngineEvent>>>;
@@ -438,6 +443,9 @@ pub trait EventJournal: Send + Sync {
     async fn latest_sequence_id(&self) -> Result<SequenceId>;
 }
 ```
+
+Persisted journal rows are versioned (`schema_version`) so incompatible payload
+changes fail explicitly instead of silently decoding against the wrong Rust type.
 
 `EngineEvent` is a 22-variant enum covering the full engine lifecycle. See `types/src/event.rs` for the canonical definitions. The `SequenceGenerator` (owned by Sequencer) assigns `SequenceId` values and resumes from the latest committed snapshot sequence after startup verifies that the journal has no unapplied tail.
 

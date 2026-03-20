@@ -46,7 +46,7 @@
 | 2 | **Venue is source of truth** | Internal state is a cache. The exchange knows what you actually hold. Reconciliation is continuous, not periodic. |
 | 3 | **Fees are first-class** | Fees determine whether a trade has edge. Fee model is identical in backtest and live. Fee estimates inform execution strategy selection. |
 | 4 | **Layered risk defense** | Layer 0 (circuit breakers, compiled-in) → Layer 1 (programmatic risk gate, configurable) → Layer 2 (LLM risk agent) → Layer 3 (human CIO). Each layer is independent. |
-| 5 | **Journaled order path** | Every state change is written to an append-only journal. Current state is a materialized view with periodic snapshots. Crash recovery replays the journal tail. |
+| 5 | **Journaled order path** | Every state change is written to an append-only journal. Current state is a materialized view with periodic snapshots. The commit path persists journal rows and snapshot metadata atomically; startup still fails closed on any unexpected journal tail until replay bootstrap is implemented. |
 | 6 | **Make illegal states uncompilable** | Pipeline stages are type-state (`Draft → Validated → RiskChecked → Routed`). Venue lifecycle uses exhaustive `match` on `VenueState` — no `_` wildcards on owned enums. Financial math is `rust_decimal::Decimal` only. The compiler is the first risk gate. |
 | 7 | **Adapters are dumb pipes** | No business logic in venue adapters. They translate between canonical format and venue-native API. All intelligence lives in the gateway. |
 | 8 | **Design for fast-quant, build for strategic** | Contracts support sub-50ms signal-to-order latency. Current implementation targets 50ms–1s. Architecture doesn't preclude HFT-tier if needed. |
@@ -1783,8 +1783,15 @@ pub trait EventJournal: Send + Sync {
     /// Append a batch atomically — all or none are written.
     async fn append_batch(&self, events: &[SequencedEvent<EngineEvent>]) -> Result<()>;
 
-    /// Replay events from a SequenceId (inclusive). Crash recovery use case:
-    ///   replay_from(last_snapshot_seq) to catch up from last known-good state.
+    /// Persist a sequencer commit atomically: event rows plus optional snapshot.
+    async fn persist_commit(
+        &self,
+        events: &[SequencedEvent<EngineEvent>],
+        snapshot: Option<&EngineStateSnapshot>,
+    ) -> Result<()>;
+
+    /// Replay events from a SequenceId (inclusive). Startup replay is a planned
+    /// recovery path; the current engine still rejects any unapplied journal tail.
     async fn replay_from(&self, from: SequenceId) -> Result<Vec<SequencedEvent<EngineEvent>>>;
 
     /// Replay events in a range [from, to] inclusive.
@@ -1805,6 +1812,10 @@ pub trait EventJournal: Send + Sync {
 }
 ```
 
+`SqliteJournal` stores an explicit `schema_version` alongside each event and
+snapshot row. Decoder/version mismatch is a hard startup error, never a silent
+best-effort decode of stale payloads.
+
 ### 9.2.1 Startup & Crash Recovery Protocol
 
 The engine may restart after a clean shutdown (§8.7), a crash, or an OOM kill. In all cases,
@@ -1820,8 +1831,12 @@ Engine starts
   │     → returns Option<(seq, state)>
   │
   │     If snapshot exists at seq N:
-  │       replay journal from seq N+1 → latest
-  │       apply each event to state via StateStore::apply_event()
+  │       current implementation verifies journal latest_seq == N
+  │       and fails closed if an unapplied tail exists
+  │
+  │       planned bootstrap:
+  │         replay journal from seq N+1 → latest
+  │         apply each event to state via StateStore::apply_event()
   │
   │     If no snapshot (cold start):
   │       start with empty state
@@ -3366,7 +3381,7 @@ impl Sequencer {
 - `catch_unwind` wraps every command, not the Sequencer loop
 - A panic is treated as fatal because Rust cannot roll back partial mutations
 - The loop exits on panic or journal persistence failure; it does not keep trading on uncertain state
-- Journal append and snapshot persistence are part of the commit path
+- Journal events and snapshot metadata are persisted via a single `persist_commit` call on the commit path
 - Startup restores the latest persisted snapshot and rejects any unapplied journal tail until replay bootstrap is implemented
 
 ### 15.10 Configuration Hot-Reload

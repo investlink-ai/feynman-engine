@@ -8,6 +8,7 @@
 //! once at construction; all async methods dispatch to `spawn_blocking`.
 
 use std::path::Path;
+use std::slice;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS events (
     sequence_id INTEGER PRIMARY KEY,
     timestamp   TEXT    NOT NULL,
     event_kind  TEXT    NOT NULL,
+    schema_version INTEGER NOT NULL,
     payload     BLOB    NOT NULL
 )";
 
@@ -31,8 +33,11 @@ const CREATE_SNAPSHOTS: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
     sequence_id INTEGER PRIMARY KEY,
     timestamp   TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
     state       BLOB NOT NULL
 )";
+
+const PERSISTED_SCHEMA_VERSION: i64 = 1;
 
 // ─── SqliteJournal ───────────────────────────────────────────────────────────
 
@@ -73,6 +78,9 @@ impl SqliteJournal {
         conn.execute_batch(CREATE_SNAPSHOTS)
             .map_err(|e| EngineError::Journal(format!("failed to create snapshots table: {e}")))?;
 
+        ensure_schema_version_column(&conn, "events")?;
+        ensure_schema_version_column(&conn, "snapshots")?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -95,6 +103,8 @@ impl SqliteJournal {
             .map_err(|e| EngineError::Journal(format!("failed to create events table: {e}")))?;
         conn.execute_batch(CREATE_SNAPSHOTS)
             .map_err(|e| EngineError::Journal(format!("failed to create snapshots table: {e}")))?;
+        ensure_schema_version_column(&conn, "events")?;
+        ensure_schema_version_column(&conn, "snapshots")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -125,6 +135,47 @@ fn encode_snapshot(snapshot: &EngineStateSnapshot) -> Result<Vec<u8>, EngineErro
 fn decode_snapshot(bytes: &[u8]) -> Result<EngineStateSnapshot, EngineError> {
     rmp_serde::from_slice(bytes)
         .map_err(|e| EngineError::Journal(format!("failed to decode snapshot: {e}")))
+}
+
+fn ensure_schema_version_column(conn: &Connection, table: &str) -> Result<(), EngineError> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .map_err(|e| EngineError::Journal(format!("prepare table_info for {table}: {e}")))?;
+    let column_names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| EngineError::Journal(format!("query table_info for {table}: {e}")))?;
+
+    let has_schema_version = column_names
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| EngineError::Journal(format!("row error in table_info for {table}: {e}")))?
+        .iter()
+        .any(|column| column == "schema_version");
+
+    if has_schema_version {
+        return Ok(());
+    }
+
+    let alter = format!(
+        "ALTER TABLE {table} ADD COLUMN schema_version INTEGER NOT NULL DEFAULT {PERSISTED_SCHEMA_VERSION}"
+    );
+    conn.execute(&alter, [])
+        .map_err(|e| EngineError::Journal(format!("add schema_version to {table}: {e}")))?;
+    Ok(())
+}
+
+fn ensure_supported_schema_version(
+    entity: &str,
+    schema_version: i64,
+    sequence_id: i64,
+) -> Result<(), EngineError> {
+    if schema_version == PERSISTED_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    Err(EngineError::Journal(format!(
+        "unsupported {entity} schema_version {schema_version} at seq:{sequence_id}; expected {PERSISTED_SCHEMA_VERSION}"
+    )))
 }
 
 /// Cast a `SequenceId` to `i64` for SQLite storage.
@@ -172,6 +223,95 @@ fn event_kind(event: &EngineEvent) -> &'static str {
     }
 }
 
+type EncodedEventRow = (i64, String, &'static str, i64, Vec<u8>);
+
+struct EncodedSnapshotRow {
+    sequence_id: i64,
+    timestamp: String,
+    schema_version: i64,
+    payload: Vec<u8>,
+}
+
+fn encode_event_row(event: &SequencedEvent<EngineEvent>) -> Result<EncodedEventRow, EngineError> {
+    Ok((
+        seq_as_i64(event.sequence_id),
+        event.timestamp.to_rfc3339(),
+        event_kind(&event.event),
+        PERSISTED_SCHEMA_VERSION,
+        encode_event(event)?,
+    ))
+}
+
+fn encode_snapshot_row(snapshot: &EngineStateSnapshot) -> Result<EncodedSnapshotRow, EngineError> {
+    Ok(EncodedSnapshotRow {
+        sequence_id: seq_as_i64(snapshot.sequence_id),
+        timestamp: snapshot.snapshot_at.to_rfc3339(),
+        schema_version: PERSISTED_SCHEMA_VERSION,
+        payload: encode_snapshot(snapshot)?,
+    })
+}
+
+fn persist_rows(
+    conn: &Connection,
+    events: &[EncodedEventRow],
+    snapshot: Option<&EncodedSnapshotRow>,
+) -> Result<(), EngineError> {
+    if events.is_empty() && snapshot.is_none() {
+        return Ok(());
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| EngineError::Journal(format!("begin transaction: {e}")))?;
+
+    for (sequence_id, timestamp, kind, schema_version, payload) in events {
+        tx.execute(
+            "INSERT OR IGNORE INTO events (sequence_id, timestamp, event_kind, schema_version, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![sequence_id, timestamp, kind, schema_version, payload],
+        )
+        .map_err(|e| EngineError::Journal(format!("batch insert at seq:{sequence_id}: {e}")))?;
+    }
+
+    if let Some(snapshot) = snapshot {
+        tx.execute(
+            "INSERT OR REPLACE INTO snapshots (sequence_id, timestamp, schema_version, state) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                snapshot.sequence_id,
+                snapshot.timestamp,
+                snapshot.schema_version,
+                snapshot.payload
+            ],
+        )
+        .map_err(|e| {
+            EngineError::Journal(format!(
+                "save_snapshot at seq:{}: {e}",
+                snapshot.sequence_id
+            ))
+        })?;
+        tx.execute(
+            "DELETE FROM snapshots WHERE sequence_id < ?1",
+            params![snapshot.sequence_id],
+        )
+        .map_err(|e| {
+            EngineError::Journal(format!(
+                "prune old snapshots at seq:{}: {e}",
+                snapshot.sequence_id
+            ))
+        })?;
+    }
+
+    tx.commit()
+        .map_err(|e| EngineError::Journal(format!("commit transaction: {e}")))?;
+
+    if snapshot.is_some() {
+        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
+            error!("wal_checkpoint after snapshot failed (non-fatal): {e}");
+        }
+    }
+
+    Ok(())
+}
+
 // ─── EventJournal impl ───────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
@@ -180,68 +320,33 @@ impl EventJournal for SqliteJournal {
         &self,
         event: &SequencedEvent<EngineEvent>,
     ) -> std::result::Result<(), EngineError> {
-        let payload = encode_event(event)?;
-        let seq = seq_as_i64(event.sequence_id);
-        let ts = event.timestamp.to_rfc3339();
-        let kind = event_kind(&event.event);
-        let conn = self.conn.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let guard = conn
-                .lock()
-                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
-            guard
-                .execute(
-                    "INSERT OR IGNORE INTO events (sequence_id, timestamp, event_kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                    params![seq, ts, kind, payload],
-                )
-                .map_err(|e| EngineError::Journal(format!("append failed at seq:{seq}: {e}")))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| EngineError::Journal(format!("spawn_blocking panic: {e}")))?
+        self.persist_commit(slice::from_ref(event), None).await
     }
 
     async fn append_batch(
         &self,
         events: &[SequencedEvent<EngineEvent>],
     ) -> std::result::Result<(), EngineError> {
-        if events.is_empty() {
-            return Ok(());
-        }
+        self.persist_commit(events, None).await
+    }
 
-        // Encode before entering the blocking section.
+    async fn persist_commit(
+        &self,
+        events: &[SequencedEvent<EngineEvent>],
+        snapshot: Option<&EngineStateSnapshot>,
+    ) -> std::result::Result<(), EngineError> {
         let rows = events
             .iter()
-            .map(|ev| {
-                let payload = encode_event(ev)?;
-                let seq = seq_as_i64(ev.sequence_id);
-                let ts = ev.timestamp.to_rfc3339();
-                let kind = event_kind(&ev.event);
-                Ok((seq, ts, kind, payload))
-            })
+            .map(encode_event_row)
             .collect::<Result<Vec<_>, EngineError>>()?;
-
+        let snapshot_row = snapshot.map(encode_snapshot_row).transpose()?;
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
             let guard = conn
                 .lock()
                 .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
-            // Single transaction for the whole batch.
-            let tx = guard
-                .unchecked_transaction()
-                .map_err(|e| EngineError::Journal(format!("begin transaction: {e}")))?;
-            for (seq, ref ts, kind, ref payload) in &rows {
-                tx.execute(
-                    "INSERT OR IGNORE INTO events (sequence_id, timestamp, event_kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                    params![seq, ts, kind, payload],
-                )
-                .map_err(|e| EngineError::Journal(format!("batch insert at seq:{seq}: {e}")))?;
-            }
-            tx.commit()
-                .map_err(|e| EngineError::Journal(format!("commit batch: {e}")))?;
-            Ok(())
+            persist_rows(&guard, &rows, snapshot_row.as_ref())
         })
         .await
         .map_err(|e| EngineError::Journal(format!("spawn_blocking panic: {e}")))?
@@ -260,16 +365,25 @@ impl EventJournal for SqliteJournal {
                 .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             let mut stmt = guard
                 .prepare(
-                    "SELECT payload FROM events WHERE sequence_id >= ?1 ORDER BY sequence_id ASC",
+                    "SELECT sequence_id, schema_version, payload FROM events WHERE sequence_id >= ?1 ORDER BY sequence_id ASC",
                 )
                 .map_err(|e| EngineError::Journal(format!("prepare replay_from: {e}")))?;
 
             let events = stmt
-                .query_map(params![from_id], |row| row.get::<_, Vec<u8>>(0))
+                .query_map(params![from_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
                 .map_err(|e| EngineError::Journal(format!("query replay_from: {e}")))?
                 .map(|r| {
                     r.map_err(|e| EngineError::Journal(format!("row error: {e}")))
-                        .and_then(|bytes| decode_event(&bytes))
+                        .and_then(|(sequence_id, schema_version, bytes)| {
+                            ensure_supported_schema_version("event", schema_version, sequence_id)?;
+                            decode_event(&bytes)
+                        })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -294,16 +408,25 @@ impl EventJournal for SqliteJournal {
                 .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             let mut stmt = guard
                 .prepare(
-                    "SELECT payload FROM events WHERE sequence_id >= ?1 AND sequence_id <= ?2 ORDER BY sequence_id ASC",
+                    "SELECT sequence_id, schema_version, payload FROM events WHERE sequence_id >= ?1 AND sequence_id <= ?2 ORDER BY sequence_id ASC",
                 )
                 .map_err(|e| EngineError::Journal(format!("prepare replay_range: {e}")))?;
 
             let events = stmt
-                .query_map(params![from_id, to_id], |row| row.get::<_, Vec<u8>>(0))
+                .query_map(params![from_id, to_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
                 .map_err(|e| EngineError::Journal(format!("query replay_range: {e}")))?
                 .map(|r| {
                     r.map_err(|e| EngineError::Journal(format!("row error: {e}")))
-                        .and_then(|bytes| decode_event(&bytes))
+                        .and_then(|(sequence_id, schema_version, bytes)| {
+                            ensure_supported_schema_version("event", schema_version, sequence_id)?;
+                            decode_event(&bytes)
+                        })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -318,47 +441,8 @@ impl EventJournal for SqliteJournal {
         sequence_id: SequenceId,
         snapshot: &EngineStateSnapshot,
     ) -> std::result::Result<(), EngineError> {
-        let payload = encode_snapshot(snapshot)?;
-        let seq = seq_as_i64(sequence_id);
-        let ts = snapshot.snapshot_at.to_rfc3339();
-        let conn = self.conn.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let guard = conn
-                .lock()
-                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
-
-            // Single transaction: insert new snapshot, prune all older ones.
-            // Without pruning the snapshots table grows without bound — the
-            // primary key is sequence_id (different each call), so every write
-            // is a new row, not a replacement of the previous one.
-            let tx = guard
-                .unchecked_transaction()
-                .map_err(|e| EngineError::Journal(format!("begin snapshot transaction: {e}")))?;
-            tx.execute(
-                "INSERT OR REPLACE INTO snapshots (sequence_id, timestamp, state) VALUES (?1, ?2, ?3)",
-                params![seq, ts, payload],
-            )
-            .map_err(|e| EngineError::Journal(format!("save_snapshot at seq:{seq}: {e}")))?;
-            tx.execute(
-                "DELETE FROM snapshots WHERE sequence_id < ?1",
-                params![seq],
-            )
-            .map_err(|e| {
-                EngineError::Journal(format!("prune old snapshots at seq:{seq}: {e}"))
-            })?;
-            tx.commit()
-                .map_err(|e| EngineError::Journal(format!("commit snapshot: {e}")))?;
-
-            // Compact WAL after snapshot so it doesn't grow unboundedly.
-            if let Err(e) = guard.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
-                error!("wal_checkpoint after snapshot failed (non-fatal): {e}");
-            }
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| EngineError::Journal(format!("spawn_blocking panic: {e}")))?
+        debug_assert_eq!(snapshot.sequence_id, sequence_id);
+        self.persist_commit(&[], Some(snapshot)).await
     }
 
     async fn load_latest_snapshot(
@@ -372,12 +456,13 @@ impl EventJournal for SqliteJournal {
                 .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             let result = guard
                 .query_row(
-                    "SELECT sequence_id, state FROM snapshots ORDER BY sequence_id DESC LIMIT 1",
+                    "SELECT sequence_id, schema_version, state FROM snapshots ORDER BY sequence_id DESC LIMIT 1",
                     [],
                     |row| {
                         let seq: i64 = row.get(0)?;
-                        let bytes: Vec<u8> = row.get(1)?;
-                        Ok((seq, bytes))
+                        let schema_version: i64 = row.get(1)?;
+                        let bytes: Vec<u8> = row.get(2)?;
+                        Ok((seq, schema_version, bytes))
                     },
                 )
                 .optional()
@@ -385,7 +470,8 @@ impl EventJournal for SqliteJournal {
 
             match result {
                 None => Ok(None),
-                Some((seq, bytes)) => {
+                Some((seq, schema_version, bytes)) => {
+                    ensure_supported_schema_version("snapshot", schema_version, seq)?;
                     let snapshot = decode_snapshot(&bytes)?;
                     Ok(Some((SequenceId(seq as u64), snapshot)))
                 }
@@ -421,6 +507,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
     use std::collections::HashMap;
+    use std::path::Path;
     use types::{
         AgentId, AgentStatus, FirmBook, FirmRiskLimits, InstrumentId, OrderId,
         PredictionExposureSummary, PredictionMarketLimits, RiskLimits,
@@ -693,6 +780,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_replay_rejects_unknown_event_schema_version() {
+        let journal = SqliteJournal::in_memory().expect("open journal");
+        journal.append(&sample_event(7)).await.expect("append");
+
+        {
+            let conn = journal.conn.lock().expect("journal lock");
+            conn.execute(
+                "UPDATE events SET schema_version = 99 WHERE sequence_id = 7",
+                [],
+            )
+            .expect("poison event schema version");
+        }
+
+        let err = journal
+            .replay_from(SequenceId::ZERO)
+            .await
+            .expect_err("version mismatch must fail");
+        assert!(err
+            .to_string()
+            .contains("unsupported event schema_version 99"));
+    }
+
+    #[tokio::test]
+    async fn test_load_snapshot_rejects_unknown_schema_version() {
+        let journal = SqliteJournal::in_memory().expect("open journal");
+        journal
+            .save_snapshot(SequenceId(42), &minimal_snapshot(42))
+            .await
+            .expect("save snapshot");
+
+        {
+            let conn = journal.conn.lock().expect("journal lock");
+            conn.execute(
+                "UPDATE snapshots SET schema_version = 99 WHERE sequence_id = 42",
+                [],
+            )
+            .expect("poison snapshot schema version");
+        }
+
+        let err = journal
+            .load_latest_snapshot()
+            .await
+            .expect_err("version mismatch must fail");
+        assert!(err
+            .to_string()
+            .contains("unsupported snapshot schema_version 99"));
+    }
+
+    #[tokio::test]
+    async fn test_open_migrates_pre_versioned_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("legacy-journal.db");
+        seed_legacy_schema(&db_path);
+
+        let journal = SqliteJournal::open(&db_path).expect("open migrated journal");
+        let snapshot = journal
+            .load_latest_snapshot()
+            .await
+            .expect("load migrated snapshot")
+            .expect("snapshot present");
+        assert_eq!(snapshot.0, SequenceId(11));
+
+        let events = journal
+            .replay_from(SequenceId::ZERO)
+            .await
+            .expect("replay migrated events");
+        assert_eq!(events.len(), 1);
+
+        let conn = journal.conn.lock().expect("journal lock");
+        assert!(table_has_schema_version(&conn, "events"));
+        assert!(table_has_schema_version(&conn, "snapshots"));
+    }
+
     // ── Snapshot pruning (only the latest row survives) ──────────────────────
 
     #[tokio::test]
@@ -780,5 +941,58 @@ mod tests {
             let kind = event_kind(ev);
             assert!(!kind.is_empty());
         }
+    }
+
+    fn seed_legacy_schema(path: &Path) {
+        let conn = Connection::open(path).expect("open legacy db");
+        conn.execute_batch(
+            "
+            CREATE TABLE events (
+                sequence_id INTEGER PRIMARY KEY,
+                timestamp   TEXT    NOT NULL,
+                event_kind  TEXT    NOT NULL,
+                payload     BLOB    NOT NULL
+            );
+            CREATE TABLE snapshots (
+                sequence_id INTEGER PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                state       BLOB NOT NULL
+            );
+            ",
+        )
+        .expect("create legacy schema");
+
+        let event = sample_event(3);
+        let snapshot = minimal_snapshot(11);
+        conn.execute(
+            "INSERT INTO events (sequence_id, timestamp, event_kind, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                seq_as_i64(event.sequence_id),
+                event.timestamp.to_rfc3339(),
+                event_kind(&event.event),
+                encode_event(&event).expect("encode event"),
+            ],
+        )
+        .expect("insert legacy event");
+        conn.execute(
+            "INSERT INTO snapshots (sequence_id, timestamp, state) VALUES (?1, ?2, ?3)",
+            params![
+                seq_as_i64(snapshot.sequence_id),
+                snapshot.snapshot_at.to_rfc3339(),
+                encode_snapshot(&snapshot).expect("encode snapshot"),
+            ],
+        )
+        .expect("insert legacy snapshot");
+    }
+
+    fn table_has_schema_version(conn: &Connection, table: &str) -> bool {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut stmt = conn.prepare(&pragma).expect("prepare table_info");
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect columns");
+        columns.iter().any(|column| column == "schema_version")
     }
 }

@@ -1029,7 +1029,7 @@ pub enum EngineEvent {
 }
 ```
 
-**Startup recovery:** Load latest snapshot → replay all events after that snapshot's `SequenceId` → resume from current state. The `SequenceGenerator` resumes from the highest journaled sequence ID.
+**Startup recovery:** The journal format supports replay after a snapshot, but the current engine bootstrap still fails closed if it finds a journal tail beyond the latest persisted snapshot. Normal runtime commits persist events and snapshot metadata atomically, so an unexpected tail is treated as corruption or an incomplete/manual write, not a routine restart path. The `SequenceGenerator` resumes from the latest committed snapshot sequence.
 
 ---
 

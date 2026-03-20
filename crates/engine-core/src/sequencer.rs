@@ -182,34 +182,28 @@ where
                 let should_commit_metadata = outcome.state_mutated || !outcome.events.is_empty();
                 let committed_snapshot =
                     should_commit_metadata.then(|| self.snapshot_for_commit(sequence_id, now));
+                let events = outcome
+                    .events
+                    .into_iter()
+                    .map(|event| SequencedEvent {
+                        sequence_id,
+                        timestamp: now,
+                        event,
+                    })
+                    .collect::<Vec<_>>();
 
-                if !outcome.events.is_empty() {
-                    let events = outcome
-                        .events
-                        .into_iter()
-                        .map(|event| SequencedEvent {
-                            sequence_id,
-                            timestamp: now,
-                            event,
-                        })
-                        .collect::<Vec<_>>();
-
-                    self.journal.append_batch(&events).await.map_err(|err| {
-                        EngineError::Journal(format!(
-                            "failed to append sequencer events at {sequence_id}: {err}"
-                        ))
-                    })?;
-                }
-
-                if let Some(snapshot) = committed_snapshot {
+                if should_commit_metadata {
                     self.journal
-                        .save_snapshot(sequence_id, &snapshot)
+                        .persist_commit(&events, committed_snapshot.as_ref())
                         .await
                         .map_err(|err| {
                             EngineError::Journal(format!(
-                                "failed to persist sequencer snapshot at {sequence_id}: {err}"
+                                "failed to persist sequencer commit at {sequence_id}: {err}"
                             ))
                         })?;
+                }
+
+                if let Some(snapshot) = committed_snapshot {
                     self.update_metadata(sequence_id, now);
                     self.snapshot_cache = snapshot;
                 }

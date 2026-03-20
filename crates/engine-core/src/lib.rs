@@ -164,6 +164,26 @@ pub trait EventJournal: Send + Sync {
         events: &[SequencedEvent<EngineEvent>],
     ) -> std::result::Result<(), EngineError>;
 
+    /// Atomically persist a sequencer commit.
+    ///
+    /// Implementations that support snapshots should override this so event
+    /// rows and the snapshot row land in a single durable transaction.
+    async fn persist_commit(
+        &self,
+        events: &[SequencedEvent<EngineEvent>],
+        snapshot: Option<&EngineStateSnapshot>,
+    ) -> std::result::Result<(), EngineError> {
+        if !events.is_empty() {
+            self.append_batch(events).await?;
+        }
+
+        if let Some(snapshot) = snapshot {
+            self.save_snapshot(snapshot.sequence_id, snapshot).await?;
+        }
+
+        Ok(())
+    }
+
     /// Replay events from a sequence ID (inclusive).
     async fn replay_from(
         &self,
