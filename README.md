@@ -1,5 +1,7 @@
 # Feynman Capital — Execution Engine
 
+[![CI](https://github.com/investlink-ai/feynman-engine/actions/workflows/test.yml/badge.svg)](https://github.com/investlink-ai/feynman-engine/actions/workflows/test.yml)
+
 A unified execution engine and message bus for multi-agent autonomous trading on crypto, stocks, options, and prediction markets.
 
 ## Quick Start
