@@ -10,7 +10,7 @@ git clone https://github.com/feynman-capital/feynman-engine.git
 cd feynman-engine
 
 # Verify Rust toolchain
-rustc --version  # 1.82+
+rustc --version  # 1.83+
 cargo --version
 
 # Build
@@ -152,20 +152,23 @@ cargo fmt --check
 ### Docker
 
 ```bash
-# Development (paper trading)
-docker compose up -d
+# End-to-end smoke check
+./scripts/smoke-test.sh
+
+# Manual bring-up
+docker compose -f docker/docker-compose.yml up -d
 
 # View logs
-docker compose logs -f engine
+docker compose -f docker/docker-compose.yml logs -f engine
 
-# Health check
-docker compose exec engine grpc_health_probe -addr=:50051
+# Health check from host
+grpc_health_probe -addr=localhost:50051
 
 # Stop
-docker compose down
+docker compose -f docker/docker-compose.yml down -v
 
 # Backtest
-docker compose -f docker-compose.yml -f docker-compose.backtest.yml run backtest
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.backtest.yml run backtest
 ```
 
 ## Configuration
@@ -190,6 +193,8 @@ api_secret = "${BYBIT_API_SECRET}"
 ```
 
 Environment variable expansion is supported (e.g., `${HOME}`, `${BYBIT_API_KEY}`).
+The bootstrap path also honors runtime overrides for `FEYNMAN_MODE`/`ENGINE_MODE`,
+`ENGINE_DRY_RUN`, `ENGINE_GRPC_PORT`, and `REDIS_URL`.
 
 ## API Reference
 

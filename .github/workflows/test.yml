@@ -27,3 +27,6 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Run Docker smoke test
+        run: ./scripts/smoke-test.sh
