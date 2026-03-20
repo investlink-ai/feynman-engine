@@ -3295,7 +3295,7 @@ an urgent liquidation signal should not wait behind 50 queued orders from a slow
 ```rust
 pub struct Sequencer {
     // High-priority channel (fills, halt, reconciliation, urgent signals)
-    priority_rx: mpsc::Receiver<SequencerCommand>,  // capacity: 256
+    priority_rx: mpsc::Receiver<SequencerCommand>,  // capacity: 64
     // Normal-priority channel (new orders, signals, snapshots)
     command_rx: mpsc::Receiver<SequencerCommand>,    // capacity: 1024
     // ...
