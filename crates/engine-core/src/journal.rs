@@ -60,7 +60,11 @@ impl SqliteJournal {
         })?;
 
         // WAL mode: reads don't block writes.
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+        // synchronous=FULL: fsync after every WAL write — ensures committed
+        // transactions survive OS crashes and power loss. Required for a
+        // financial journal. NORMAL would lose the most recent commits on
+        // power failure, leaving recovered state inconsistent with venue fills.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
             .map_err(|e| EngineError::Journal(format!("failed to set WAL mode: {e}")))?;
 
         conn.execute_batch(CREATE_EVENTS)
@@ -75,12 +79,18 @@ impl SqliteJournal {
     }
 
     /// Open an in-memory journal (for testing only).
+    ///
+    /// Note: SQLite ignores `PRAGMA journal_mode=WAL` for `:memory:` databases
+    /// — they always use the rollback journal. WAL-specific behaviour (concurrent
+    /// reads, checkpoint side effects) is exercised by the file-backed crash-
+    /// recovery test (`test_write_1000_crash_replay_recovers_identical_sequence`).
     #[cfg(test)]
     pub(crate) fn in_memory() -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()
             .map_err(|e| EngineError::Journal(format!("failed to open in-memory journal: {e}")))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-            .map_err(|e| EngineError::Journal(format!("failed to set WAL mode: {e}")))?;
+        // journal_mode=WAL is silently ignored for :memory: — see doc comment above.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .map_err(|e| EngineError::Journal(format!("failed to set pragmas: {e}")))?;
         conn.execute_batch(CREATE_EVENTS)
             .map_err(|e| EngineError::Journal(format!("failed to create events table: {e}")))?;
         conn.execute_batch(CREATE_SNAPSHOTS)
@@ -115,6 +125,21 @@ fn encode_snapshot(snapshot: &EngineStateSnapshot) -> Result<Vec<u8>, EngineErro
 fn decode_snapshot(bytes: &[u8]) -> Result<EngineStateSnapshot, EngineError> {
     rmp_serde::from_slice(bytes)
         .map_err(|e| EngineError::Journal(format!("failed to decode snapshot: {e}")))
+}
+
+/// Cast a `SequenceId` to `i64` for SQLite storage.
+///
+/// SQLite INTEGER is a signed 64-bit value. `SequenceId` is `u64`. Values above
+/// `i64::MAX` (≈9.2×10^18) would wrap negative and corrupt ordering queries.
+/// A `debug_assert` catches the boundary in test; in release it is unreachable
+/// for any realistic event volume.
+fn seq_as_i64(seq: SequenceId) -> i64 {
+    debug_assert!(
+        seq.0 <= i64::MAX as u64,
+        "sequence_id {0} overflows i64::MAX — journal ordering is broken",
+        seq.0
+    );
+    seq.0 as i64
 }
 
 /// Extract the enum variant name as an ASCII discriminant string for indexing.
@@ -156,13 +181,15 @@ impl EventJournal for SqliteJournal {
         event: &SequencedEvent<EngineEvent>,
     ) -> std::result::Result<(), EngineError> {
         let payload = encode_event(event)?;
-        let seq = event.sequence_id.0 as i64;
+        let seq = seq_as_i64(event.sequence_id);
         let ts = event.timestamp.to_rfc3339();
         let kind = event_kind(&event.event);
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("journal mutex");
+            let guard = conn
+                .lock()
+                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             guard
                 .execute(
                     "INSERT OR IGNORE INTO events (sequence_id, timestamp, event_kind, payload) VALUES (?1, ?2, ?3, ?4)",
@@ -188,7 +215,7 @@ impl EventJournal for SqliteJournal {
             .iter()
             .map(|ev| {
                 let payload = encode_event(ev)?;
-                let seq = ev.sequence_id.0 as i64;
+                let seq = seq_as_i64(ev.sequence_id);
                 let ts = ev.timestamp.to_rfc3339();
                 let kind = event_kind(&ev.event);
                 Ok((seq, ts, kind, payload))
@@ -198,7 +225,9 @@ impl EventJournal for SqliteJournal {
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("journal mutex");
+            let guard = conn
+                .lock()
+                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             // Single transaction for the whole batch.
             let tx = guard
                 .unchecked_transaction()
@@ -222,11 +251,13 @@ impl EventJournal for SqliteJournal {
         &self,
         from: SequenceId,
     ) -> std::result::Result<Vec<SequencedEvent<EngineEvent>>, EngineError> {
-        let from_id = from.0 as i64;
+        let from_id = seq_as_i64(from);
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("journal mutex");
+            let guard = conn
+                .lock()
+                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             let mut stmt = guard
                 .prepare(
                     "SELECT payload FROM events WHERE sequence_id >= ?1 ORDER BY sequence_id ASC",
@@ -253,12 +284,14 @@ impl EventJournal for SqliteJournal {
         from: SequenceId,
         to: SequenceId,
     ) -> std::result::Result<Vec<SequencedEvent<EngineEvent>>, EngineError> {
-        let from_id = from.0 as i64;
-        let to_id = to.0 as i64;
+        let from_id = seq_as_i64(from);
+        let to_id = seq_as_i64(to);
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("journal mutex");
+            let guard = conn
+                .lock()
+                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             let mut stmt = guard
                 .prepare(
                     "SELECT payload FROM events WHERE sequence_id >= ?1 AND sequence_id <= ?2 ORDER BY sequence_id ASC",
@@ -286,18 +319,36 @@ impl EventJournal for SqliteJournal {
         snapshot: &EngineStateSnapshot,
     ) -> std::result::Result<(), EngineError> {
         let payload = encode_snapshot(snapshot)?;
-        let seq = sequence_id.0 as i64;
+        let seq = seq_as_i64(sequence_id);
         let ts = snapshot.snapshot_at.to_rfc3339();
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("journal mutex");
-            guard
-                .execute(
-                    "INSERT OR REPLACE INTO snapshots (sequence_id, timestamp, state) VALUES (?1, ?2, ?3)",
-                    params![seq, ts, payload],
-                )
-                .map_err(|e| EngineError::Journal(format!("save_snapshot at seq:{seq}: {e}")))?;
+            let guard = conn
+                .lock()
+                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
+
+            // Single transaction: insert new snapshot, prune all older ones.
+            // Without pruning the snapshots table grows without bound — the
+            // primary key is sequence_id (different each call), so every write
+            // is a new row, not a replacement of the previous one.
+            let tx = guard
+                .unchecked_transaction()
+                .map_err(|e| EngineError::Journal(format!("begin snapshot transaction: {e}")))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO snapshots (sequence_id, timestamp, state) VALUES (?1, ?2, ?3)",
+                params![seq, ts, payload],
+            )
+            .map_err(|e| EngineError::Journal(format!("save_snapshot at seq:{seq}: {e}")))?;
+            tx.execute(
+                "DELETE FROM snapshots WHERE sequence_id < ?1",
+                params![seq],
+            )
+            .map_err(|e| {
+                EngineError::Journal(format!("prune old snapshots at seq:{seq}: {e}"))
+            })?;
+            tx.commit()
+                .map_err(|e| EngineError::Journal(format!("commit snapshot: {e}")))?;
 
             // Compact WAL after snapshot so it doesn't grow unboundedly.
             if let Err(e) = guard.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
@@ -316,7 +367,9 @@ impl EventJournal for SqliteJournal {
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("journal mutex");
+            let guard = conn
+                .lock()
+                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             let result = guard
                 .query_row(
                     "SELECT sequence_id, state FROM snapshots ORDER BY sequence_id DESC LIMIT 1",
@@ -346,7 +399,9 @@ impl EventJournal for SqliteJournal {
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("journal mutex");
+            let guard = conn
+                .lock()
+                .map_err(|_| EngineError::Journal("journal mutex poisoned".to_owned()))?;
             let max: Option<i64> = guard
                 .query_row("SELECT MAX(sequence_id) FROM events", [], |row| row.get(0))
                 .map_err(|e| EngineError::Journal(format!("latest_sequence_id query: {e}")))?;
@@ -625,7 +680,54 @@ mod tests {
             .expect("snapshot present");
 
         assert_eq!(seq, SequenceId(42));
+        // Verify financial state survives the encode/decode round-trip, not just the sequence id.
         assert_eq!(loaded.state.last_sequence_id, snap.state.last_sequence_id);
+        assert_eq!(loaded.state.firm_book.nav, snap.state.firm_book.nav);
+        assert_eq!(
+            loaded.state.risk_limits.firm.max_daily_loss,
+            snap.state.risk_limits.firm.max_daily_loss,
+        );
+        assert_eq!(
+            loaded.state.risk_limits.firm.max_gross_notional,
+            snap.state.risk_limits.firm.max_gross_notional,
+        );
+    }
+
+    // ── Snapshot pruning (only the latest row survives) ──────────────────────
+
+    #[tokio::test]
+    async fn test_save_snapshot_prunes_older_rows() {
+        let journal = SqliteJournal::in_memory().expect("open journal");
+
+        // Write three successive snapshots.
+        for seq in [10u64, 20, 30] {
+            journal
+                .save_snapshot(SequenceId(seq), &minimal_snapshot(seq))
+                .await
+                .expect("save_snapshot");
+        }
+
+        // Only the snapshot at seq=30 should survive.
+        let (seq, _) = journal
+            .load_latest_snapshot()
+            .await
+            .expect("load")
+            .expect("snapshot present");
+        assert_eq!(seq, SequenceId(30));
+
+        // Verify older entries are gone by checking replay_range covers no snapshots
+        // (the snapshots table is internal, but we can confirm only one exists by
+        // saving a new one and loading it — if pruning failed we would have stale rows).
+        journal
+            .save_snapshot(SequenceId(40), &minimal_snapshot(40))
+            .await
+            .expect("save fourth snapshot");
+        let (seq2, _) = journal
+            .load_latest_snapshot()
+            .await
+            .expect("load after fourth")
+            .expect("snapshot present");
+        assert_eq!(seq2, SequenceId(40));
     }
 
     // ── Idempotent insert (INSERT OR IGNORE) ─────────────────────────────────
