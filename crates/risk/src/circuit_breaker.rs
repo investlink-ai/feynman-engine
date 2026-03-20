@@ -468,9 +468,20 @@ impl CircuitBreaker for Cb9VenueDisconnected {
                 )
             }
         };
-        // Use max(0) so a future heartbeat timestamp (clock skew) reads as 0s elapsed (not
-        // a giant u64 from unsigned_abs). Future timestamps always pass CB-9.
-        let elapsed_secs = (ctx.clock.now() - last_hb).num_seconds().max(0) as u64;
+        // Fail closed on future timestamps: if last_hb is ahead of the engine clock, the
+        // heartbeat record is untrustworthy (clock skew, replay bug, or tampered state).
+        // Passing silently would keep CB-9 open indefinitely while the clock catches up.
+        let elapsed = ctx.clock.now() - last_hb;
+        if elapsed.num_seconds() < 0 {
+            return reject(
+                "CB-9",
+                format!(
+                    "venue {venue_id} heartbeat timestamp is {:.1}s in the future — clock skew detected",
+                    elapsed.num_seconds().unsigned_abs()
+                ),
+            );
+        }
+        let elapsed_secs = elapsed.num_seconds() as u64;
         if elapsed_secs > ctx.config.max_venue_disconnect_secs {
             return reject(
                 "CB-9",
@@ -743,16 +754,22 @@ impl CircuitBreakerBank {
             return r;
         }
 
-        // 8–12: per-order checks (require an order in context)
-        let r = self.cb1.check(ctx);
-        if r != CircuitBreakerResult::Pass {
-            if let CircuitBreakerResult::Reject { ref reason, .. } = r {
-                warn!(
-                    breaker = "CB-1",
-                    reason, "order rejected by circuit breaker"
-                );
+        // 8–12: per-order checks (require an order in context).
+        // CB-1 (per-order notional cap) is skipped for ReduceOnly: a flatten order whose
+        // notional exceeds the single-order cap must not be blocked — the engine would be
+        // stuck holding risk during a halt. The position-size breach that triggered the
+        // flatten is already captured by CB-3/4/5 latch logic.
+        if !is_reduce_only {
+            let r = self.cb1.check(ctx);
+            if r != CircuitBreakerResult::Pass {
+                if let CircuitBreakerResult::Reject { ref reason, .. } = r {
+                    warn!(
+                        breaker = "CB-1",
+                        reason, "order rejected by circuit breaker"
+                    );
+                }
+                return r;
             }
-            return r;
         }
 
         let r = self.cb2.check(ctx);
@@ -1908,15 +1925,25 @@ mod tests {
         let config = test_config();
         let mut book = test_firm_book();
         book.daily_pnl = dec!(-50_001); // trips CB-4
-        let clock = SimulatedClock::at_epoch();
+                                        // Use WallClock so connected_venue_health()'s Utc::now() heartbeat is not in
+                                        // the future relative to the clock used by CB-9.
+        let wall_clock = types::WallClock;
         let order = test_order(dec!(1), dec!(100));
         let health = HashMap::from([(VenueId("bybit".into()), connected_venue_health())]);
         let stats: HashMap<VenueId, VenueErrorStats> = HashMap::new();
         let agent_orders: HashMap<AgentId, u32> = HashMap::new();
         let mut bank = CircuitBreakerBank::new();
 
-        // Trip and latch CB-4
-        let ctx = test_ctx(None, &book, &config, &clock, &health, &stats, &agent_orders);
+        // Trip and latch CB-4 (order=None bypasses CB-9)
+        let ctx = test_ctx(
+            None,
+            &book,
+            &config,
+            &wall_clock,
+            &health,
+            &stats,
+            &agent_orders,
+        );
         bank.check_all(&ctx);
         assert!(bank.is_halt_active());
 
@@ -1925,7 +1952,7 @@ mod tests {
             Some(&order),
             &book,
             &config,
-            &clock,
+            &wall_clock,
             &health,
             &stats,
             &agent_orders,
@@ -1935,6 +1962,99 @@ mod tests {
             bank.check_all(&reduce_ctx),
             CircuitBreakerResult::Pass,
             "ReduceOnly must bypass latched CB-4 halt"
+        );
+    }
+
+    // ── CB-9: future heartbeat rejects ───────────────────────────────────────
+
+    #[test]
+    fn cb9_future_heartbeat_rejects() {
+        let config = test_config();
+        let book = test_firm_book();
+        let order = test_order(dec!(1), dec!(100));
+        // Clock is at epoch; heartbeat is 30s later — future relative to the engine clock.
+        let clock = SimulatedClock::at_epoch();
+        let clock_now: &dyn types::Clock = &clock;
+        let mut health_record = VenueConnectionHealth::new(VenueId("bybit".into()));
+        health_record.state = types::ConnectionState::Connected;
+        health_record.last_heartbeat_at = Some(clock_now.now() + chrono::Duration::seconds(30));
+        let health = HashMap::from([(VenueId("bybit".into()), health_record)]);
+        let stats: HashMap<VenueId, VenueErrorStats> = HashMap::new();
+        let agent_orders: HashMap<AgentId, u32> = HashMap::new();
+        let ctx = test_ctx(
+            Some(&order),
+            &book,
+            &config,
+            &clock,
+            &health,
+            &stats,
+            &agent_orders,
+        );
+        let cb = Cb9VenueDisconnected;
+        assert!(
+            matches!(
+                cb.check(&ctx),
+                CircuitBreakerResult::Reject {
+                    breaker: "CB-9",
+                    ..
+                }
+            ),
+            "future heartbeat timestamp must be rejected (fail closed)"
+        );
+    }
+
+    // ── CB-1 skipped for ReduceOnly ───────────────────────────────────────────
+
+    #[test]
+    fn reduce_only_skips_cb1_notional_cap() {
+        // Order notional = 200_000, well above the 100_000 CB-1 cap.
+        // A NewOrder is rejected; a ReduceOnly must pass CB-1 via check_all.
+        let config = test_config(); // max_single_order_notional = 100_000
+        let book = test_firm_book();
+        // WallClock so connected_venue_health()'s Utc::now() heartbeat is not in the future.
+        let wall_clock = types::WallClock;
+        let order = test_order(dec!(1), dec!(200_000)); // notional = 200_000 > 100_000
+        let health = HashMap::from([(VenueId("bybit".into()), connected_venue_health())]);
+        let stats: HashMap<VenueId, VenueErrorStats> = HashMap::new();
+        let agent_orders: HashMap<AgentId, u32> = HashMap::new();
+
+        // Sanity: CB-1 alone rejects this order
+        let ctx = test_ctx(
+            Some(&order),
+            &book,
+            &config,
+            &wall_clock,
+            &health,
+            &stats,
+            &agent_orders,
+        );
+        assert!(
+            matches!(
+                Cb1MaxSingleOrderNotional.check(&ctx),
+                CircuitBreakerResult::Reject {
+                    breaker: "CB-1",
+                    ..
+                }
+            ),
+            "sanity: CB-1 must reject 200_000 notional order"
+        );
+
+        // check_all with ReduceOnly must pass (CB-1 skipped)
+        let mut bank = CircuitBreakerBank::new();
+        let mut reduce_ctx = test_ctx(
+            Some(&order),
+            &book,
+            &config,
+            &wall_clock,
+            &health,
+            &stats,
+            &agent_orders,
+        );
+        reduce_ctx.operation_kind = crate::OperationKind::ReduceOnly;
+        assert_eq!(
+            bank.check_all(&reduce_ctx),
+            CircuitBreakerResult::Pass,
+            "ReduceOnly must skip CB-1 notional cap in check_all"
         );
     }
 
