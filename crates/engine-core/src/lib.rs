@@ -10,12 +10,22 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 
+mod sequencer;
+
+#[cfg(test)]
+mod sequencer_tests;
+
 // Re-export commonly used types.
 pub use types::{
-    AgentAllocation, AgentId, AgentRiskLimits, AgentStatus, ClientOrderId, Clock, EngineEvent,
-    Fill, FirmBook, InstrumentId, OrderCore, OrderId, OrderState, PipelineOrder,
-    ReconciliationReport, RiskApprovalStamp, RiskCheckResult, RiskLimits, RiskViolation,
-    RoutingAssignment, SequenceId, SequencedEvent, Signal, Validated, VenueId,
+    AgentAllocation, AgentId, AgentRiskLimits, AgentStatus, ClientOrderId, ClientOrderIdGenerator,
+    Clock, EngineEvent, Fill, FirmBook, InstrumentId, OrderCore, OrderId, OrderState,
+    PipelineOrder, PriceSource, ReconciliationAction, ReconciliationReport, RiskApprovalStamp,
+    RiskCheckResult, RiskLimits, RiskViolation, RoutingAssignment, SequenceId, SequencedEvent,
+    Signal, SignalId, TrackedPosition, Validated, VenueId,
+};
+
+pub use sequencer::{
+    Sequencer, SequencerHandle, COMMAND_CHANNEL_CAPACITY, HIGH_PRIORITY_CHANNEL_CAPACITY,
 };
 
 /// Result type for engine operations.
@@ -51,11 +61,12 @@ pub enum EngineError {
     #[error("reconciliation error: {0}")]
     Reconciliation(String),
 
+    #[error("unsupported command: {command}")]
+    UnsupportedCommand { command: &'static str },
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
-
-// ─── Engine Core ───
 
 /// Synchronous decision logic and state mutations.
 ///
@@ -67,6 +78,25 @@ pub enum EngineError {
 pub trait EngineCore: Send {
     /// Current state snapshot (for reading without mutation).
     fn state(&self) -> &EngineState;
+
+    /// Mutable access to engine state. Only the Sequencer should call this.
+    fn state_mut(&mut self) -> &mut EngineState;
+
+    /// Restore state from the latest persisted snapshot during startup.
+    fn restore_snapshot(&mut self, snapshot: &EngineStateSnapshot) -> Result<()> {
+        *self.state_mut() = snapshot.state.clone();
+        Ok(())
+    }
+
+    /// Cheap clone for read-only consumers.
+    #[must_use]
+    fn snapshot(&self, sequence_id: SequenceId, snapshot_at: DateTime<Utc>) -> EngineStateSnapshot {
+        EngineStateSnapshot {
+            state: self.state().clone(),
+            sequence_id,
+            snapshot_at,
+        }
+    }
 
     /// Evaluate a validated order through circuit breaker and risk gate.
     ///
@@ -93,8 +123,7 @@ pub trait EngineCore: Send {
 
     /// Mark-to-market: update unrealized P&L from current prices.
     /// Called periodically by the Sequencer (e.g., every second).
-    fn mark_to_market(&mut self, prices: &dyn types::PriceSource, now: DateTime<Utc>)
-        -> Result<()>;
+    fn mark_to_market(&mut self, prices: &dyn PriceSource, now: DateTime<Utc>) -> Result<()>;
 
     /// Pause an agent (prevent new orders, allow fill processing).
     fn pause_agent(&mut self, agent: &AgentId, reason: String, now: DateTime<Utc>) -> Result<()>;
@@ -102,8 +131,8 @@ pub trait EngineCore: Send {
     /// Resume a paused agent.
     fn resume_agent(&mut self, agent: &AgentId, now: DateTime<Utc>) -> Result<()>;
 
-    /// Update risk limits (hot-reload).
-    fn update_risk_limits(&mut self, limits: RiskLimits) -> Result<()>;
+    /// Update per-agent risk limits (hot-reload).
+    fn adjust_limits(&mut self, agent: &AgentId, limits: AgentRiskLimits) -> Result<()>;
 
     /// Halt all trading (emergency response to loss breaker).
     fn halt_all(&mut self, reason: String, now: DateTime<Utc>) -> Result<()>;
@@ -112,20 +141,12 @@ pub trait EngineCore: Send {
     fn reset_circuit_breaker(&mut self, now: DateTime<Utc>) -> Result<()>;
 }
 
-// ─── Event Journal ───
-
 /// Append-only event log with snapshot support.
 ///
-/// Every event produced by the Sequencer is appended to the journal.
-/// State can be reconstructed by loading a snapshot and replaying events since.
-///
-/// Implementations:
-/// - Live/Paper: SQLite or file-backed WAL
-/// - Backtest: in-memory (or disabled for speed)
-///
-/// The journal is **not** on the hot path — the Sequencer processes commands first,
-/// then appends the resulting events. If the journal is slow, events buffer in memory
-/// (graceful degradation via `BufferAndContinue` policy).
+/// Every event produced by the Sequencer is appended to the journal as part of
+/// the commit path. Startup currently restores the latest persisted snapshot and
+/// fails closed if the journal contains an unapplied tail; applying replayed
+/// events back into `EngineCore` is not implemented yet.
 #[async_trait::async_trait]
 pub trait EventJournal: Send + Sync {
     /// Append a sequenced event to the journal.
@@ -141,7 +162,6 @@ pub trait EventJournal: Send + Sync {
     ) -> std::result::Result<(), EngineError>;
 
     /// Replay events from a sequence ID (inclusive).
-    /// Returns events in sequence order.
     async fn replay_from(
         &self,
         from: SequenceId,
@@ -155,7 +175,6 @@ pub trait EventJournal: Send + Sync {
     ) -> std::result::Result<Vec<SequencedEvent<EngineEvent>>, EngineError>;
 
     /// Save a state snapshot at the given sequence ID.
-    /// After this, `replay_from` only needs events after this point.
     async fn save_snapshot(
         &self,
         sequence_id: SequenceId,
@@ -171,19 +190,9 @@ pub trait EventJournal: Send + Sync {
     async fn latest_sequence_id(&self) -> std::result::Result<SequenceId, EngineError>;
 }
 
-// ─── Reconciler ───
-
 /// Queries venue state and produces reconciliation reports.
-///
-/// The Reconciler is an async task that runs on a timer (per venue).
-/// It sends `ReconciliationReport` to the Sequencer via `SequencerCommand::OnReconciliation`.
-///
-/// It does NOT mutate engine state directly — only the Sequencer does that.
 #[async_trait::async_trait]
 pub trait Reconciler: Send + Sync {
-    /// Run reconciliation for a single venue.
-    /// Queries venue for positions, orders, and balances, then compares
-    /// against the provided engine state snapshot.
     async fn reconcile(
         &self,
         venue_id: &VenueId,
@@ -191,83 +200,88 @@ pub trait Reconciler: Send + Sync {
     ) -> std::result::Result<ReconciliationReport, EngineError>;
 }
 
-// ─── Sequencer Command ───
-
 /// Commands sent TO the Sequencer from other tasks.
-///
-/// Every command is assigned a `SequenceId` by the Sequencer before processing.
-/// The Sequencer processes commands sequentially, one at a time.
-/// All mutations to business state happen inside command processing.
 #[derive(Debug)]
 pub enum SequencerCommand {
-    /// New order request (from gRPC handler, already validated).
     SubmitOrder {
         order: PipelineOrder<Validated>,
         respond: oneshot::Sender<Result<OrderAck>>,
     },
-
-    /// New signal from LLM agent (needs sizing before risk check).
+    /// Placeholder for future signal ingress. The current sequencer returns
+    /// `EngineError::UnsupportedCommand` for this variant.
     SubmitSignal {
         signal: Signal,
         respond: oneshot::Sender<Result<SignalAck>>,
     },
-
-    /// Fill received from venue adapter.
-    OnFill { fill: Fill },
-
-    /// Reconciliation report from Reconciler task.
-    OnReconciliation { report: ReconciliationReport },
-
-    /// Mark-to-market tick (periodic, e.g., every 1s).
+    OnFill {
+        fill: Fill,
+    },
+    OnReconciliation {
+        report: ReconciliationReport,
+    },
     MarkToMarket,
-
-    /// Risk limit change (from Taleb L2 or Feynman L3).
     AdjustLimits {
         agent: AgentId,
         limits: AgentRiskLimits,
         respond: oneshot::Sender<Result<()>>,
     },
-
-    /// Pause an agent.
-    PauseAgent { agent: AgentId, reason: String },
-
-    /// Resume a paused agent.
-    ResumeAgent { agent: AgentId },
-
-    /// Emergency halt (circuit breaker triggered or manual).
-    HaltAll { reason: String },
-
-    /// Reset circuit breaker after investigation.
-    ResetCircuitBreaker,
-
-    /// Request a read-only snapshot of engine state.
+    PauseAgent {
+        agent: AgentId,
+        reason: String,
+    },
+    ResumeAgent {
+        agent: AgentId,
+    },
+    HaltAll {
+        reason: String,
+    },
+    ResetCircuitBreaker {
+        breaker_id: String,
+    },
     Snapshot {
         respond: oneshot::Sender<EngineStateSnapshot>,
     },
-
-    /// Graceful shutdown signal.
-    Shutdown,
+    Shutdown {
+        respond: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    PoisonPill,
 }
 
-// ─── Sequence Number Generator ───
+impl SequencerCommand {
+    #[must_use]
+    pub fn is_high_priority(&self) -> bool {
+        match self {
+            Self::OnFill { .. }
+            | Self::OnReconciliation { .. }
+            | Self::HaltAll { .. }
+            | Self::ResetCircuitBreaker { .. }
+            | Self::Shutdown { .. } => true,
+            #[cfg(test)]
+            Self::PoisonPill => true,
+            Self::SubmitOrder { .. }
+            | Self::SubmitSignal { .. }
+            | Self::MarkToMarket
+            | Self::AdjustLimits { .. }
+            | Self::PauseAgent { .. }
+            | Self::ResumeAgent { .. }
+            | Self::Snapshot { .. } => false,
+        }
+    }
+}
 
 /// Monotonic sequence number generator owned by the Sequencer.
-///
-/// Every command is assigned a sequence ID before processing.
-/// This provides total ordering across all engine events.
 #[derive(Debug)]
 pub struct SequenceGenerator {
     next: SequenceId,
 }
 
 impl SequenceGenerator {
-    /// Start from a given sequence ID (e.g., after loading from journal).
     #[must_use]
     pub fn new(start_from: SequenceId) -> Self {
         Self { next: start_from }
     }
 
-    /// Start from zero.
     #[must_use]
     pub fn from_zero() -> Self {
         Self {
@@ -275,49 +289,33 @@ impl SequenceGenerator {
         }
     }
 
-    /// Get next sequence ID and advance the counter.
     pub fn next_id(&mut self) -> SequenceId {
         let current = self.next;
         self.next = SequenceId(self.next.0 + 1);
         current
     }
 
-    /// Current value (the next ID that will be assigned).
     #[must_use]
     pub fn current(&self) -> SequenceId {
         self.next
     }
 }
 
-// ─── State types ───
-
 /// Current state of the engine (positions, P&L, risk utilization).
 #[derive(Debug, Clone)]
 pub struct EngineState {
     pub orders: HashMap<OrderId, OrderRecord>,
+    pub positions: HashMap<(AgentId, VenueId, InstrumentId), TrackedPosition>,
+    pub pending_signals: HashMap<SignalId, Signal>,
     pub firm_book: FirmBook,
     pub agent_allocations: HashMap<AgentId, AgentAllocation>,
     pub risk_limits: RiskLimits,
-    pub agent_statuses: HashMap<AgentId, AgentStatusEntry>,
-    /// Idempotency cache: prevents duplicate order submission on retry.
-    /// Keyed by `ClientOrderId` — if a submission with the same client ID
-    /// arrives, the cached ack is returned without re-processing.
+    pub agent_statuses: HashMap<AgentId, AgentStatus>,
     pub idempotency_cache: HashMap<ClientOrderId, OrderAck>,
-    /// Last sequence ID processed.
     pub last_sequence_id: SequenceId,
-    /// Timestamp of last processed command (from Clock).
     pub last_updated: DateTime<Utc>,
 }
 
-/// Agent status as tracked by the engine.
-#[derive(Debug, Clone)]
-pub struct AgentStatusEntry {
-    pub is_active: bool,
-    pub paused_reason: Option<String>,
-    pub paused_at: Option<DateTime<Utc>>,
-}
-
-/// Acknowledgment for SubmitOrder.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct OrderAck {
@@ -326,7 +324,6 @@ pub struct OrderAck {
     pub accepted_at: DateTime<Utc>,
 }
 
-/// Acknowledgment for SubmitSignal.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct SignalAck {
@@ -336,8 +333,6 @@ pub struct SignalAck {
     pub accepted_at: DateTime<Utc>,
 }
 
-/// Immutable, cloneable snapshot of engine state.
-/// Stale by design — consumers accept eventual consistency for reads.
 #[derive(Debug, Clone)]
 pub struct EngineStateSnapshot {
     pub state: EngineState,
@@ -345,12 +340,6 @@ pub struct EngineStateSnapshot {
     pub snapshot_at: DateTime<Utc>,
 }
 
-// ─── Order record (post-pipeline, stored in EngineState) ───
-
-/// An order as stored in engine state after entering the pipeline.
-///
-/// Uses `OrderState` enum (not `String`) for type-safe exhaustive matching.
-/// The `OrderCore` is cloned from the `PipelineOrder` before it is consumed.
 #[derive(Debug, Clone)]
 pub struct OrderRecord {
     pub core: OrderCore,
@@ -361,9 +350,6 @@ pub struct OrderRecord {
     pub last_updated: DateTime<Utc>,
 }
 
-/// Approval from risk gate after successful evaluation.
-///
-/// Bridges the risk crate's evaluation result to the pipeline's `RiskApprovalStamp`.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct RiskApproval {
@@ -373,7 +359,6 @@ pub struct RiskApproval {
 }
 
 impl RiskApproval {
-    /// Convert to a `RiskApprovalStamp` for the pipeline transition.
     #[must_use]
     pub fn into_stamp(self) -> RiskApprovalStamp {
         RiskApprovalStamp {
@@ -381,55 +366,5 @@ impl RiskApproval {
             checks_performed: self.checks_performed,
             warnings: self.warnings,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sequence_generator() {
-        let mut gen = SequenceGenerator::from_zero();
-        assert_eq!(gen.next_id(), SequenceId(0));
-        assert_eq!(gen.next_id(), SequenceId(1));
-        assert_eq!(gen.next_id(), SequenceId(2));
-        assert_eq!(gen.current(), SequenceId(3));
-    }
-
-    #[test]
-    fn test_sequence_generator_resume() {
-        let mut gen = SequenceGenerator::new(SequenceId(1000));
-        assert_eq!(gen.next_id(), SequenceId(1000));
-        assert_eq!(gen.next_id(), SequenceId(1001));
-    }
-
-    #[test]
-    fn test_risk_approval_into_stamp() {
-        let approval = RiskApproval {
-            approved_at: Utc::now(),
-            checks_performed: vec![
-                RiskCheckResult {
-                    check_name: "CB-all".into(),
-                    passed: true,
-                    message: None,
-                },
-                RiskCheckResult {
-                    check_name: "RG-notional".into(),
-                    passed: true,
-                    message: None,
-                },
-            ],
-            warnings: vec![RiskViolation {
-                check_name: "near_limit".into(),
-                violation_type: types::ViolationType::Soft,
-                current_value: "0.89".into(),
-                limit: "0.90".into(),
-                suggested_action: "monitor".into(),
-            }],
-        };
-        let stamp = approval.into_stamp();
-        assert_eq!(stamp.checks_performed.len(), 2);
-        assert_eq!(stamp.warnings.len(), 1);
     }
 }

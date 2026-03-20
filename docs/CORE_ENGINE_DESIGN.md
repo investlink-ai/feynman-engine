@@ -3295,7 +3295,7 @@ an urgent liquidation signal should not wait behind 50 queued orders from a slow
 ```rust
 pub struct Sequencer {
     // High-priority channel (fills, halt, reconciliation, urgent signals)
-    priority_rx: mpsc::Receiver<SequencerCommand>,  // capacity: 256
+    priority_rx: mpsc::Receiver<SequencerCommand>,  // capacity: 64
     // Normal-priority channel (new orders, signals, snapshots)
     command_rx: mpsc::Receiver<SequencerCommand>,    // capacity: 1024
     // ...
@@ -3336,45 +3336,26 @@ impl Sequencer {
 ### 15.9 Poison Message Handling
 
 The Sequencer is the heart of the engine. If it panics, everything stops. A single
-malformed command must not crash the engine.
+malformed command must not leave partially-applied state running live.
 
 ```rust
 impl Sequencer {
-    fn process_command(&mut self, cmd: SequencerCommand) {
-        // catch_unwind boundary: panic in one command doesn't kill the Sequencer
+    fn process_command(&mut self, cmd: SequencerCommand) -> Result<()> {
+        // catch_unwind isolates the command so the loop can surface a fatal
+        // error instead of unwinding the entire runtime.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.process_command_inner(cmd)
         }));
 
         match result {
-            Ok(Ok(())) => { /* normal */ }
-            Ok(Err(e)) => {
-                // Expected error (risk rejection, validation failure)
-                // Already handled inside process_command_inner
-                error!("command processing error: {:?}", e);
-            }
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
             Err(panic_payload) => {
-                // UNEXPECTED PANIC — this is a bug
                 error!("SEQUENCER PANIC on command: {:?}", panic_payload);
-                self.metrics.record_sequencer_panic();
-
-                // Alert: this is always Critical
-                self.alert_tx.send(Alert {
-                    severity: AlertSeverity::Critical,
-                    title: "Sequencer panic caught".into(),
-                    body: format!("Panic: {:?}", panic_payload),
-                    ..
-                });
-
-                // Do NOT halt — the Sequencer is still running.
-                // The panicked command is dropped (its oneshot sender drops,
-                // caller gets a channel error).
-                // Continue processing next commands.
-                //
-                // If panics happen repeatedly (>3 in 60s), THEN halt.
-                if self.panic_count_last_60s() > 3 {
-                    self.halt_all("repeated sequencer panics");
-                }
+                Err(EngineError::Internal(anyhow!(
+                    "sequencer panic: {:?}",
+                    panic_payload
+                )))
             }
         }
     }
@@ -3383,10 +3364,10 @@ impl Sequencer {
 
 **Rules:**
 - `catch_unwind` wraps every command, not the Sequencer loop
-- A single panic is logged + alerted but does not halt trading
-- Repeated panics (>3 in 60s) trigger `HaltAll` — something is systemically wrong
-- The panicked command's `oneshot` sender is dropped — caller receives a channel error
-- Journal still records the attempt (for forensics)
+- A panic is treated as fatal because Rust cannot roll back partial mutations
+- The loop exits on panic or journal persistence failure; it does not keep trading on uncertain state
+- Journal append and snapshot persistence are part of the commit path
+- Startup restores the latest persisted snapshot and rejects any unapplied journal tail until replay bootstrap is implemented
 
 ### 15.10 Configuration Hot-Reload
 
