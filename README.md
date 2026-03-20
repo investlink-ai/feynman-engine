@@ -193,6 +193,8 @@ api_secret = "${BYBIT_API_SECRET}"
 ```
 
 Environment variable expansion is supported (e.g., `${HOME}`, `${BYBIT_API_KEY}`).
+The bootstrap path also honors runtime overrides for `FEYNMAN_MODE`/`ENGINE_MODE`,
+`ENGINE_DRY_RUN`, `ENGINE_GRPC_PORT`, and `REDIS_URL`.
 
 ## API Reference
 

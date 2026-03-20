@@ -52,12 +52,14 @@ struct BootstrapConfig {
     redis: RedisConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct EngineConfig {
+    mode: String,
+    dry_run: bool,
     grpc_port: u16,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct RedisConfig {
     url: String,
 }
@@ -77,9 +79,58 @@ fn load_config(path: &Path) -> Result<BootstrapConfig> {
         .build()
         .with_context(|| format!("failed to load config from {}", path.display()))?;
 
-    settings
+    let config = settings
         .try_deserialize()
-        .with_context(|| format!("failed to parse bootstrap config from {}", path.display()))
+        .with_context(|| format!("failed to parse bootstrap config from {}", path.display()))?;
+
+    apply_env_overrides(config, |key| std::env::var(key).ok())
+}
+
+fn apply_env_overrides<F>(mut config: BootstrapConfig, env: F) -> Result<BootstrapConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match (env("FEYNMAN_MODE"), env("ENGINE_MODE")) {
+        (Some(feynman_mode), Some(engine_mode)) if feynman_mode != engine_mode => {
+            bail!(
+                "conflicting engine mode env vars: FEYNMAN_MODE={}, ENGINE_MODE={}",
+                feynman_mode,
+                engine_mode
+            );
+        }
+        (Some(feynman_mode), _) => config.engine.mode = feynman_mode,
+        (_, Some(engine_mode)) => config.engine.mode = engine_mode,
+        (None, None) => {}
+    }
+
+    if let Some(dry_run) = env("ENGINE_DRY_RUN") {
+        config.engine.dry_run = parse_bool_env("ENGINE_DRY_RUN", &dry_run)?;
+    }
+
+    if let Some(grpc_port) = env("ENGINE_GRPC_PORT") {
+        config.engine.grpc_port = parse_u16_env("ENGINE_GRPC_PORT", &grpc_port)?;
+    }
+
+    if let Some(redis_url) = env("REDIS_URL") {
+        if redis_url.trim().is_empty() {
+            bail!("REDIS_URL must not be empty");
+        }
+        config.redis.url = redis_url;
+    }
+
+    Ok(config)
+}
+
+fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
+    value
+        .parse()
+        .with_context(|| format!("{key} must be a boolean, got {value}"))
+}
+
+fn parse_u16_env(key: &str, value: &str) -> Result<u16> {
+    value
+        .parse()
+        .with_context(|| format!("{key} must be a valid u16, got {value}"))
 }
 
 #[tokio::main]
@@ -93,6 +144,8 @@ async fn main() -> Result<()> {
     info!("Loading config from {}", cli_args.config_path.display());
 
     let bootstrap_config = load_config(&cli_args.config_path)?;
+    info!("Engine mode: {}", bootstrap_config.engine.mode);
+    info!("dry_run: {}", bootstrap_config.engine.dry_run);
 
     let redis_bus = RedisBus::connect(&bootstrap_config.redis.url)
         .await
@@ -132,7 +185,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::CliArgs;
+    use super::{apply_env_overrides, BootstrapConfig, CliArgs, EngineConfig, RedisConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -153,5 +206,62 @@ mod tests {
         let error =
             CliArgs::parse(vec!["--verbose".to_owned()]).expect_err("unknown arguments fail");
         assert!(error.to_string().contains("unknown argument"));
+    }
+
+    #[test]
+    fn env_overrides_apply_runtime_bootstrap_values() {
+        let config = apply_env_overrides(sample_config(), |key| match key {
+            "FEYNMAN_MODE" => Some("paper".to_owned()),
+            "ENGINE_DRY_RUN" => Some("false".to_owned()),
+            "ENGINE_GRPC_PORT" => Some("60000".to_owned()),
+            "REDIS_URL" => Some("redis://127.0.0.1:6380".to_owned()),
+            _ => None,
+        })
+        .expect("env overrides apply");
+
+        assert_eq!(config.engine.mode, "paper");
+        assert!(!config.engine.dry_run);
+        assert_eq!(config.engine.grpc_port, 60_000);
+        assert_eq!(config.redis.url, "redis://127.0.0.1:6380");
+    }
+
+    #[test]
+    fn env_overrides_reject_conflicting_mode_env_vars() {
+        let error = apply_env_overrides(sample_config(), |key| match key {
+            "FEYNMAN_MODE" => Some("paper".to_owned()),
+            "ENGINE_MODE" => Some("live".to_owned()),
+            _ => None,
+        })
+        .expect_err("conflicting mode env vars fail");
+
+        assert!(error
+            .to_string()
+            .contains("conflicting engine mode env vars"));
+    }
+
+    #[test]
+    fn env_overrides_reject_invalid_booleans() {
+        let error = apply_env_overrides(sample_config(), |key| match key {
+            "ENGINE_DRY_RUN" => Some("sometimes".to_owned()),
+            _ => None,
+        })
+        .expect_err("invalid dry-run env value fails");
+
+        assert!(error
+            .to_string()
+            .contains("ENGINE_DRY_RUN must be a boolean"));
+    }
+
+    fn sample_config() -> BootstrapConfig {
+        BootstrapConfig {
+            engine: EngineConfig {
+                mode: "live".to_owned(),
+                dry_run: true,
+                grpc_port: 50_051,
+            },
+            redis: RedisConfig {
+                url: "redis://redis:6379".to_owned(),
+            },
+        }
     }
 }

@@ -87,6 +87,9 @@ RUST_LOG=debug cargo run --bin feynman-engine  # With debug logging
 RUST_LOG=feynman_engine=debug,types=trace cargo run --bin feynman-engine  # Module-specific
 ```
 
+Bootstrap config is loaded from TOML and then overridden by runtime env where present:
+`FEYNMAN_MODE`/`ENGINE_MODE`, `ENGINE_DRY_RUN`, `ENGINE_GRPC_PORT`, and `REDIS_URL`.
+
 ---
 
 ## gRPC

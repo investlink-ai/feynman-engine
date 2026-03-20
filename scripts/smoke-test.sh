@@ -2,10 +2,16 @@
 set -euo pipefail
 
 compose_file="docker/docker-compose.yml"
+project_user="$(printf '%s' "${USER:-ci}" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]_-')"
+project_name="feynman-smoke-${project_user:-ci}-$$"
 engine_log_file="$(mktemp)"
 probe_log_file="$(mktemp)"
 downloaded_probe=""
 probe_cmd="grpc_health_probe"
+
+compose() {
+  docker compose -p "${project_name}" -f "${compose_file}" "$@"
+}
 
 ensure_probe() {
   if command -v "${probe_cmd}" >/dev/null 2>&1; then
@@ -42,7 +48,7 @@ ensure_probe() {
 }
 
 cleanup() {
-  docker compose -f "${compose_file}" down -v --remove-orphans
+  compose down -v --remove-orphans
   rm -f "${engine_log_file}" "${probe_log_file}" "${downloaded_probe}"
 }
 
@@ -53,9 +59,9 @@ command -v curl >/dev/null
 
 ensure_probe
 
-if ! docker compose -f "${compose_file}" up -d --build; then
+if ! compose up -d --build; then
   echo "docker compose up failed"
-  docker compose -f "${compose_file}" logs engine redis || true
+  compose logs engine redis || true
   exit 1
 fi
 
@@ -70,11 +76,11 @@ done
 if ! "${probe_cmd}" -addr=localhost:50051 >"${probe_log_file}" 2>&1; then
   echo "gRPC health probe failed"
   cat "${probe_log_file}"
-  docker compose -f "${compose_file}" logs engine redis
+  compose logs engine redis
   exit 1
 fi
 
-docker compose -f "${compose_file}" logs engine >"${engine_log_file}"
+compose logs engine >"${engine_log_file}"
 
 if ! grep -F "gRPC health server listening on :50051" "${engine_log_file}" >/dev/null; then
   echo "engine logs did not contain the expected gRPC startup line"
