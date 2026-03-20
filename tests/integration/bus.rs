@@ -4,9 +4,10 @@ use fred::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const REDIS_URL: &str = "redis://127.0.0.1:6379";
+const CLAIM_MIN_IDLE: Duration = Duration::from_secs(2);
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(5);
 static TEST_SUFFIX: AtomicU64 = AtomicU64::new(0);
 
@@ -89,6 +90,40 @@ async fn test_consumer_group_redelivery() -> Result<()> {
         pending_message.payload
     );
 
+    drop(rx);
+
+    let mut recovery_rx = bus
+        .subscribe(&context.topic, &context.group, &context.recovery_consumer)
+        .await
+        .context("subscribe recovery consumer")?;
+    let recovered_message = recv_message(&mut recovery_rx).await?;
+
+    anyhow::ensure!(
+        recovered_message.id == message.id,
+        "expected recovered id {}, got {}",
+        message.id,
+        recovered_message.id
+    );
+    anyhow::ensure!(
+        recovered_message.payload == payload,
+        "expected recovered payload {:?}, got {:?}",
+        payload,
+        recovered_message.payload
+    );
+
+    bus.ack(&context.topic, &context.group, &recovered_message.id)
+        .await
+        .context("ack recovered pending message")?;
+
+    let pending_after_ack = bus
+        .pending(&context.topic, &context.group, Duration::ZERO)
+        .await
+        .context("check pending entries after recovery ack")?;
+    anyhow::ensure!(
+        pending_after_ack.is_empty(),
+        "expected no pending entries after recovery ack"
+    );
+
     context.cleanup().await
 }
 
@@ -109,14 +144,30 @@ async fn test_stuck_message_claim() -> Result<()> {
         .context("subscribe original consumer")?;
 
     let message = recv_message(&mut rx).await?;
-    drop(rx);
+
+    let unclaimable = bus
+        .claim(
+            &context.topic,
+            &context.group,
+            &context.recovery_consumer,
+            CLAIM_MIN_IDLE,
+            &[message.id.clone()],
+        )
+        .await
+        .context("verify message cannot be claimed before idle threshold")?;
+    anyhow::ensure!(
+        unclaimable.is_empty(),
+        "expected no claimed entries before idle threshold elapsed"
+    );
+
+    sleep(CLAIM_MIN_IDLE + Duration::from_millis(100)).await;
 
     let claimed = bus
         .claim(
             &context.topic,
             &context.group,
             &context.recovery_consumer,
-            Duration::ZERO,
+            CLAIM_MIN_IDLE,
             &[message.id.clone()],
         )
         .await
