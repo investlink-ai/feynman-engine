@@ -66,6 +66,23 @@ make check
 #   cargo test --workspace
 ```
 
+## CI/CD
+
+GitHub Actions runs the same Rust verification stack on every push to `main` or `dev` and on pull requests:
+
+```bash
+cargo check --workspace
+cargo fmt --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+```
+
+The Docker smoke test runs as a separate workflow job:
+
+```bash
+./scripts/smoke-test.sh
+```
+
 ---
 
 ## Documentation

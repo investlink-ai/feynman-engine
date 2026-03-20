@@ -349,7 +349,10 @@ CI runs on every push to `main` or `dev` and on every PR.
 - cargo fmt --check
 - cargo clippy --workspace -- -D warnings
 - cargo test --workspace
+- ./scripts/smoke-test.sh
 ```
+
+The Rust checks run first. The Docker smoke test runs as a separate job after they pass so infrastructure failures do not hide compiler or test regressions.
 
 ### CI failure protocol
 

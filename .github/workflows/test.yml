@@ -1,13 +1,14 @@
-name: Test
+name: CI
 
 on:
   push:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  workflow_dispatch:
 
 jobs:
-  test:
+  rust-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,14 +20,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
-        run: cargo test --workspace --verbose
+      - name: Run check
+        run: cargo check --workspace
+
+      - name: Check formatting
+        run: cargo fmt --check
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: Check formatting
-        run: cargo fmt --check
+      - name: Run tests
+        run: cargo test --workspace
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    needs: rust-checks
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Run Docker smoke test
         run: ./scripts/smoke-test.sh
