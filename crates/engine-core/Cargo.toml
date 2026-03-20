@@ -10,6 +10,8 @@ license.workspace = true
 types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rmp-serde.workspace = true
+rusqlite.workspace = true
 chrono.workspace = true
 rust_decimal.workspace = true
 anyhow.workspace = true
@@ -20,3 +22,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tempfile = "3"

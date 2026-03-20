@@ -10,10 +10,13 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 
+mod journal;
 mod sequencer;
 
 #[cfg(test)]
 mod sequencer_tests;
+
+pub use journal::SqliteJournal;
 
 // Re-export commonly used types.
 pub use types::{
@@ -302,7 +305,7 @@ impl SequenceGenerator {
 }
 
 /// Current state of the engine (positions, P&L, risk utilization).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineState {
     pub orders: HashMap<OrderId, OrderRecord>,
     pub positions: HashMap<(AgentId, VenueId, InstrumentId), TrackedPosition>,
@@ -316,7 +319,7 @@ pub struct EngineState {
     pub last_updated: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[must_use]
 pub struct OrderAck {
     pub order_id: OrderId,
@@ -324,7 +327,7 @@ pub struct OrderAck {
     pub accepted_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[must_use]
 pub struct SignalAck {
     pub order_id: OrderId,
@@ -333,14 +336,14 @@ pub struct SignalAck {
     pub accepted_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineStateSnapshot {
     pub state: EngineState,
     pub sequence_id: SequenceId,
     pub snapshot_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OrderRecord {
     pub core: OrderCore,
     pub state: OrderState,
@@ -350,7 +353,7 @@ pub struct OrderRecord {
     pub last_updated: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[must_use]
 pub struct RiskApproval {
     pub approved_at: DateTime<Utc>,
