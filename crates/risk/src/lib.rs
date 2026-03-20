@@ -1,7 +1,7 @@
 //! risk — CircuitBreaker (L0) and RiskGate (L1) for the Feynman execution engine.
 //!
 //! Path-aware checks: universal (all order paths) + signal-specific (`SubmitSignal` only).
-//! CircuitBreaker provides hardcoded, compiled-in safety checks.
+//! CircuitBreaker provides hardcoded, compiled-in safety checks (CB-1 through CB-11).
 //! AgentRiskManager provides deterministic Layer 1 evaluation.
 
 use std::collections::HashMap;
@@ -12,11 +12,14 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
 pub use types::{
-    AgentAllocation, AgentId, AgentRiskLimits, Clock, Fill, FirmBook, FirmRiskLimits, InstrumentId,
-    InstrumentRiskLimits, OrderCore, PipelineOrder, PredictionMarketLimits, PriceSource,
-    RiskCheckResult, RiskLimits, RiskOutcome, RiskViolation, Side, Validated, VenueId,
-    VenueRiskLimits, ViolationType,
+    AgentAllocation, AgentId, AgentRiskLimits, Clock, ConnectionState, Fill, FirmBook,
+    FirmRiskLimits, InstrumentId, InstrumentRiskLimits, OrderCore, PipelineOrder,
+    PredictionMarketLimits, PriceSource, RiskCheckResult, RiskLimits, RiskOutcome, RiskViolation,
+    Side, SimulatedClock, Validated, VenueConnectionHealth, VenueId, VenueRiskLimits,
+    ViolationType, WallClock,
 };
+
+pub mod circuit_breaker;
 
 /// Typed errors for risk operations (thiserror for libs).
 #[derive(Debug, thiserror::Error)]
@@ -38,49 +41,142 @@ pub type Result<T> = std::result::Result<T, RiskError>;
 
 // ─── Circuit Breaker (Layer 0) ───
 
-/// Hardcoded, compiled-in safety checks. Not configurable at runtime.
-/// Changed only via code deploy + review. The absolute last line of defense.
-///
-/// Accepts `&PipelineOrder<Validated>` — the type system guarantees the order
-/// has passed structural validation before circuit breaker evaluation.
-///
-/// All time-dependent checks receive `now` from the Sequencer's Clock.
-///
-/// Sealed trait — external crates cannot implement this.
-pub trait CircuitBreaker: Send + Sync + sealed::Sealed {
-    /// Check if order passes all hardcoded circuit breaker rules.
-    /// `now` comes from `Clock::now()`.
-    fn check(
-        &self,
-        order: &PipelineOrder<Validated>,
-        firm_book: &FirmBook,
-        now: DateTime<Utc>,
-    ) -> std::result::Result<(), CircuitBreakerTrip>;
-
-    /// System-wide kill switch. When tripped, ALL execution halts.
-    fn is_halted(&self) -> bool;
-
-    /// Trip the breaker manually (emergency halt).
-    fn trip(&mut self, reason: String, now: DateTime<Utc>);
-
-    /// Reset after investigation (requires explicit action).
-    fn reset(&mut self, now: DateTime<Utc>) -> std::result::Result<(), RiskError>;
-}
-
-/// Sealed trait pattern.
-mod sealed {
+/// Sealed trait — external crates cannot add new circuit breakers.
+pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
-/// Describes why a circuit breaker rejected an order.
+/// Engine execution mode — determines which circuit breaker checks apply (CB-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionMode {
+    Live,
+    Paper,
+    Backtest,
+}
+
+/// The kind of operation being evaluated by the circuit breaker bank.
+///
+/// `Cancel` operations bypass all circuit breakers — they never increase exposure.
+/// `NewOrder` operations are subject to all checks, including latched halts.
+/// `ReduceOnly` is a convenience alias recognised by the HaltAll early-returns:
+/// the latch still fires for new directional orders, but `ReduceOnly` is allowed
+/// through CB-3/4/5 so resting positions can be flattened during a halt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationKind {
+    /// A new order that may increase exposure.
+    NewOrder,
+    /// A cancel request — never increases exposure, always allowed through.
+    Cancel,
+    /// A reduce-only order — allowed through latched HaltAll/GrossNotional checks.
+    ReduceOnly,
+}
+
+/// Thresholds for all 11 compiled-in circuit breakers.
+///
+/// Not hot-reloadable — changed only via code deploy and review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// CB-1: Max notional for a single order (USD).
+    pub max_single_order_notional: Decimal,
+    /// CB-2: Max gross notional per instrument across the firm (USD).
+    pub max_instrument_position_notional: Decimal,
+    /// CB-3: Max firm gross notional across all instruments (USD).
+    pub max_firm_gross_notional: Decimal,
+    /// CB-4: Max daily loss as a fraction of NAV (e.g. `0.05` = 5%).
+    pub max_daily_loss_pct: Decimal,
+    /// CB-5: Max hourly loss as a fraction of NAV (e.g. `0.02` = 2%).
+    pub max_hourly_loss_pct: Decimal,
+    /// CB-6: Max firm-wide new orders in the last 60 seconds.
+    pub max_firm_orders_per_min: u32,
+    /// CB-7: Max per-agent new orders in the last 60 seconds.
+    pub max_agent_orders_per_min: u32,
+    /// CB-8: Max venue error rate (errors / total) over the last 5 minutes.
+    pub max_venue_error_rate: Decimal,
+    /// CB-9: Max seconds since last venue heartbeat before rejecting orders to that venue.
+    pub max_venue_disconnect_secs: u64,
+    /// CB-11: Max Sequencer command queue depth before rejecting new orders.
+    pub max_sequencer_queue_depth: usize,
+}
+
+/// Venue error counts over the last 5-minute window for CB-8.
+///
+/// Populated by the Sequencer from venue adapter callbacks.
+#[derive(Debug, Clone, Default)]
+pub struct VenueErrorStats {
+    pub errors_last_5min: u32,
+    pub total_last_5min: u32,
+}
+
+/// Inputs to every circuit breaker check call.
+///
+/// The Sequencer constructs this from live engine state before calling
+/// `CircuitBreakerBank::check_all`.
+pub struct CircuitBreakerContext<'a> {
+    /// The order being evaluated. `None` for latch-state pre-checks and cancels.
+    pub order: Option<&'a PipelineOrder<Validated>>,
+    pub firm_book: &'a FirmBook,
+    /// Current connection health per venue, keyed by `VenueId`.
+    pub venue_health: &'a HashMap<VenueId, VenueConnectionHealth>,
+    /// Error stats per venue for CB-8, keyed by `VenueId`.
+    pub venue_error_stats: &'a HashMap<VenueId, VenueErrorStats>,
+    /// Firm-wide orders submitted in the last 60 seconds for CB-6.
+    pub firm_orders_last_60s: u32,
+    /// Per-agent orders submitted in the last 60 seconds for CB-7.
+    pub agent_orders_last_60s: &'a HashMap<AgentId, u32>,
+    /// Current Sequencer command queue depth for CB-11.
+    pub sequencer_queue_depth: usize,
+    /// Current engine execution mode for CB-10.
+    pub execution_mode: ExecutionMode,
+    /// Kind of operation being evaluated — determines which circuit breakers apply.
+    pub operation_kind: OperationKind,
+    pub config: &'a CircuitBreakerConfig,
+    pub clock: &'a dyn Clock,
+}
+
+/// Result of a single circuit breaker check.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum CircuitBreakerResult {
+    Pass,
+    /// Order rejected by this breaker — fills and cancels still processed.
+    Reject {
+        breaker: &'static str,
+        reason: String,
+    },
+    /// Full trading halt — new orders blocked until manually reset.
+    /// Cancels and `ReduceOnly` orders are allowed through so resting positions
+    /// can be flattened; `NewOrder` operations are hard-blocked.
+    HaltAll {
+        breaker: &'static str,
+        reason: String,
+    },
+}
+
+/// Reason a stateful circuit breaker was manually reset.
 #[derive(Debug, Clone)]
-pub struct CircuitBreakerTrip {
-    /// Which breaker tripped (e.g., "CB-4", "CB-1").
-    pub breaker: String,
-    /// Human-readable reason.
-    pub reason: String,
-    /// When the breaker tripped (from Clock).
-    pub tripped_at: DateTime<Utc>,
+pub enum ResetReason {
+    ManualOperator { operator: String },
+    CioApproval { approver: String },
+}
+
+/// Hardcoded, compiled-in safety checks. Not configurable at runtime.
+/// Sealed — external crates cannot add new circuit breakers.
+///
+/// All 11 breakers are registered in `CircuitBreakerBank`. The bank is
+/// the only public entry point; individual breakers are crate-internal.
+pub trait CircuitBreaker: Send + Sync + sealed::Sealed {
+    /// Identifier for this breaker (e.g. `"CB-4"`).
+    fn id(&self) -> &'static str;
+
+    /// Evaluate the breaker against the current context. Always re-evaluates;
+    /// does not cache or latch state — the bank handles latching for CB-3/4/5.
+    fn check(&self, ctx: &CircuitBreakerContext<'_>) -> CircuitBreakerResult;
+
+    /// Reset a latched stateful breaker. No-op for stateless breakers.
+    fn reset(&mut self, reason: ResetReason);
+
+    /// Whether this breaker is currently latched (stateful CBs only).
+    fn is_tripped(&self) -> bool;
 }
 
 // ─── Risk Gate (Layer 1) ───
@@ -156,6 +252,34 @@ struct ResizeCandidate {
     new_qty: Decimal,
     reason: String,
     warning: RiskViolation,
+}
+
+/// Project (net_notional, gross_notional) after applying a signed notional delta.
+///
+/// Correctly handles paired long/short book entries: a sell against a long reduces
+/// gross rather than inflating it; a buy against a short covers rather than adds.
+/// Used by CB-2 and the L1 risk gate.
+pub(crate) fn project_net_and_gross(
+    current_net: Decimal,
+    current_gross: Decimal,
+    signed_delta: Decimal,
+) -> (Decimal, Decimal) {
+    let two = dec!(2);
+    let mut long = (current_gross + current_net) / two;
+    let mut short = (current_gross - current_net) / two;
+
+    if signed_delta >= Decimal::ZERO {
+        let reduction = signed_delta.min(short);
+        short -= reduction;
+        long += signed_delta - reduction;
+    } else {
+        let sell_qty = signed_delta.abs();
+        let reduction = sell_qty.min(long);
+        long -= reduction;
+        short += sell_qty - reduction;
+    }
+
+    (long - short, long + short)
 }
 
 impl AgentRiskManager {
@@ -844,22 +968,7 @@ impl AgentRiskManager {
         current_gross: Decimal,
         signed_delta: Decimal,
     ) -> (Decimal, Decimal) {
-        let two = dec!(2);
-        let mut long = (current_gross + current_net) / two;
-        let mut short = (current_gross - current_net) / two;
-
-        if signed_delta >= Decimal::ZERO {
-            let reduction = signed_delta.min(short);
-            short -= reduction;
-            long += signed_delta - reduction;
-        } else {
-            let sell_qty = signed_delta.abs();
-            let reduction = sell_qty.min(long);
-            long -= reduction;
-            short += sell_qty - reduction;
-        }
-
-        (long - short, long + short)
+        project_net_and_gross(current_net, current_gross, signed_delta)
     }
 
     fn rejected(violations: Vec<RiskViolation>) -> RiskOutcome {
