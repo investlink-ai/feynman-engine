@@ -10,8 +10,6 @@
 //!
 //! Entry point: [`CircuitBreakerBank::check_all`].
 
-use chrono::DateTime;
-use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -130,20 +128,15 @@ impl CircuitBreaker for Cb2MaxInstrumentPosition {
 /// Latches on trip — manual reset required.
 pub(crate) struct Cb3MaxFirmGrossNotional {
     tripped: bool,
-    tripped_at: Option<DateTime<Utc>>,
 }
 
 impl Cb3MaxFirmGrossNotional {
     fn new() -> Self {
-        Self {
-            tripped: false,
-            tripped_at: None,
-        }
+        Self { tripped: false }
     }
 
-    fn latch(&mut self, now: DateTime<Utc>) {
+    fn latch(&mut self) {
         self.tripped = true;
-        self.tripped_at = Some(now);
     }
 }
 
@@ -175,7 +168,6 @@ impl CircuitBreaker for Cb3MaxFirmGrossNotional {
 
     fn reset(&mut self, _reason: ResetReason) {
         self.tripped = false;
-        self.tripped_at = None;
     }
 
     fn is_tripped(&self) -> bool {
@@ -188,20 +180,15 @@ impl CircuitBreaker for Cb3MaxFirmGrossNotional {
 /// HaltAll when firm daily P&L breaches the loss cap. Latches — manual reset + CIO approval.
 pub(crate) struct Cb4FirmDailyLoss {
     tripped: bool,
-    tripped_at: Option<DateTime<Utc>>,
 }
 
 impl Cb4FirmDailyLoss {
     fn new() -> Self {
-        Self {
-            tripped: false,
-            tripped_at: None,
-        }
+        Self { tripped: false }
     }
 
-    fn latch(&mut self, now: DateTime<Utc>) {
+    fn latch(&mut self) {
         self.tripped = true;
-        self.tripped_at = Some(now);
     }
 }
 
@@ -239,7 +226,6 @@ impl CircuitBreaker for Cb4FirmDailyLoss {
 
     fn reset(&mut self, _reason: ResetReason) {
         self.tripped = false;
-        self.tripped_at = None;
     }
 
     fn is_tripped(&self) -> bool {
@@ -252,20 +238,15 @@ impl CircuitBreaker for Cb4FirmDailyLoss {
 /// HaltAll when firm hourly P&L breaches the loss cap. Latches — manual reset.
 pub(crate) struct Cb5FirmHourlyLoss {
     tripped: bool,
-    tripped_at: Option<DateTime<Utc>>,
 }
 
 impl Cb5FirmHourlyLoss {
     fn new() -> Self {
-        Self {
-            tripped: false,
-            tripped_at: None,
-        }
+        Self { tripped: false }
     }
 
-    fn latch(&mut self, now: DateTime<Utc>) {
+    fn latch(&mut self) {
         self.tripped = true;
-        self.tripped_at = Some(now);
     }
 }
 
@@ -300,7 +281,6 @@ impl CircuitBreaker for Cb5FirmHourlyLoss {
 
     fn reset(&mut self, _reason: ResetReason) {
         self.tripped = false;
-        self.tripped_at = None;
     }
 
     fn is_tripped(&self) -> bool {
@@ -608,26 +588,53 @@ impl CircuitBreakerBank {
     ///
     /// Stateful breakers (CB-3, CB-4, CB-5) are latched inside this method when
     /// their fresh check triggers.
+    ///
+    /// **Check order:**
+    /// 1. Latched HaltAll (CB-4, CB-5) — early return; these supersede all other checks.
+    /// 2. Latched Reject (CB-3) — early return.
+    /// 3. CB-10: dry-run bypass — checked before any fresh P&L evaluation, but only
+    ///    reached when no latch is already active (see steps 1–2).
+    /// 4. CB-4 / CB-5: fresh P&L evaluation; latch on HaltAll.
+    /// 5. CB-3: fresh gross notional evaluation; latch on Reject.
+    ///    6–12. Per-order / rate / connectivity checks (CB-11, CB-1, CB-2, CB-6–CB-9).
     pub fn check_all(&mut self, ctx: &CircuitBreakerContext<'_>) -> CircuitBreakerResult {
         // 1. Early return on latched HaltAll (CB-4 > CB-5 — daily loss takes precedence)
         if self.cb4.is_tripped() {
+            let agent = ctx.order.map(|o| o.core().agent_id.to_string());
+            warn!(
+                breaker = "CB-4",
+                agent_id = ?agent,
+                "HALT active: order blocked by latched daily loss halt"
+            );
             return halt(
                 "CB-4",
                 "daily loss halt latched — manual reset + CIO approval required",
             );
         }
         if self.cb5.is_tripped() {
+            let agent = ctx.order.map(|o| o.core().agent_id.to_string());
+            warn!(
+                breaker = "CB-5",
+                agent_id = ?agent,
+                "HALT active: order blocked by latched hourly loss halt"
+            );
             return halt("CB-5", "hourly loss halt latched — manual reset required");
         }
         // 2. Early return on latched Reject (CB-3)
         if self.cb3.is_tripped() {
+            let agent = ctx.order.map(|o| o.core().agent_id.to_string());
+            warn!(
+                breaker = "CB-3",
+                agent_id = ?agent,
+                "order blocked by latched firm gross notional limit"
+            );
             return reject(
                 "CB-3",
                 "firm gross notional limit latched — manual reset required",
             );
         }
 
-        // 3. CB-10: dry-run bypass (hard invariant)
+        // 3. CB-10: dry-run bypass (hard invariant; only reached when no latch is active)
         let r = self.cb10.check(ctx);
         if r != CircuitBreakerResult::Pass {
             return r;
@@ -637,7 +644,7 @@ impl CircuitBreakerBank {
         let r = self.cb4.check(ctx);
         if r != CircuitBreakerResult::Pass {
             if matches!(r, CircuitBreakerResult::HaltAll { .. }) {
-                self.cb4.latch(ctx.clock.now());
+                self.cb4.latch();
                 error!(
                     breaker = "CB-4",
                     daily_pnl = %ctx.firm_book.daily_pnl,
@@ -652,7 +659,7 @@ impl CircuitBreakerBank {
         let r = self.cb5.check(ctx);
         if r != CircuitBreakerResult::Pass {
             if matches!(r, CircuitBreakerResult::HaltAll { .. }) {
-                self.cb5.latch(ctx.clock.now());
+                self.cb5.latch();
                 error!(
                     breaker = "CB-5",
                     hourly_pnl = %ctx.firm_book.hourly_pnl,
@@ -667,7 +674,7 @@ impl CircuitBreakerBank {
         let r = self.cb3.check(ctx);
         if r != CircuitBreakerResult::Pass {
             if matches!(r, CircuitBreakerResult::Reject { .. }) {
-                self.cb3.latch(ctx.clock.now());
+                self.cb3.latch();
                 error!(
                     breaker = "CB-3",
                     gross_notional = %ctx.firm_book.gross_notional,
@@ -1750,18 +1757,26 @@ mod tests {
             qty in 1_u64..1_000_u64,
             price in 1_u64..200_000_u64,
             gross_notional in 0_u64..2_000_000_u64,
+            // nav=0 exercises the CB-4/CB-5 NAV≤0 guard (silent pass-through)
+            nav in 0_u64..2_000_000_u64,
+            // loss values above the 5%/2% caps exercise the HaltAll paths
+            daily_pnl_loss in 0_u64..200_000_u64,
+            hourly_pnl_loss in 0_u64..100_000_u64,
             firm_orders in 0_u32..200_u32,
             queue_depth in 0_usize..2_000_usize,
         ) {
             let config = test_config();
             let mut book = test_firm_book();
             book.gross_notional = Decimal::from(gross_notional);
+            book.nav = Decimal::from(nav);
+            book.daily_pnl = -Decimal::from(daily_pnl_loss);
+            book.hourly_pnl = -Decimal::from(hourly_pnl_loss);
             let clock = SimulatedClock::at_epoch();
             let order = test_order(Decimal::from(qty), Decimal::from(price));
             let health = HashMap::from([(VenueId("bybit".into()), connected_venue_health())]);
             let stats: HashMap<VenueId, VenueErrorStats> = HashMap::new();
             let agent_orders: HashMap<AgentId, u32> = HashMap::new();
-            let mut ctx = CircuitBreakerContext {
+            let ctx = CircuitBreakerContext {
                 order: Some(&order),
                 firm_book: &book,
                 venue_health: &health,
@@ -1773,8 +1788,6 @@ mod tests {
                 config: &config,
                 clock: &clock,
             };
-            ctx.firm_orders_last_60s = firm_orders;
-            ctx.sequencer_queue_depth = queue_depth;
 
             let mut bank = CircuitBreakerBank::new();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
