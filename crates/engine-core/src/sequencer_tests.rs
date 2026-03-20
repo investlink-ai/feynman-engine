@@ -811,6 +811,89 @@ async fn test_bootstrap_restores_snapshot_and_avoids_sequence_reuse_after_reject
 }
 
 #[tokio::test]
+async fn test_bootstrap_restores_client_order_generator_state() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let first_order =
+        crate::PipelineOrder::new(sample_order("ord-restore-1", now)).into_validated(now);
+    let (first_ack_tx, first_ack_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitOrder {
+            order: first_order,
+            respond: first_ack_tx,
+        })
+        .await
+        .expect("queue first order");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::Shutdown {
+            respond: shutdown_tx,
+        })
+        .await
+        .expect("queue shutdown");
+
+    let first_snapshot = tokio::spawn(sequencer.run())
+        .await
+        .expect("join first sequencer")
+        .expect("first sequencer result");
+    shutdown_rx.await.expect("shutdown ack");
+    let first_ack = first_ack_rx
+        .await
+        .expect("first order channel")
+        .expect("first order accepted");
+
+    assert_eq!(first_snapshot.state.idempotency_cache.len(), 1);
+    assert_eq!(first_ack.client_order_id.parse_sequence(), Some(0));
+
+    let restored_core = TestCore::new(now);
+    let restored_clock = types::SimulatedClock::new(now);
+    let (restored_sequencer, restored_handle) =
+        Sequencer::new(restored_core, journal, StaticPriceSource, restored_clock, 7)
+            .await
+            .expect("restore sequencer");
+
+    let second_order =
+        crate::PipelineOrder::new(sample_order("ord-restore-2", now)).into_validated(now);
+    let (second_ack_tx, second_ack_rx) = oneshot::channel();
+    restored_handle
+        .send(SequencerCommand::SubmitOrder {
+            order: second_order,
+            respond: second_ack_tx,
+        })
+        .await
+        .expect("queue second order");
+
+    let (restored_shutdown_tx, restored_shutdown_rx) = oneshot::channel();
+    restored_handle
+        .send(SequencerCommand::Shutdown {
+            respond: restored_shutdown_tx,
+        })
+        .await
+        .expect("queue restored shutdown");
+
+    let restored_snapshot = tokio::spawn(restored_sequencer.run())
+        .await
+        .expect("join restored sequencer")
+        .expect("restored sequencer result");
+    restored_shutdown_rx.await.expect("restored shutdown ack");
+    let second_ack = second_ack_rx
+        .await
+        .expect("second order channel")
+        .expect("second order accepted");
+
+    assert_ne!(first_ack.client_order_id, second_ack.client_order_id);
+    assert_eq!(second_ack.client_order_id.parse_sequence(), Some(1));
+    assert_eq!(restored_snapshot.state.idempotency_cache.len(), 2);
+}
+
+#[tokio::test]
 async fn test_bootstrap_rejects_journal_tail_without_replay_support() {
     let now = fixed_time();
     let journal = RecordingJournal::default();
