@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use types::{
     ClientOrderId, ExecHint, InstrumentId, OrderId, OrderType, PredictionExposureSummary, Side,
-    TimeInForce, VenueId, VenueOrderId,
+    Signal, SignalId, TimeInForce, Urgency, VenueId, VenueOrderId,
 };
 
 #[derive(Clone, Default)]
@@ -29,6 +29,78 @@ struct JournalState {
 impl RecordingJournal {
     fn events(&self) -> Vec<crate::SequencedEvent<EngineEvent>> {
         self.state.lock().expect("journal lock").events.clone()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JournalFailureMode {
+    AppendBatch,
+    SaveSnapshot,
+}
+
+#[derive(Clone)]
+struct FailingJournal {
+    inner: RecordingJournal,
+    failure_mode: JournalFailureMode,
+}
+
+#[async_trait::async_trait]
+impl EventJournal for FailingJournal {
+    async fn append(
+        &self,
+        event: &crate::SequencedEvent<EngineEvent>,
+    ) -> std::result::Result<(), crate::EngineError> {
+        self.inner.append(event).await
+    }
+
+    async fn append_batch(
+        &self,
+        events: &[crate::SequencedEvent<EngineEvent>],
+    ) -> std::result::Result<(), crate::EngineError> {
+        if matches!(self.failure_mode, JournalFailureMode::AppendBatch) {
+            return Err(crate::EngineError::Journal(
+                "simulated append failure".to_owned(),
+            ));
+        }
+        self.inner.append_batch(events).await
+    }
+
+    async fn replay_from(
+        &self,
+        from: SequenceId,
+    ) -> std::result::Result<Vec<crate::SequencedEvent<EngineEvent>>, crate::EngineError> {
+        self.inner.replay_from(from).await
+    }
+
+    async fn replay_range(
+        &self,
+        from: SequenceId,
+        to: SequenceId,
+    ) -> std::result::Result<Vec<crate::SequencedEvent<EngineEvent>>, crate::EngineError> {
+        self.inner.replay_range(from, to).await
+    }
+
+    async fn save_snapshot(
+        &self,
+        sequence_id: SequenceId,
+        snapshot: &EngineStateSnapshot,
+    ) -> std::result::Result<(), crate::EngineError> {
+        if matches!(self.failure_mode, JournalFailureMode::SaveSnapshot) {
+            return Err(crate::EngineError::Journal(
+                "simulated snapshot failure".to_owned(),
+            ));
+        }
+        self.inner.save_snapshot(sequence_id, snapshot).await
+    }
+
+    async fn load_latest_snapshot(
+        &self,
+    ) -> std::result::Result<Option<(SequenceId, EngineStateSnapshot)>, crate::EngineError> {
+        self.inner.load_latest_snapshot().await
+    }
+
+    async fn latest_sequence_id(&self) -> std::result::Result<SequenceId, crate::EngineError> {
+        self.inner.latest_sequence_id().await
     }
 }
 
@@ -131,17 +203,24 @@ impl PriceSource for StaticPriceSource {
 
 struct TestCore {
     state: EngineState,
+    reject_orders: bool,
 }
 
 impl TestCore {
     fn new(now: DateTime<Utc>) -> Self {
         Self {
             state: empty_state(now),
+            reject_orders: false,
         }
     }
 
     fn with_order(mut self, record: OrderRecord) -> Self {
         self.state.orders.insert(record.core.id.clone(), record);
+        self
+    }
+
+    fn rejecting_orders(mut self) -> Self {
+        self.reject_orders = true;
         self
     }
 }
@@ -160,6 +239,11 @@ impl EngineCore for TestCore {
         order: crate::PipelineOrder<crate::Validated>,
         now: DateTime<Utc>,
     ) -> std::result::Result<types::PipelineOrder<types::RiskChecked>, crate::EngineError> {
+        if self.reject_orders {
+            return Err(crate::EngineError::RiskRejected {
+                reason: "test rejection".to_owned(),
+            });
+        }
         let approval = RiskApprovalStamp {
             approved_at: now,
             checks_performed: Vec::new(),
@@ -327,7 +411,9 @@ async fn test_priority_commands_preempt_normal_queue() {
     let journal = RecordingJournal::default();
     let core = TestCore::new(now);
     let clock = types::SimulatedClock::new(now);
-    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
 
     let agent = AgentId("taleb".to_owned());
     handle
@@ -373,6 +459,53 @@ async fn test_priority_commands_preempt_normal_queue() {
 }
 
 #[tokio::test]
+async fn test_submit_signal_returns_explicitly_unsupported() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let run_task = tokio::spawn(sequencer.run());
+
+    let (signal_tx, signal_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitSignal {
+            signal: sample_signal(now),
+            respond: signal_tx,
+        })
+        .await
+        .expect("queue signal");
+
+    let signal_result = signal_rx.await.expect("signal response");
+    assert!(matches!(
+        signal_result,
+        Err(crate::EngineError::UnsupportedCommand {
+            command: "SubmitSignal",
+        })
+    ));
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::Shutdown {
+            respond: shutdown_tx,
+        })
+        .await
+        .expect("queue shutdown");
+
+    let final_snapshot = run_task
+        .await
+        .expect("sequencer join")
+        .expect("sequencer result");
+    shutdown_rx.await.expect("shutdown ack");
+
+    assert_eq!(final_snapshot.sequence_id, SequenceId::ZERO);
+    assert!(journal.events().is_empty());
+}
+
+#[tokio::test]
 async fn test_on_fill_updates_order_state_and_journals_fill() {
     let now = fixed_time();
     let journal = RecordingJournal::default();
@@ -388,7 +521,9 @@ async fn test_on_fill_updates_order_state_and_journals_fill() {
     };
     let core = TestCore::new(now).with_order(order_record);
     let clock = types::SimulatedClock::new(now);
-    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
 
     let fill = Fill {
         order_id: OrderId("ord-fill".to_owned()),
@@ -443,7 +578,9 @@ async fn test_shutdown_drains_pending_commands_before_exit() {
     let journal = RecordingJournal::default();
     let core = TestCore::new(now);
     let clock = types::SimulatedClock::new(now);
-    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
 
     let agent = AgentId("satoshi".to_owned());
     handle
@@ -484,26 +621,110 @@ async fn test_shutdown_drains_pending_commands_before_exit() {
 }
 
 #[tokio::test]
-async fn test_catch_unwind_keeps_sequencer_running() {
+async fn test_caught_panic_stops_sequencer() {
     let now = fixed_time();
     let journal = RecordingJournal::default();
     let core = TestCore::new(now);
     let clock = types::SimulatedClock::new(now);
-    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
 
     handle
         .send(SequencerCommand::PoisonPill)
         .await
         .expect("queue poison pill");
 
-    let agent = AgentId("taleb".to_owned());
+    let run_result = tokio::spawn(sequencer.run()).await.expect("sequencer join");
+
+    assert!(matches!(run_result, Err(crate::EngineError::Internal(_))));
+    assert!(journal.events().is_empty());
+}
+
+#[tokio::test]
+async fn test_command_processing_is_deterministic() {
+    let first = run_deterministic_sequence().await;
+    let second = run_deterministic_sequence().await;
+
+    assert_eq!(first.final_order_state, second.final_order_state);
+    assert_eq!(first.final_client_order_id, second.final_client_order_id);
+    assert_eq!(first.event_tags, second.event_tags);
+    assert_eq!(first.sequence_id, second.sequence_id);
+    assert_eq!(first.fill_count, second.fill_count);
+}
+
+#[tokio::test]
+async fn test_journal_append_failure_stops_sequencer() {
+    let now = fixed_time();
+    let journal = FailingJournal {
+        inner: RecordingJournal::default(),
+        failure_mode: JournalFailureMode::AppendBatch,
+    };
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal, StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let order =
+        crate::PipelineOrder::new(sample_order("ord-journal-fail", now)).into_validated(now);
+    let (ack_tx, _ack_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitOrder {
+            order,
+            respond: ack_tx,
+        })
+        .await
+        .expect("queue order");
+
+    let run_result = tokio::spawn(sequencer.run()).await.expect("sequencer join");
+    assert!(matches!(run_result, Err(crate::EngineError::Journal(_))));
+}
+
+#[tokio::test]
+async fn test_snapshot_persistence_failure_stops_sequencer() {
+    let now = fixed_time();
+    let journal = FailingJournal {
+        inner: RecordingJournal::default(),
+        failure_mode: JournalFailureMode::SaveSnapshot,
+    };
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal, StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
     handle
         .send(SequencerCommand::PauseAgent {
-            agent: agent.clone(),
-            reason: "post-panic".to_owned(),
+            agent: AgentId("athena".to_owned()),
+            reason: "snapshot fail".to_owned(),
         })
         .await
         .expect("queue pause");
+
+    let run_result = tokio::spawn(sequencer.run()).await.expect("sequencer join");
+    assert!(matches!(run_result, Err(crate::EngineError::Journal(_))));
+}
+
+#[tokio::test]
+async fn test_bootstrap_restores_snapshot_and_avoids_sequence_reuse_after_rejection() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    let core = TestCore::new(now).rejecting_orders();
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let order = crate::PipelineOrder::new(sample_order("ord-reject", now)).into_validated(now);
+    let (ack_tx, ack_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitOrder {
+            order,
+            respond: ack_tx,
+        })
+        .await
+        .expect("queue rejected order");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     handle
@@ -513,29 +734,91 @@ async fn test_catch_unwind_keeps_sequencer_running() {
         .await
         .expect("queue shutdown");
 
-    let final_snapshot = tokio::spawn(sequencer.run())
+    let first_snapshot = tokio::spawn(sequencer.run())
         .await
         .expect("sequencer join")
         .expect("sequencer result");
+    shutdown_rx.await.expect("shutdown ack");
+    assert!(ack_rx.await.expect("reply channel").is_err());
+    assert_eq!(first_snapshot.sequence_id, SequenceId(2));
 
+    let fresh_core = TestCore::new(now);
+    let fresh_clock = types::SimulatedClock::new(now);
+    let (restored_sequencer, restored_handle) = Sequencer::new(
+        fresh_core,
+        journal.clone(),
+        StaticPriceSource,
+        fresh_clock,
+        7,
+    )
+    .await
+    .expect("restore sequencer from snapshot");
+
+    let (snapshot_tx, snapshot_rx) = oneshot::channel();
+    restored_handle
+        .send(SequencerCommand::Snapshot {
+            respond: snapshot_tx,
+        })
+        .await
+        .expect("queue snapshot");
+    restored_handle
+        .send(SequencerCommand::PauseAgent {
+            agent: AgentId("athena".to_owned()),
+            reason: "post-restore".to_owned(),
+        })
+        .await
+        .expect("queue pause");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    restored_handle
+        .send(SequencerCommand::Shutdown {
+            respond: shutdown_tx,
+        })
+        .await
+        .expect("queue shutdown");
+
+    let restored_final_snapshot = tokio::spawn(restored_sequencer.run())
+        .await
+        .expect("sequencer join")
+        .expect("sequencer result");
+    let restored_snapshot = snapshot_rx.await.expect("snapshot response");
     shutdown_rx.await.expect("shutdown ack");
 
-    assert!(matches!(
-        final_snapshot.state.agent_statuses.get(&agent),
-        Some(AgentStatus::Paused { .. })
-    ));
+    assert_eq!(restored_snapshot.sequence_id, SequenceId(2));
+    assert_eq!(restored_final_snapshot.sequence_id, SequenceId(5));
+    assert_eq!(
+        journal
+            .events()
+            .iter()
+            .map(|event| event.sequence_id.0)
+            .collect::<Vec<_>>(),
+        vec![2, 5]
+    );
 }
 
 #[tokio::test]
-async fn test_replay_is_deterministic() {
-    let first = run_deterministic_sequence().await;
-    let second = run_deterministic_sequence().await;
+async fn test_bootstrap_rejects_journal_tail_without_replay_support() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    {
+        let mut state = journal.state.lock().expect("journal lock");
+        state.events.push(crate::SequencedEvent {
+            sequence_id: SequenceId(1),
+            timestamp: now,
+            event: EngineEvent::OrderRejected {
+                order_id: OrderId("ord-tail".to_owned()),
+                stage: "risk".to_owned(),
+                reason: "tail".to_owned(),
+            },
+        });
+    }
 
-    assert_eq!(first.final_order_state, second.final_order_state);
-    assert_eq!(first.final_client_order_id, second.final_client_order_id);
-    assert_eq!(first.event_tags, second.event_tags);
-    assert_eq!(first.sequence_id, second.sequence_id);
-    assert_eq!(first.fill_count, second.fill_count);
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let bootstrap_result = Sequencer::new(core, journal, StaticPriceSource, clock, 7).await;
+    assert!(matches!(
+        bootstrap_result,
+        Err(crate::EngineError::Journal(_))
+    ));
 }
 
 struct ReplayOutcome {
@@ -551,7 +834,11 @@ async fn run_deterministic_sequence() -> ReplayOutcome {
     let journal = RecordingJournal::default();
     let core = TestCore::new(now);
     let clock = types::SimulatedClock::new(now);
-    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let run_task = tokio::spawn(sequencer.run());
 
     let order = crate::PipelineOrder::new(sample_order("ord-seq", now)).into_validated(now);
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -562,6 +849,10 @@ async fn run_deterministic_sequence() -> ReplayOutcome {
         })
         .await
         .expect("queue order");
+    let ack = ack_rx
+        .await
+        .expect("order ack channel")
+        .expect("order accepted");
 
     let fill = Fill {
         order_id: OrderId("ord-seq".to_owned()),
@@ -594,15 +885,11 @@ async fn run_deterministic_sequence() -> ReplayOutcome {
         .await
         .expect("queue shutdown");
 
-    let final_snapshot = tokio::spawn(sequencer.run())
+    let final_snapshot = run_task
         .await
         .expect("sequencer join")
         .expect("sequencer result");
     shutdown_rx.await.expect("shutdown ack");
-    let ack = ack_rx
-        .await
-        .expect("order ack channel")
-        .expect("order accepted");
 
     let final_order = final_snapshot
         .state
@@ -699,6 +986,24 @@ fn sample_order(order_id: &str, now: DateTime<Utc>) -> OrderCore {
         reduce_only: false,
         dry_run: true,
         exec_hint: ExecHint::default(),
+        created_at: now,
+    }
+}
+
+fn sample_signal(now: DateTime<Utc>) -> Signal {
+    Signal {
+        id: SignalId("sig-unsupported".to_owned()),
+        agent: AgentId("athena".to_owned()),
+        instrument: InstrumentId("BTCUSDT".to_owned()),
+        direction: Side::Buy,
+        conviction: Decimal::new(75, 2),
+        sizing_hint: None,
+        arb_type: "momentum".to_owned(),
+        stop_loss: Decimal::new(49_000, 0),
+        take_profit: Some(Decimal::new(52_000, 0)),
+        thesis: "unsupported path".to_owned(),
+        urgency: Urgency::Normal,
+        metadata: serde_json::json!({}),
         created_at: now,
     }
 }

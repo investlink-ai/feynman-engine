@@ -418,9 +418,10 @@ Append-only event log for crash recovery, audit, and replay. Events are wrapped 
 
 ```rust
 /// Append-only event journal. Events are stored with their SequenceId.
-/// On restart: load_latest_snapshot → replay_from(snapshot_sequence_id + 1).
-/// Not on the hot path — Sequencer processes first, journals after.
-/// If journal is slow → events buffer in memory (BufferAndContinue policy).
+/// The Sequencer persists journal entries and snapshots as part of the commit
+/// path; append/snapshot failures fail the runtime closed instead of buffering.
+/// Startup currently restores the latest persisted snapshot and rejects any
+/// unapplied journal tail until replay bootstrap is implemented.
 #[async_trait]
 pub trait EventJournal: Send + Sync {
     async fn append(&self, event: &SequencedEvent<EngineEvent>) -> Result<()>;
@@ -438,7 +439,7 @@ pub trait EventJournal: Send + Sync {
 }
 ```
 
-`EngineEvent` is a 22-variant enum covering the full engine lifecycle. See `types/src/event.rs` for the canonical definitions. The `SequenceGenerator` (owned by Sequencer) assigns `SequenceId` values and resumes from the highest journaled ID on startup.
+`EngineEvent` is a 22-variant enum covering the full engine lifecycle. See `types/src/event.rs` for the canonical definitions. The `SequenceGenerator` (owned by Sequencer) assigns `SequenceId` values and resumes from the latest committed snapshot sequence after startup verifies that the journal has no unapplied tail.
 
 ## 5a. Reconciler Trait
 

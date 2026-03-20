@@ -1,9 +1,7 @@
-use chrono::{DateTime, Duration, Utc};
+use anyhow::anyhow;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use std::{
-    collections::VecDeque,
-    panic::{catch_unwind, AssertUnwindSafe},
-};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -16,9 +14,6 @@ use crate::{
 
 pub const HIGH_PRIORITY_CHANNEL_CAPACITY: usize = 64;
 pub const COMMAND_CHANNEL_CAPACITY: usize = 1024;
-
-const PANIC_WINDOW_SECS: i64 = 60;
-const MAX_PANICS_PER_WINDOW: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct SequencerHandle {
@@ -60,7 +55,6 @@ pub struct Sequencer<C, J, P, K> {
     command_rx: mpsc::Receiver<SequencerCommand>,
     client_order_id_generators: std::collections::HashMap<AgentId, ClientOrderIdGenerator>,
     restart_epoch: u16,
-    panic_timestamps: VecDeque<DateTime<Utc>>,
 }
 
 impl<C, J, P, K> Sequencer<C, J, P, K>
@@ -70,21 +64,46 @@ where
     P: PriceSource,
     K: crate::Clock,
 {
-    #[must_use]
-    pub fn new(
-        core: C,
+    pub async fn new(
+        mut core: C,
         journal: J,
         prices: P,
         clock: K,
         restart_epoch: u16,
-    ) -> (Self, SequencerHandle) {
+    ) -> Result<(Self, SequencerHandle)> {
         let (high_priority_tx, high_priority_rx) = mpsc::channel(HIGH_PRIORITY_CHANNEL_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
 
-        let current_sequence = core.state().last_sequence_id;
-        let snapshot_cache = core.snapshot(current_sequence, core.state().last_updated);
+        let latest_snapshot = journal.load_latest_snapshot().await?;
+        let journal_sequence = journal.latest_sequence_id().await?;
 
-        (
+        if let Some((_, snapshot)) = &latest_snapshot {
+            core.restore_snapshot(snapshot)?;
+        }
+
+        let has_unapplied_journal_tail = match latest_snapshot.as_ref() {
+            Some((snapshot_sequence, _)) => journal_sequence > *snapshot_sequence,
+            None => !journal.replay_from(SequenceId::ZERO).await?.is_empty(),
+        };
+
+        if has_unapplied_journal_tail {
+            return Err(EngineError::Journal(
+                "journal contains unapplied events beyond the latest persisted snapshot; replay bootstrap is not implemented yet"
+                    .to_owned(),
+            ));
+        }
+
+        let current_sequence = latest_snapshot
+            .as_ref()
+            .map_or(core.state().last_sequence_id, |(sequence_id, _)| {
+                *sequence_id
+            });
+        let snapshot_cache = latest_snapshot.map_or_else(
+            || core.snapshot(current_sequence, core.state().last_updated),
+            |(_, snapshot)| snapshot,
+        );
+
+        Ok((
             Self {
                 core,
                 journal,
@@ -96,13 +115,12 @@ where
                 command_rx,
                 client_order_id_generators: std::collections::HashMap::new(),
                 restart_epoch,
-                panic_timestamps: VecDeque::new(),
             },
             SequencerHandle {
                 high_priority_tx,
                 command_tx,
             },
-        )
+        ))
     }
 
     pub async fn run(mut self) -> Result<EngineStateSnapshot> {
@@ -111,8 +129,8 @@ where
                 break;
             };
 
-            if let Some(reply) = self.process_command(command).await {
-                self.drain_pending_commands().await;
+            if let Some(reply) = self.process_command(command).await? {
+                self.drain_pending_commands().await?;
                 let final_snapshot = self.snapshot_cache.clone();
                 let _ = reply.send(());
                 return Ok(final_snapshot);
@@ -144,23 +162,26 @@ where
         self.command_rx.try_recv().ok()
     }
 
-    async fn drain_pending_commands(&mut self) {
+    async fn drain_pending_commands(&mut self) -> Result<()> {
         while let Some(command) = self.try_next_pending_command() {
-            let _ = self.process_command(command).await;
+            let _ = self.process_command(command).await?;
         }
+        Ok(())
     }
 
-    async fn process_command(&mut self, command: SequencerCommand) -> Option<oneshot::Sender<()>> {
+    async fn process_command(
+        &mut self,
+        command: SequencerCommand,
+    ) -> Result<Option<oneshot::Sender<()>>> {
         let sequence_id = self.sequence_gen.next_id();
         let now = self.clock.now();
 
         let outcome = catch_unwind(AssertUnwindSafe(|| self.handle_command(command, now)));
         match outcome {
             Ok(Ok(outcome)) => {
-                if outcome.state_mutated {
-                    self.update_metadata(sequence_id, now);
-                    self.refresh_snapshot(sequence_id, now);
-                }
+                let should_commit_metadata = outcome.state_mutated || !outcome.events.is_empty();
+                let committed_snapshot =
+                    should_commit_metadata.then(|| self.snapshot_for_commit(sequence_id, now));
 
                 if !outcome.events.is_empty() {
                     let events = outcome
@@ -173,46 +194,38 @@ where
                         })
                         .collect::<Vec<_>>();
 
-                    if let Err(err) = self.journal.append_batch(&events).await {
-                        error!("failed to append sequencer events at {sequence_id}: {err}");
-                    }
+                    self.journal.append_batch(&events).await.map_err(|err| {
+                        EngineError::Journal(format!(
+                            "failed to append sequencer events at {sequence_id}: {err}"
+                        ))
+                    })?;
                 }
 
-                outcome.shutdown_reply
+                if let Some(snapshot) = committed_snapshot {
+                    self.journal
+                        .save_snapshot(sequence_id, &snapshot)
+                        .await
+                        .map_err(|err| {
+                            EngineError::Journal(format!(
+                                "failed to persist sequencer snapshot at {sequence_id}: {err}"
+                            ))
+                        })?;
+                    self.update_metadata(sequence_id, now);
+                    self.snapshot_cache = snapshot;
+                }
+
+                Ok(outcome.shutdown_reply)
             }
             Ok(Err(err)) => {
                 error!("sequencer command failed at {sequence_id}: {err}");
-                None
+                Err(err)
             }
             Err(payload) => {
                 error!("sequencer panic caught at {sequence_id}: {:?}", payload);
-                self.record_panic(now);
-
-                if self.panic_timestamps.len() > MAX_PANICS_PER_WINDOW {
-                    let halt_reason = "repeated sequencer panics".to_owned();
-                    match self.core.halt_all(halt_reason.clone(), now) {
-                        Ok(()) => {
-                            self.update_metadata(sequence_id, now);
-                            self.refresh_snapshot(sequence_id, now);
-
-                            let event = SequencedEvent {
-                                sequence_id,
-                                timestamp: now,
-                                event: EngineEvent::EngineHalted {
-                                    reason: halt_reason,
-                                },
-                            };
-                            if let Err(err) = self.journal.append(&event).await {
-                                error!(
-                                    "failed to append panic-triggered halt event at {sequence_id}: {err}"
-                                );
-                            }
-                        }
-                        Err(err) => error!("failed to halt after repeated panics: {err}"),
-                    }
-                }
-
-                None
+                Err(EngineError::Internal(anyhow!(
+                    "sequencer panic at {sequence_id}: {:?}",
+                    payload
+                )))
             }
         }
     }
@@ -462,20 +475,19 @@ where
         state.last_updated = now;
     }
 
-    fn refresh_snapshot(&mut self, sequence_id: SequenceId, now: DateTime<Utc>) {
-        self.snapshot_cache = self.core.snapshot(sequence_id, now);
-    }
-
-    fn record_panic(&mut self, now: DateTime<Utc>) {
-        let cutoff = now - Duration::seconds(PANIC_WINDOW_SECS);
-        while self
-            .panic_timestamps
-            .front()
-            .is_some_and(|timestamp| *timestamp < cutoff)
-        {
-            let _ = self.panic_timestamps.pop_front();
+    fn snapshot_for_commit(
+        &self,
+        sequence_id: SequenceId,
+        now: DateTime<Utc>,
+    ) -> EngineStateSnapshot {
+        let mut state = self.core.state().clone();
+        state.last_sequence_id = sequence_id;
+        state.last_updated = now;
+        EngineStateSnapshot {
+            state,
+            sequence_id,
+            snapshot_at: now,
         }
-        self.panic_timestamps.push_back(now);
     }
 }
 

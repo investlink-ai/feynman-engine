@@ -82,6 +82,12 @@ pub trait EngineCore: Send {
     /// Mutable access to engine state. Only the Sequencer should call this.
     fn state_mut(&mut self) -> &mut EngineState;
 
+    /// Restore state from the latest persisted snapshot during startup.
+    fn restore_snapshot(&mut self, snapshot: &EngineStateSnapshot) -> Result<()> {
+        *self.state_mut() = snapshot.state.clone();
+        Ok(())
+    }
+
     /// Cheap clone for read-only consumers.
     #[must_use]
     fn snapshot(&self, sequence_id: SequenceId, snapshot_at: DateTime<Utc>) -> EngineStateSnapshot {
@@ -137,8 +143,10 @@ pub trait EngineCore: Send {
 
 /// Append-only event log with snapshot support.
 ///
-/// Every event produced by the Sequencer is appended to the journal.
-/// State can be reconstructed by loading a snapshot and replaying events since.
+/// Every event produced by the Sequencer is appended to the journal as part of
+/// the commit path. Startup currently restores the latest persisted snapshot and
+/// fails closed if the journal contains an unapplied tail; applying replayed
+/// events back into `EngineCore` is not implemented yet.
 #[async_trait::async_trait]
 pub trait EventJournal: Send + Sync {
     /// Append a sequenced event to the journal.
@@ -199,6 +207,8 @@ pub enum SequencerCommand {
         order: PipelineOrder<Validated>,
         respond: oneshot::Sender<Result<OrderAck>>,
     },
+    /// Placeholder for future signal ingress. The current sequencer returns
+    /// `EngineError::UnsupportedCommand` for this variant.
     SubmitSignal {
         signal: Signal,
         respond: oneshot::Sender<Result<SignalAck>>,
