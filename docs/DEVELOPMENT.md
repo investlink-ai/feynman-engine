@@ -8,7 +8,7 @@ Quick cheat sheet for common development tasks. For the full dev workflow (issue
 
 ```bash
 # Verify Rust toolchain
-rustc --version  # 1.82+
+rustc --version  # 1.83+
 cargo --version
 
 # Install protobuf compiler
@@ -104,6 +104,7 @@ grpcurl -plaintext localhost:50051 feynman.engine.v1.ExecutionService/GetEngineH
 ## Docker
 
 ```bash
+./scripts/smoke-test.sh                             # End-to-end Docker validation
 docker build -f docker/engine.Dockerfile -t feynman-engine:latest .
 docker compose -f docker/docker-compose.yml up -d      # Start engine + Redis
 docker compose logs -f engine                          # View logs

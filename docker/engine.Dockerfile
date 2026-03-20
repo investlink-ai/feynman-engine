@@ -3,7 +3,7 @@
 # Stage 2: Runtime
 
 # ── Build Stage ──
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.83-bookworm AS builder
 
 WORKDIR /build
 
@@ -36,8 +36,8 @@ COPY --from=builder /build/target/release/feynman-engine /usr/local/bin/
 COPY config/default.toml /config/default.toml
 
 # Health probe
-COPY --from=fullstorydev/grpc-health-probe:v0.4.28 \
-    /bin/grpc_health_probe /usr/local/bin/
+COPY --from=ghcr.io/grpc-ecosystem/grpc-health-probe:v0.4.42 \
+    /ko-app/grpc-health-probe /usr/local/bin/grpc_health_probe
 
 # Change ownership
 RUN chown -R feynman:feynman /config
