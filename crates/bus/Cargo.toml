@@ -16,4 +16,9 @@ fred.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 proptest.workspace = true
+
+[[test]]
+name = "bus"
+path = "../../tests/integration/bus.rs"
