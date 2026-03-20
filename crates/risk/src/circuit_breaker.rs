@@ -77,6 +77,10 @@ impl CircuitBreaker for Cb1MaxSingleOrderNotional {
 // ─── CB-2: Max position per instrument ───────────────────────────────────────
 
 /// Rejects orders that would push gross instrument exposure past the cap.
+///
+/// Uses a signed notional delta (positive for buys, negative for sells) so that
+/// risk-reducing trades — a sell against a long, a buy to cover a short — are
+/// not incorrectly rejected when the book is near the limit.
 pub(crate) struct Cb2MaxInstrumentPosition;
 
 impl sealed::Sealed for Cb2MaxInstrumentPosition {}
@@ -97,18 +101,27 @@ impl CircuitBreaker for Cb2MaxInstrumentPosition {
             _ => return CircuitBreakerResult::Pass,
         };
         let order_notional = core.qty * price;
-        let current_gross = ctx
+        // Signed delta: positive for buys (increases long / covers short),
+        // negative for sells (reduces long / increases short).
+        let signed_delta = match core.side {
+            types::Side::Buy => order_notional,
+            types::Side::Sell => -order_notional,
+        };
+        let (current_net, current_gross) = ctx
             .firm_book
             .instruments
             .iter()
             .find(|e| e.instrument == core.instrument_id)
-            .map_or(Decimal::ZERO, |e| e.gross_notional_usd);
-        let projected = current_gross + order_notional;
-        if projected > ctx.config.max_instrument_position_notional {
+            .map_or((Decimal::ZERO, Decimal::ZERO), |e| {
+                (e.net_notional_usd, e.gross_notional_usd)
+            });
+        let (_projected_net, projected_gross) =
+            crate::project_net_and_gross(current_net, current_gross, signed_delta);
+        if projected_gross > ctx.config.max_instrument_position_notional {
             return reject(
                 "CB-2",
                 format!(
-                    "projected instrument exposure {projected} exceeds max {}",
+                    "projected instrument gross exposure {projected_gross} exceeds max {}",
                     ctx.config.max_instrument_position_notional
                 ),
             );
@@ -433,6 +446,19 @@ impl CircuitBreaker for Cb9VenueDisconnected {
                 )
             }
         };
+        // Fail closed: venue must be in Connected state before we even check heartbeat age.
+        // Stale, Reconnecting, and Disconnected states are never submittable even if the
+        // last heartbeat timestamp is recent (the state machine tracks transitions that
+        // heartbeat age alone cannot capture).
+        if !health.is_submittable() {
+            return reject(
+                "CB-9",
+                format!(
+                    "venue {venue_id} is not in Connected state ({:?}) — submission blocked",
+                    health.state
+                ),
+            );
+        }
         let last_hb = match health.last_heartbeat_at {
             Some(t) => t,
             None => {
@@ -598,8 +624,16 @@ impl CircuitBreakerBank {
     /// 5. CB-3: fresh gross notional evaluation; latch on Reject.
     ///    6–12. Per-order / rate / connectivity checks (CB-11, CB-1, CB-2, CB-6–CB-9).
     pub fn check_all(&mut self, ctx: &CircuitBreakerContext<'_>) -> CircuitBreakerResult {
-        // 1. Early return on latched HaltAll (CB-4 > CB-5 — daily loss takes precedence)
-        if self.cb4.is_tripped() {
+        // 0. Cancels never increase exposure — they bypass all circuit breakers.
+        if ctx.operation_kind == crate::OperationKind::Cancel {
+            return CircuitBreakerResult::Pass;
+        }
+
+        let is_reduce_only = ctx.operation_kind == crate::OperationKind::ReduceOnly;
+
+        // 1. Early return on latched HaltAll (CB-4 > CB-5 — daily loss takes precedence).
+        //    ReduceOnly operations are allowed through so resting positions can be flattened.
+        if self.cb4.is_tripped() && !is_reduce_only {
             let agent = ctx.order.map(|o| o.core().agent_id.to_string());
             warn!(
                 breaker = "CB-4",
@@ -611,7 +645,7 @@ impl CircuitBreakerBank {
                 "daily loss halt latched — manual reset + CIO approval required",
             );
         }
-        if self.cb5.is_tripped() {
+        if self.cb5.is_tripped() && !is_reduce_only {
             let agent = ctx.order.map(|o| o.core().agent_id.to_string());
             warn!(
                 breaker = "CB-5",
@@ -620,8 +654,10 @@ impl CircuitBreakerBank {
             );
             return halt("CB-5", "hourly loss halt latched — manual reset required");
         }
-        // 2. Early return on latched Reject (CB-3)
-        if self.cb3.is_tripped() {
+        // 2. Early return on latched Reject (CB-3).
+        //    ReduceOnly operations are allowed through: they reduce gross notional, which
+        //    is exactly what is needed to clear the CB-3 breach condition.
+        if self.cb3.is_tripped() && !is_reduce_only {
             let agent = ctx.order.map(|o| o.core().agent_id.to_string());
             warn!(
                 breaker = "CB-3",
@@ -640,49 +676,59 @@ impl CircuitBreakerBank {
             return r;
         }
 
-        // 4. CB-4: daily loss (latch on HaltAll)
-        let r = self.cb4.check(ctx);
-        if r != CircuitBreakerResult::Pass {
-            if matches!(r, CircuitBreakerResult::HaltAll { .. }) {
-                self.cb4.latch();
-                error!(
-                    breaker = "CB-4",
-                    daily_pnl = %ctx.firm_book.daily_pnl,
-                    nav = %ctx.firm_book.nav,
-                    "HALT ALL: daily loss circuit breaker latched"
-                );
+        // 4. CB-4: daily loss (latch on HaltAll).
+        //    ReduceOnly skips the fresh evaluation — it is de-risking, not adding exposure.
+        if !is_reduce_only {
+            let r = self.cb4.check(ctx);
+            if r != CircuitBreakerResult::Pass {
+                if matches!(r, CircuitBreakerResult::HaltAll { .. }) {
+                    self.cb4.latch();
+                    error!(
+                        breaker = "CB-4",
+                        daily_pnl = %ctx.firm_book.daily_pnl,
+                        nav = %ctx.firm_book.nav,
+                        "HALT ALL: daily loss circuit breaker latched"
+                    );
+                }
+                return r;
             }
-            return r;
         }
 
-        // 5. CB-5: hourly loss (latch on HaltAll)
-        let r = self.cb5.check(ctx);
-        if r != CircuitBreakerResult::Pass {
-            if matches!(r, CircuitBreakerResult::HaltAll { .. }) {
-                self.cb5.latch();
-                error!(
-                    breaker = "CB-5",
-                    hourly_pnl = %ctx.firm_book.hourly_pnl,
-                    nav = %ctx.firm_book.nav,
-                    "HALT ALL: hourly loss circuit breaker latched"
-                );
+        // 5. CB-5: hourly loss (latch on HaltAll).
+        //    ReduceOnly skips the fresh evaluation for the same reason.
+        if !is_reduce_only {
+            let r = self.cb5.check(ctx);
+            if r != CircuitBreakerResult::Pass {
+                if matches!(r, CircuitBreakerResult::HaltAll { .. }) {
+                    self.cb5.latch();
+                    error!(
+                        breaker = "CB-5",
+                        hourly_pnl = %ctx.firm_book.hourly_pnl,
+                        nav = %ctx.firm_book.nav,
+                        "HALT ALL: hourly loss circuit breaker latched"
+                    );
+                }
+                return r;
             }
-            return r;
         }
 
-        // 6. CB-3: firm gross notional (latch on Reject)
-        let r = self.cb3.check(ctx);
-        if r != CircuitBreakerResult::Pass {
-            if matches!(r, CircuitBreakerResult::Reject { .. }) {
-                self.cb3.latch();
-                error!(
-                    breaker = "CB-3",
-                    gross_notional = %ctx.firm_book.gross_notional,
-                    limit = %ctx.config.max_firm_gross_notional,
-                    "firm gross notional circuit breaker latched — all new orders blocked"
-                );
+        // 6. CB-3: firm gross notional (latch on Reject).
+        //    ReduceOnly skips: a sell/cover reduces gross notional, which is the desired outcome
+        //    when CB-3 is near or above its limit.
+        if !is_reduce_only {
+            let r = self.cb3.check(ctx);
+            if r != CircuitBreakerResult::Pass {
+                if matches!(r, CircuitBreakerResult::Reject { .. }) {
+                    self.cb3.latch();
+                    error!(
+                        breaker = "CB-3",
+                        gross_notional = %ctx.firm_book.gross_notional,
+                        limit = %ctx.config.max_firm_gross_notional,
+                        "firm gross notional circuit breaker latched — all new orders blocked"
+                    );
+                }
+                return r;
             }
-            return r;
         }
 
         // 7. CB-11: queue depth (backpressure before per-order work)
@@ -943,6 +989,7 @@ mod tests {
             agent_orders_last_60s: agent_orders,
             sequencer_queue_depth: 0,
             execution_mode: ExecutionMode::Paper,
+            operation_kind: crate::OperationKind::NewOrder,
             config,
             clock,
         }
@@ -1499,6 +1546,7 @@ mod tests {
             agent_orders_last_60s: &agent_orders,
             sequencer_queue_depth: 0,
             execution_mode: ExecutionMode::Paper,
+            operation_kind: crate::OperationKind::NewOrder,
             config: &config,
             clock: &wall_clock,
         };
@@ -1677,6 +1725,7 @@ mod tests {
             agent_orders_last_60s: &agent_orders,
             sequencer_queue_depth: 0,
             execution_mode: ExecutionMode::Live,
+            operation_kind: crate::OperationKind::NewOrder,
             config: &config,
             clock: &clock,
         };
@@ -1718,6 +1767,175 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── CB-2: side-aware projection ───────────────────────────────────────────
+
+    #[test]
+    fn cb2_sell_against_long_reduces_exposure_and_passes() {
+        // Book is long 400_000 on BTC-USD (close to the 500_000 cap).
+        // A sell order should reduce exposure and must NOT be rejected.
+        let config = test_config(); // max_instrument_position_notional = 500_000
+        let mut book = test_firm_book();
+        book.instruments.push(types::InstrumentExposure {
+            instrument: InstrumentId("BTC-USD".into()),
+            net_qty: dec!(4),
+            gross_qty: dec!(4),
+            net_notional_usd: dec!(400_000),
+            gross_notional_usd: dec!(400_000),
+            by_venue: Vec::new(),
+            by_agent: Vec::new(),
+        });
+        let clock = SimulatedClock::at_epoch();
+        // Sell 1 unit @ 100_000 — notional = 100_000, reduces gross to 300_000
+        let order = PipelineOrder::new(OrderCore {
+            id: OrderId("ord-sell".into()),
+            agent_id: AgentId("satoshi".into()),
+            instrument_id: InstrumentId("BTC-USD".into()),
+            venue_id: VenueId("bybit".into()),
+            side: types::Side::Sell,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            qty: dec!(1),
+            price: Some(dec!(100_000)),
+            trigger_price: None,
+            stop_loss: None,
+            take_profit: None,
+            post_only: false,
+            reduce_only: true,
+            dry_run: true,
+            exec_hint: ExecHint::default(),
+            created_at: Utc::now(),
+        })
+        .into_validated(Utc::now());
+        let health: HashMap<VenueId, VenueConnectionHealth> = HashMap::new();
+        let stats: HashMap<VenueId, VenueErrorStats> = HashMap::new();
+        let agent_orders: HashMap<AgentId, u32> = HashMap::new();
+        let ctx = test_ctx(
+            Some(&order),
+            &book,
+            &config,
+            &clock,
+            &health,
+            &stats,
+            &agent_orders,
+        );
+        let cb = Cb2MaxInstrumentPosition;
+        assert_eq!(
+            cb.check(&ctx),
+            CircuitBreakerResult::Pass,
+            "sell against long should pass CB-2"
+        );
+    }
+
+    // ── CB-9: state check ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cb9_disconnected_state_rejects_even_with_recent_heartbeat() {
+        let config = test_config();
+        let book = test_firm_book();
+        let order = test_order(dec!(1), dec!(100));
+        // Heartbeat is very recent, but venue is in Disconnected state.
+        let mut health_record = VenueConnectionHealth::new(VenueId("bybit".into()));
+        health_record.last_heartbeat_at = Some(Utc::now());
+        health_record.state = types::ConnectionState::Disconnected;
+        let health = HashMap::from([(VenueId("bybit".into()), health_record)]);
+        let stats: HashMap<VenueId, VenueErrorStats> = HashMap::new();
+        let agent_orders: HashMap<AgentId, u32> = HashMap::new();
+        let wall_clock = types::WallClock;
+        let ctx = CircuitBreakerContext {
+            order: Some(&order),
+            firm_book: &book,
+            venue_health: &health,
+            venue_error_stats: &stats,
+            firm_orders_last_60s: 0,
+            agent_orders_last_60s: &agent_orders,
+            sequencer_queue_depth: 0,
+            execution_mode: ExecutionMode::Paper,
+            operation_kind: crate::OperationKind::NewOrder,
+            config: &config,
+            clock: &wall_clock,
+        };
+        let cb = Cb9VenueDisconnected;
+        assert!(
+            matches!(
+                cb.check(&ctx),
+                CircuitBreakerResult::Reject {
+                    breaker: "CB-9",
+                    ..
+                }
+            ),
+            "disconnected venue must be rejected even with a fresh heartbeat"
+        );
+    }
+
+    // ── Bank: Cancel / ReduceOnly bypass of HaltAll ───────────────────────────
+
+    #[test]
+    fn cancel_bypasses_latched_cb4_halt() {
+        let config = test_config();
+        let mut book = test_firm_book();
+        book.daily_pnl = dec!(-50_001); // trips CB-4
+        let clock = SimulatedClock::at_epoch();
+        let health: HashMap<VenueId, VenueConnectionHealth> = HashMap::new();
+        let stats: HashMap<VenueId, VenueErrorStats> = HashMap::new();
+        let agent_orders: HashMap<AgentId, u32> = HashMap::new();
+        let mut bank = CircuitBreakerBank::new();
+
+        // First call trips and latches CB-4
+        let ctx = test_ctx(None, &book, &config, &clock, &health, &stats, &agent_orders);
+        assert!(matches!(
+            bank.check_all(&ctx),
+            CircuitBreakerResult::HaltAll {
+                breaker: "CB-4",
+                ..
+            }
+        ));
+        assert!(bank.is_halt_active());
+
+        // A Cancel operation must pass even while CB-4 is latched
+        let mut cancel_ctx = test_ctx(None, &book, &config, &clock, &health, &stats, &agent_orders);
+        cancel_ctx.operation_kind = crate::OperationKind::Cancel;
+        assert_eq!(
+            bank.check_all(&cancel_ctx),
+            CircuitBreakerResult::Pass,
+            "Cancel must bypass latched CB-4 halt"
+        );
+    }
+
+    #[test]
+    fn reduce_only_bypasses_latched_cb4_halt() {
+        let config = test_config();
+        let mut book = test_firm_book();
+        book.daily_pnl = dec!(-50_001); // trips CB-4
+        let clock = SimulatedClock::at_epoch();
+        let order = test_order(dec!(1), dec!(100));
+        let health = HashMap::from([(VenueId("bybit".into()), connected_venue_health())]);
+        let stats: HashMap<VenueId, VenueErrorStats> = HashMap::new();
+        let agent_orders: HashMap<AgentId, u32> = HashMap::new();
+        let mut bank = CircuitBreakerBank::new();
+
+        // Trip and latch CB-4
+        let ctx = test_ctx(None, &book, &config, &clock, &health, &stats, &agent_orders);
+        bank.check_all(&ctx);
+        assert!(bank.is_halt_active());
+
+        // A ReduceOnly operation must pass through the latched CB-4 check
+        let mut reduce_ctx = test_ctx(
+            Some(&order),
+            &book,
+            &config,
+            &clock,
+            &health,
+            &stats,
+            &agent_orders,
+        );
+        reduce_ctx.operation_kind = crate::OperationKind::ReduceOnly;
+        assert_eq!(
+            bank.check_all(&reduce_ctx),
+            CircuitBreakerResult::Pass,
+            "ReduceOnly must bypass latched CB-4 halt"
+        );
     }
 
     // ── Bank: reset validation ────────────────────────────────────────────────
@@ -1785,6 +2003,7 @@ mod tests {
                 agent_orders_last_60s: &agent_orders,
                 sequencer_queue_depth: queue_depth,
                 execution_mode: ExecutionMode::Paper,
+                operation_kind: crate::OperationKind::NewOrder,
                 config: &config,
                 clock: &clock,
             };

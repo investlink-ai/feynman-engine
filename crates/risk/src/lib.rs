@@ -54,6 +54,23 @@ pub enum ExecutionMode {
     Backtest,
 }
 
+/// The kind of operation being evaluated by the circuit breaker bank.
+///
+/// `Cancel` operations bypass all circuit breakers — they never increase exposure.
+/// `NewOrder` operations are subject to all checks, including latched halts.
+/// `ReduceOnly` is a convenience alias recognised by the HaltAll early-returns:
+/// the latch still fires for new directional orders, but `ReduceOnly` is allowed
+/// through CB-3/4/5 so resting positions can be flattened during a halt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationKind {
+    /// A new order that may increase exposure.
+    NewOrder,
+    /// A cancel request — never increases exposure, always allowed through.
+    Cancel,
+    /// A reduce-only order — allowed through latched HaltAll/GrossNotional checks.
+    ReduceOnly,
+}
+
 /// Thresholds for all 11 compiled-in circuit breakers.
 ///
 /// Not hot-reloadable — changed only via code deploy and review.
@@ -95,7 +112,7 @@ pub struct VenueErrorStats {
 /// The Sequencer constructs this from live engine state before calling
 /// `CircuitBreakerBank::check_all`.
 pub struct CircuitBreakerContext<'a> {
-    /// The order being evaluated. `None` for latch-state pre-checks.
+    /// The order being evaluated. `None` for latch-state pre-checks and cancels.
     pub order: Option<&'a PipelineOrder<Validated>>,
     pub firm_book: &'a FirmBook,
     /// Current connection health per venue, keyed by `VenueId`.
@@ -110,6 +127,8 @@ pub struct CircuitBreakerContext<'a> {
     pub sequencer_queue_depth: usize,
     /// Current engine execution mode for CB-10.
     pub execution_mode: ExecutionMode,
+    /// Kind of operation being evaluated — determines which circuit breakers apply.
+    pub operation_kind: OperationKind,
     pub config: &'a CircuitBreakerConfig,
     pub clock: &'a dyn Clock,
 }
@@ -124,7 +143,9 @@ pub enum CircuitBreakerResult {
         breaker: &'static str,
         reason: String,
     },
-    /// Full trading halt — all new orders and cancels blocked until manually reset.
+    /// Full trading halt — new orders blocked until manually reset.
+    /// Cancels and `ReduceOnly` orders are allowed through so resting positions
+    /// can be flattened; `NewOrder` operations are hard-blocked.
     HaltAll {
         breaker: &'static str,
         reason: String,
@@ -231,6 +252,34 @@ struct ResizeCandidate {
     new_qty: Decimal,
     reason: String,
     warning: RiskViolation,
+}
+
+/// Project (net_notional, gross_notional) after applying a signed notional delta.
+///
+/// Correctly handles paired long/short book entries: a sell against a long reduces
+/// gross rather than inflating it; a buy against a short covers rather than adds.
+/// Used by CB-2 and the L1 risk gate.
+pub(crate) fn project_net_and_gross(
+    current_net: Decimal,
+    current_gross: Decimal,
+    signed_delta: Decimal,
+) -> (Decimal, Decimal) {
+    let two = dec!(2);
+    let mut long = (current_gross + current_net) / two;
+    let mut short = (current_gross - current_net) / two;
+
+    if signed_delta >= Decimal::ZERO {
+        let reduction = signed_delta.min(short);
+        short -= reduction;
+        long += signed_delta - reduction;
+    } else {
+        let sell_qty = signed_delta.abs();
+        let reduction = sell_qty.min(long);
+        long -= reduction;
+        short += sell_qty - reduction;
+    }
+
+    (long - short, long + short)
 }
 
 impl AgentRiskManager {
@@ -919,22 +968,7 @@ impl AgentRiskManager {
         current_gross: Decimal,
         signed_delta: Decimal,
     ) -> (Decimal, Decimal) {
-        let two = dec!(2);
-        let mut long = (current_gross + current_net) / two;
-        let mut short = (current_gross - current_net) / two;
-
-        if signed_delta >= Decimal::ZERO {
-            let reduction = signed_delta.min(short);
-            short -= reduction;
-            long += signed_delta - reduction;
-        } else {
-            let sell_qty = signed_delta.abs();
-            let reduction = sell_qty.min(long);
-            long -= reduction;
-            short += sell_qty - reduction;
-        }
-
-        (long - short, long + short)
+        project_net_and_gross(current_net, current_gross, signed_delta)
     }
 
     fn rejected(violations: Vec<RiskViolation>) -> RiskOutcome {
