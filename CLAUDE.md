@@ -62,6 +62,11 @@ gh pr create --draft --base main
 
 **Branch naming:** `feat/`, `fix/`, `ops/`, `research/`
 
+### PR Communication
+
+- Put verification evidence in the PR body, commit message context, or direct user handoff summary.
+- Do **not** post raw testing logs or verification summaries as PR comments unless the user explicitly asks for a comment.
+
 ---
 
 ## Rust Standards (non-negotiable)
