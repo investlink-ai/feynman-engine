@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -880,6 +880,7 @@ impl PaperAdapterConfig {
 
 #[derive(Debug, Default)]
 struct PaperAdapterState {
+    acknowledged_orders: HashSet<VenueOrderId>,
     orderbooks: HashMap<MarketId, types::OrderbookSnapshot>,
     open_orders: HashMap<VenueOrderId, PaperOpenOrder>,
     idempotency_cache: HashMap<ClientOrderId, VenueOrderAck>,
@@ -1209,23 +1210,27 @@ impl VenueAdapter for PaperAdapter {
             });
         }
 
-        let fill_to_broadcast = match simulation {
+        match simulation {
             FillSimulationOutcome::Resting => {
                 let mut state = self.state.lock().await;
                 state
                     .idempotency_cache
                     .insert(client_order_id.clone(), ack.clone());
+                state.acknowledged_orders.insert(venue_order_id.clone());
                 match submission.time_in_force {
                     types::TimeInForce::GTC => {
                         state.open_orders.insert(
                             venue_order_id.clone(),
                             PaperOpenOrder {
                                 submission,
-                                venue_order_id,
+                                venue_order_id: venue_order_id.clone(),
                                 accepted_at,
                                 filled_qty: Decimal::ZERO,
                             },
                         );
+                        state
+                            .post_ack_actions
+                            .insert(venue_order_id.clone(), PostAckActions::default());
                     }
                     types::TimeInForce::IOC => {
                         state.post_ack_actions.insert(
@@ -1251,7 +1256,6 @@ impl VenueAdapter for PaperAdapter {
                         ));
                     }
                 }
-                None
             }
             FillSimulationOutcome::Executed(simulated_fill) => {
                 let post_ack_fill = PostAckFill {
@@ -1267,6 +1271,7 @@ impl VenueAdapter for PaperAdapter {
                             state
                                 .idempotency_cache
                                 .insert(client_order_id.clone(), ack.clone());
+                            state.acknowledged_orders.insert(venue_order_id.clone());
                             state.open_orders.insert(
                                 venue_order_id.clone(),
                                 PaperOpenOrder {
@@ -1289,6 +1294,7 @@ impl VenueAdapter for PaperAdapter {
                             state
                                 .idempotency_cache
                                 .insert(client_order_id.clone(), ack.clone());
+                            state.acknowledged_orders.insert(venue_order_id.clone());
                             state.post_ack_actions.insert(
                                 venue_order_id.clone(),
                                 PostAckActions {
@@ -1322,6 +1328,7 @@ impl VenueAdapter for PaperAdapter {
                     state
                         .idempotency_cache
                         .insert(client_order_id.clone(), ack.clone());
+                    state.acknowledged_orders.insert(venue_order_id.clone());
                     state.post_ack_actions.insert(
                         venue_order_id.clone(),
                         PostAckActions {
@@ -1330,13 +1337,7 @@ impl VenueAdapter for PaperAdapter {
                         },
                     );
                 }
-
-                None
             }
-        };
-
-        if let Some(fill) = fill_to_broadcast {
-            self.broadcast_fill(fill).await;
         }
 
         Ok(ack)
@@ -1345,10 +1346,13 @@ impl VenueAdapter for PaperAdapter {
     async fn take_post_ack_actions(&self, venue_order_id: &VenueOrderId) -> Result<PostAckActions> {
         let actions = {
             let mut state = self.state.lock().await;
-            state
-                .post_ack_actions
-                .remove(venue_order_id)
-                .unwrap_or_default()
+            if let Some(actions) = state.post_ack_actions.remove(venue_order_id) {
+                actions
+            } else if state.acknowledged_orders.contains(venue_order_id) {
+                PostAckActions::default()
+            } else {
+                return Err(GatewayError::OrderNotFound(venue_order_id.to_string()));
+            }
         };
 
         for queued_fill in &actions.fills {
@@ -2623,6 +2627,169 @@ mod tests {
         assert_eq!(fill.qty, Decimal::new(2, 0));
         assert_eq!(fill.price, Decimal::new(10_005, 0));
         assert!(adapter.query_open_orders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn paper_adapter_duplicate_submission_returns_cached_ack_without_duplicate_fill() {
+        let now = Utc::now();
+        let fee_model: Arc<dyn types::FeeModel> = Arc::new(StaticFeeModel::zero_fee("paper"));
+        let simulator: Arc<dyn FillSimulator> = Arc::new(LiveOrderbookFillSimulator);
+        let mut adapter = PaperAdapter::new(
+            PaperAdapterConfig::new(VenueId("paper".into())),
+            simulator,
+            fee_model,
+        );
+        adapter.connect().await.unwrap();
+        adapter
+            .replace_orderbook(sample_orderbook(now))
+            .await
+            .unwrap();
+
+        let mut fills = adapter.subscribe_fills().await.unwrap();
+        let submission = sample_submission(
+            "athena-idem",
+            types::OrderType::Market,
+            types::Side::Buy,
+            Decimal::new(1, 0),
+            None,
+            types::TimeInForce::IOC,
+        );
+
+        let first_ack = adapter.submit_order(submission.clone()).await.unwrap();
+        let second_ack = adapter.submit_order(submission).await.unwrap();
+        assert_eq!(first_ack.venue_order_id, second_ack.venue_order_id);
+
+        let actions = adapter
+            .take_post_ack_actions(&first_ack.venue_order_id)
+            .await
+            .unwrap();
+        assert_eq!(actions.fills.len(), 1);
+
+        let fill = timeout(TokioDuration::from_secs(1), fills.recv())
+            .await
+            .expect("fill should arrive")
+            .expect("fill channel should stay open");
+        assert_eq!(fill.venue_order_id, first_ack.venue_order_id);
+        assert!(
+            timeout(TokioDuration::from_millis(50), fills.recv())
+                .await
+                .is_err(),
+            "duplicate submission must not emit a second fill"
+        );
+
+        let second_take_actions = adapter
+            .take_post_ack_actions(&first_ack.venue_order_id)
+            .await
+            .unwrap();
+        assert!(second_take_actions.fills.is_empty());
+        assert!(second_take_actions.cancellation_reason.is_none());
+
+        let retry_ack = adapter
+            .submit_order(sample_submission(
+                "athena-idem",
+                types::OrderType::Market,
+                types::Side::Buy,
+                Decimal::new(1, 0),
+                None,
+                types::TimeInForce::IOC,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retry_ack.venue_order_id, first_ack.venue_order_id);
+        let retry_actions = adapter
+            .take_post_ack_actions(&retry_ack.venue_order_id)
+            .await
+            .unwrap();
+        assert!(retry_actions.fills.is_empty());
+        assert!(retry_actions.cancellation_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn paper_adapter_post_ack_actions_are_idempotent_for_known_orders() {
+        let now = Utc::now();
+        let fee_model: Arc<dyn types::FeeModel> = Arc::new(StaticFeeModel::zero_fee("paper"));
+        let simulator: Arc<dyn FillSimulator> = Arc::new(LiveOrderbookFillSimulator);
+        let mut adapter = PaperAdapter::new(
+            PaperAdapterConfig::new(VenueId("paper".into())),
+            simulator,
+            fee_model,
+        );
+        adapter.connect().await.unwrap();
+        adapter
+            .replace_orderbook(sample_orderbook(now))
+            .await
+            .unwrap();
+
+        let submission = sample_submission(
+            "athena-post-ack",
+            types::OrderType::Market,
+            types::Side::Buy,
+            Decimal::new(1, 0),
+            None,
+            types::TimeInForce::IOC,
+        );
+
+        let ack = adapter.submit_order(submission).await.unwrap();
+        let actions = adapter
+            .take_post_ack_actions(&ack.venue_order_id)
+            .await
+            .unwrap();
+        assert_eq!(actions.fills.len(), 1);
+
+        let second_take = adapter
+            .take_post_ack_actions(&ack.venue_order_id)
+            .await
+            .unwrap();
+        assert!(second_take.fills.is_empty());
+        assert!(second_take.cancellation_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn paper_adapter_duplicate_resting_gtc_returns_empty_post_ack_actions() {
+        let now = Utc::now();
+        let fee_model: Arc<dyn types::FeeModel> = Arc::new(StaticFeeModel::zero_fee("paper"));
+        let simulator: Arc<dyn FillSimulator> = Arc::new(LiveOrderbookFillSimulator);
+        let mut adapter = PaperAdapter::new(
+            PaperAdapterConfig::new(VenueId("paper".into())),
+            simulator,
+            fee_model,
+        );
+        adapter.connect().await.unwrap();
+        adapter
+            .replace_orderbook(sample_orderbook(now))
+            .await
+            .unwrap();
+
+        let submission = sample_submission(
+            "athena-gtc-idem",
+            types::OrderType::Limit,
+            types::Side::Buy,
+            Decimal::new(1, 0),
+            Some(Decimal::new(9_995, 0)),
+            types::TimeInForce::GTC,
+        );
+
+        let first_ack = adapter.submit_order(submission.clone()).await.unwrap();
+        let second_ack = adapter.submit_order(submission).await.unwrap();
+        assert_eq!(first_ack.venue_order_id, second_ack.venue_order_id);
+
+        let first_actions = adapter
+            .take_post_ack_actions(&first_ack.venue_order_id)
+            .await
+            .unwrap();
+        assert!(first_actions.fills.is_empty());
+        assert!(first_actions.cancellation_reason.is_none());
+
+        let second_actions = adapter
+            .take_post_ack_actions(&first_ack.venue_order_id)
+            .await
+            .unwrap();
+        assert!(second_actions.fills.is_empty());
+        assert!(second_actions.cancellation_reason.is_none());
+
+        let open_orders = adapter.query_open_orders().await.unwrap();
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].venue_order_id, first_ack.venue_order_id);
     }
 
     #[tokio::test]
