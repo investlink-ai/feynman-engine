@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 types.workspace = true
+engine-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

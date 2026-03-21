@@ -23,12 +23,13 @@ pub use types::{
     AgentAllocation, AgentId, AgentRiskLimits, AgentStatus, ClientOrderId, ClientOrderIdGenerator,
     Clock, EngineEvent, Fill, FirmBook, InstrumentId, OrderCore, OrderId, OrderState,
     PipelineOrder, PriceSource, ReconciliationAction, ReconciliationReport, RiskApprovalStamp,
-    RiskCheckResult, RiskLimits, RiskViolation, RoutingAssignment, SequenceId, SequencedEvent,
-    Signal, SignalId, TrackedPosition, Validated, VenueId,
+    RiskCheckResult, RiskLimits, RiskViolation, Routed, RoutingAssignment, SequenceId,
+    SequencedEvent, Signal, SignalId, TrackedPosition, Validated, VenueId, VenueOrderId,
 };
 
 pub use sequencer::{
     Sequencer, SequencerHandle, COMMAND_CHANNEL_CAPACITY, HIGH_PRIORITY_CHANNEL_CAPACITY,
+    VENUE_SUBMIT_CHANNEL_CAPACITY,
 };
 
 /// Result type for engine operations.
@@ -236,6 +237,17 @@ pub enum SequencerCommand {
         signal: Signal,
         respond: oneshot::Sender<Result<SignalAck>>,
     },
+    /// Venue acknowledged the submitted order. Transitions the order record to `Submitted`.
+    OnVenueAck {
+        order_id: OrderId,
+        venue_order_id: VenueOrderId,
+        submitted_at: DateTime<Utc>,
+    },
+    /// Venue submission failed (adapter error or no adapter registered for the venue).
+    OnVenueSubmitFailed {
+        order_id: OrderId,
+        reason: String,
+    },
     OnFill {
         fill: Fill,
     },
@@ -275,7 +287,9 @@ impl SequencerCommand {
     #[must_use]
     pub fn is_high_priority(&self) -> bool {
         match self {
-            Self::OnFill { .. }
+            Self::OnVenueAck { .. }
+            | Self::OnVenueSubmitFailed { .. }
+            | Self::OnFill { .. }
             | Self::OnReconciliation { .. }
             | Self::HaltAll { .. }
             | Self::ResetCircuitBreaker { .. }
@@ -368,6 +382,9 @@ pub struct OrderRecord {
     pub core: OrderCore,
     pub state: OrderState,
     pub client_order_id: ClientOrderId,
+    /// Set by `OnVenueAck` once the venue has accepted the order.
+    #[serde(default)]
+    pub venue_order_id: Option<VenueOrderId>,
     pub fills: Vec<Fill>,
     pub created_at: DateTime<Utc>,
     pub last_updated: DateTime<Utc>,

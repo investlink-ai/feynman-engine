@@ -530,6 +530,7 @@ async fn test_on_fill_updates_order_state_and_journals_fill() {
         core: validated.core.clone(),
         state: OrderState::Accepted,
         client_order_id: ClientOrderId("athena-1-000000-r07".to_owned()),
+        venue_order_id: Some(VenueOrderId("venue-fill-1".to_owned())),
         fills: Vec::new(),
         created_at: now,
         last_updated: now,
@@ -1006,6 +1007,207 @@ async fn run_deterministic_sequence() -> ReplayOutcome {
         sequence_id: final_snapshot.sequence_id,
         fill_count: final_order.fills.len(),
     }
+}
+
+// ─── Pipeline wiring tests ───
+
+#[tokio::test]
+async fn test_submit_order_emits_order_routed() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let run_task = tokio::spawn(sequencer.run());
+
+    let order = crate::PipelineOrder::new(sample_order("ord-routed", now)).into_validated(now);
+    let (ack_tx, ack_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitOrder {
+            order,
+            respond: ack_tx,
+        })
+        .await
+        .expect("queue order");
+    let ack = ack_rx.await.expect("ack channel").expect("order accepted");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::Shutdown {
+            respond: shutdown_tx,
+        })
+        .await
+        .expect("queue shutdown");
+    let final_snapshot = run_task
+        .await
+        .expect("sequencer join")
+        .expect("sequencer result");
+    shutdown_rx.await.expect("shutdown ack");
+
+    // Event sequence: received → validated → risk_checked → routed
+    let tags: Vec<_> = journal
+        .events()
+        .iter()
+        .map(|e| event_tag(&e.event))
+        .collect();
+    assert_eq!(
+        tags,
+        vec![
+            "order_received",
+            "order_validated",
+            "order_risk_checked",
+            "order_routed"
+        ]
+    );
+
+    // OrderRecord state is Pending (waiting for venue ack)
+    let record = final_snapshot
+        .state
+        .orders
+        .get(&OrderId("ord-routed".to_owned()))
+        .expect("order record");
+    assert_eq!(record.state, OrderState::Pending);
+    assert_eq!(record.client_order_id, ack.client_order_id);
+    assert_eq!(record.venue_order_id, None);
+}
+
+#[tokio::test]
+async fn test_venue_ack_transitions_order_to_submitted() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let run_task = tokio::spawn(sequencer.run());
+
+    // Submit order (transitions to Pending + Routed)
+    let order = crate::PipelineOrder::new(sample_order("ord-ack", now)).into_validated(now);
+    let (ack_tx, ack_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitOrder {
+            order,
+            respond: ack_tx,
+        })
+        .await
+        .expect("queue order");
+    ack_rx.await.expect("ack channel").expect("order accepted");
+
+    // Send venue ack
+    let venue_order_id = VenueOrderId("bybit-12345".to_owned());
+    handle
+        .send(SequencerCommand::OnVenueAck {
+            order_id: OrderId("ord-ack".to_owned()),
+            venue_order_id: venue_order_id.clone(),
+            submitted_at: now,
+        })
+        .await
+        .expect("queue venue ack");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::Shutdown {
+            respond: shutdown_tx,
+        })
+        .await
+        .expect("queue shutdown");
+    let final_snapshot = run_task
+        .await
+        .expect("sequencer join")
+        .expect("sequencer result");
+    shutdown_rx.await.expect("shutdown ack");
+
+    // Last event is order_submitted
+    let tags: Vec<_> = journal
+        .events()
+        .iter()
+        .map(|e| event_tag(&e.event))
+        .collect();
+    assert!(
+        tags.contains(&"order_submitted".to_owned()),
+        "expected order_submitted in {tags:?}"
+    );
+
+    // Order state is now Submitted and venue_order_id is set
+    let record = final_snapshot
+        .state
+        .orders
+        .get(&OrderId("ord-ack".to_owned()))
+        .expect("order record");
+    assert_eq!(record.state, OrderState::Submitted);
+    assert_eq!(record.venue_order_id, Some(venue_order_id));
+}
+
+#[tokio::test]
+async fn test_venue_submit_failed_transitions_order_to_rejected() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let run_task = tokio::spawn(sequencer.run());
+
+    // Submit order
+    let order = crate::PipelineOrder::new(sample_order("ord-fail", now)).into_validated(now);
+    let (ack_tx, ack_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitOrder {
+            order,
+            respond: ack_tx,
+        })
+        .await
+        .expect("queue order");
+    ack_rx.await.expect("ack channel").expect("order accepted");
+
+    // Simulate venue rejection
+    handle
+        .send(SequencerCommand::OnVenueSubmitFailed {
+            order_id: OrderId("ord-fail".to_owned()),
+            reason: "insufficient margin".to_owned(),
+        })
+        .await
+        .expect("queue venue submit failed");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::Shutdown {
+            respond: shutdown_tx,
+        })
+        .await
+        .expect("queue shutdown");
+    let final_snapshot = run_task
+        .await
+        .expect("sequencer join")
+        .expect("sequencer result");
+    shutdown_rx.await.expect("shutdown ack");
+
+    // Last event is order_rejected
+    let tags: Vec<_> = journal
+        .events()
+        .iter()
+        .map(|e| event_tag(&e.event))
+        .collect();
+    assert!(
+        tags.contains(&"order_rejected".to_owned()),
+        "expected order_rejected in {tags:?}"
+    );
+
+    // Order state is Rejected
+    let record = final_snapshot
+        .state
+        .orders
+        .get(&OrderId("ord-fail".to_owned()))
+        .expect("order record");
+    assert_eq!(record.state, OrderState::Rejected);
+    assert_eq!(record.venue_order_id, None);
 }
 
 fn fixed_time() -> DateTime<Utc> {
