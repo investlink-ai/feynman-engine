@@ -1,7 +1,7 @@
 # Feynman Engine — Data Model
 
-**Version:** 2.1.0
-**Last Updated:** 2026-03-19
+**Version:** 2.2.0
+**Last Updated:** 2026-03-21
 
 This document defines every type, state machine, and invariant in the engine. The source of truth for `crates/types/`.
 
@@ -38,12 +38,16 @@ graph TD
     end
 
     subgraph Order["Order (Execution)"]
-        ORD[Order<br/>instrument, side, qty, price]
+        ORD[Order<br/>kind: OrderKind]
+        OK[OrderKind<br/>Single / Structure]
+        SL[StructureLeg<br/>instrument, side, qty, ratio]
         OA[OrderAmend]
     end
 
     subgraph Risk["Risk"]
         ARL[AgentRiskLimits]
+        SRL[StructureRiskLimits]
+        GL[GreekLimits]
         IRL[InstrumentRiskLimits]
         VRL[VenueRiskLimits]
         PML[PredictionMarketLimits]
@@ -174,11 +178,9 @@ pub struct PipelineOrder<S: PipelineStage> {
     pub market: MarketId,                // venue-native symbol
 
     // ── Intent ──
-    pub side: Side,
+    pub kind: OrderKind,                 // Single-leg or multi-leg structure (see §3.1.1)
     pub order_type: OrderType,
-    pub qty: Decimal,                    // base currency units
-    pub notional_usd: Decimal,           // qty * price (for risk checks)
-    pub price: Option<Decimal>,          // None for market orders
+    pub notional_usd: Decimal,           // total notional for risk checks
     pub stop_loss: Option<Decimal>,      // Option because OrderCore serves both paths:
                                          // Signal.stop_loss is Decimal (always required),
                                          // but SubmitOrder may omit it (None → worst-case = full notional)
@@ -217,6 +219,64 @@ pub enum TimeInForce {
     PostOnly,
 }
 ```
+
+### 3.1.1 OrderKind — Single-Leg and Multi-Leg Orders
+
+The `OrderKind` enum lives inside `PipelineOrder` (via `OrderCore`). It determines whether an order is a single instrument or a multi-leg structure. **One pipeline, one Sequencer, one journal path** — the pipeline dispatches on `kind` where behavior differs, but the type-state transitions are identical.
+
+```rust
+/// Determines whether this order is a single-leg or multi-leg structure.
+/// Lives in OrderCore — same pipeline, same type-state, same journal path.
+/// Risk gate and venue adapter dispatch on this variant.
+pub enum OrderKind {
+    /// Standard single-instrument order.
+    Single {
+        instrument: InstrumentId,
+        side: Side,
+        qty: Decimal,
+        price: Option<Decimal>,          // None for market orders
+    },
+
+    /// Multi-leg structure (spread, condor, butterfly, etc.).
+    /// Venue adapter translates to venue-native multi-leg representation.
+    /// Risk checks enforce defined-risk constraints at the structure level.
+    Structure {
+        structure_type: StructureType,
+        legs: Vec<StructureLeg>,         // 2–4 legs, ordered by strike
+        underlying: InstrumentId,        // e.g., "AAPL", "SPY"
+        max_loss_per_unit: Decimal,      // required — not Option. Uncompilable without it.
+        max_gain_per_unit: Decimal,
+        net_debit_credit: Decimal,       // positive = debit, negative = credit
+        basket_id: BasketId,             // groups legs for lifecycle tracking
+    },
+}
+
+/// A single leg within a multi-leg structure.
+pub struct StructureLeg {
+    pub instrument: InstrumentId,        // e.g., "AAPL250418P00170000"
+    pub side: Side,
+    pub qty: Decimal,
+    pub ratio: u32,                      // 1 for standard, 2+ for ratio spreads
+    pub price: Option<Decimal>,
+    pub open_close: OpenClose,
+}
+
+pub enum OpenClose { Open, Close }
+
+/// Exhaustive — no `_` wildcard. Every new variant is a compile error.
+pub enum StructureType {
+    BullPutSpread,
+    BearCallSpread,
+    IronCondor,
+    IronButterfly,
+    CallDebitSpread,
+    PutDebitSpread,
+    Straddle,
+    Strangle,
+}
+```
+
+**Design rationale (2026-03-21):** `OrderKind` extends the existing pipeline rather than creating a parallel `StructureOrder` type. This satisfies Principle #6 (make illegal states uncompilable): `max_loss_per_unit` is `Decimal`, not `Option<Decimal>` — a structure order literally cannot compile without a defined max loss. The risk gate dispatches on `OrderKind::Structure` to run structure-specific checks (L1-S1 through L1-S7) in the same composable chain as existing checks.
 
 ### 3.2 Pipeline Transitions (Consuming Methods)
 
@@ -608,10 +668,29 @@ pub struct FirmBook {
     pub instruments: Vec<InstrumentExposure>,
     pub agent_allocations: Vec<AgentAllocation>,
     pub prediction_exposure: PredictionExposureSummary,
+
+    // ── Options Portfolio (populated when option positions exist) ──
+    pub portfolio_greeks: Option<PortfolioGreeks>,    // firm-wide aggregated Greeks
+    pub total_open_defined_loss: Decimal,             // Σ(max_loss) of all open structures
+    pub defined_loss_by_underlying: HashMap<InstrumentId, Decimal>, // per-underlying defined loss
+
     pub nav_peak: Decimal,              // high-water mark for drawdown
     pub nav_peak_source: NavPeakSource, // bootstrap vs live
     pub as_of: DateTime<Utc>,
 }
+
+/// Aggregated Greeks for the options portfolio. Strategy reports Greeks via
+/// gRPC ReportGreeks RPC → Sequencer stores here → risk gate reads.
+/// Engine does NOT compute Greeks — strategy owns that responsibility.
+pub struct PortfolioGreeks {
+    pub delta: Decimal,
+    pub gamma: Decimal,
+    pub theta: Decimal,
+    pub vega: Decimal,
+    pub rho: Decimal,
+    pub as_of: DateTime<Utc>,
+}
+
 
 /// Source of NAV peak to prevent fabricated drawdown breaches.
 /// See trading bot Issue #98.
@@ -717,6 +796,21 @@ pub struct AgentRiskLimits {
     pub max_open_orders: u32,
     pub allowed_instruments: Vec<InstrumentId>,
     pub allowed_venues: Vec<VenueId>,
+
+    // ── Structure/Option Limits (per-agent, optional) ──
+    pub structure_limits: Option<StructureRiskLimits>,
+}
+
+/// Per-agent limits for multi-leg option structures.
+/// Only present for agents authorized to trade structures.
+pub struct StructureRiskLimits {
+    pub max_open_structures: u32,                   // max concurrent structures
+    pub max_defined_loss_per_structure: Decimal,     // max loss on a single structure
+    pub max_total_defined_loss: Decimal,             // Σ(max_loss) across all structures
+    pub max_defined_loss_pct_nav: Decimal,           // max as % of NAV
+    pub allowed_structure_types: Vec<StructureType>, // whitelist
+    pub max_days_to_expiry: u32,                     // no positions expiring > N days out
+    pub min_days_to_expiry: u32,                     // no positions expiring < N days out (gamma risk)
 }
 ```
 
@@ -743,6 +837,19 @@ pub struct FirmRiskLimits {
     pub max_open_orders: u32,
     pub cash_reserve_pct: Decimal,       // minimum cash as % of NAV
     pub min_risk_reward_ratio: Decimal,  // minimum R:R for approval
+
+    // ── Firm-Wide Greek Limits (optional — active when options are traded) ──
+    pub greek_limits: Option<GreekLimits>,
+}
+
+/// Firm-wide Greek exposure limits. Enforced by the risk gate when
+/// portfolio_greeks is populated in FirmBook (strategy reports via ReportGreeks RPC).
+pub struct GreekLimits {
+    pub max_portfolio_delta: Decimal,     // absolute net delta
+    pub max_portfolio_gamma: Decimal,     // absolute gamma exposure
+    pub max_portfolio_vega: Decimal,      // absolute vega exposure
+    pub max_portfolio_theta: Decimal,     // max daily theta burn
+    pub max_concentration_per_underlying: Decimal, // max defined loss in one underlying
 }
 ```
 
@@ -797,6 +904,31 @@ pub enum SuggestedAction {
 
 Note: For account risk (check 2), if `stop_loss` is absent, `max_loss = notional` (worst case).
 
+### 5.4a Structure-Specific Risk Checks
+
+When `OrderKind::Structure` is present, the risk gate runs these additional composable L1 checks **in the same evaluation chain** as universal checks. These implement the same `RiskCheck` trait — they are not a separate pipeline.
+
+| # | Check | Hard/Soft | On Fail | Applies To |
+|---|-------|-----------|---------|------------|
+| L1-S1 | Defined risk only (no naked short) | Hard | Reject | All structures |
+| L1-S2 | `max_loss_per_unit` ≤ `max_defined_loss_per_structure` | Hard | Reject | All structures |
+| L1-S3 | Total defined loss ≤ limit (`Σ max_loss` across open structures) | Hard | Reject | All structures |
+| L1-S4 | Defined loss as % of NAV ≤ limit | Resize | Resize qty | All structures |
+| L1-S5 | Expiration window (`min_days_to_expiry` ≤ DTE ≤ `max_days_to_expiry`) | Hard | Reject | All structures |
+| L1-S6 | Underlying concentration ≤ limit (`defined_loss_by_underlying`) | Hard | Reject | All structures |
+| L1-S7 | Structure type in `allowed_structure_types` whitelist | Hard | Reject | All structures |
+
+**Greek limit checks (firm-level, when `GreekLimits` is configured):**
+
+| # | Check | Hard/Soft | On Fail |
+|---|-------|-----------|---------|
+| L1-G1 | Portfolio delta ≤ `max_portfolio_delta` | Hard | Reject |
+| L1-G2 | Portfolio gamma ≤ `max_portfolio_gamma` | Hard | Reject |
+| L1-G3 | Portfolio vega ≤ `max_portfolio_vega` | Hard | Reject |
+| L1-G4 | Daily theta burn ≤ `max_portfolio_theta` | Soft | Warn |
+
+**Greek reporting flow:** Strategy computes Greeks externally → reports via `ReportGreeks` gRPC RPC → Sequencer stores in `FirmBook.portfolio_greeks` → risk gate reads during evaluation. Engine never computes Greeks — this is the strategy's responsibility.
+
 ---
 
 ## 6. Event Types
@@ -833,6 +965,15 @@ graph LR
         E19[HaltDeactivated]
     end
 
+    subgraph OptionEvents["Option Lifecycle"]
+        E26[OptionAssigned]
+        E27[OptionExercised]
+        E28[OptionExpired]
+        E29[DneSubmitted]
+        E30[DneConfirmed]
+        E31[GreeksReported]
+    end
+
     subgraph SystemEvents["System"]
         E20[EngineStarted]
         E21[EngineShutdown]
@@ -842,6 +983,59 @@ graph LR
         E25[ReconciliationRun]
     end
 ```
+
+### 6.1 Option Lifecycle Events
+
+Option positions have lifecycle events beyond the standard order flow. These are new `EngineEvent` variants processed by the Sequencer via `SequencerCommand::OnOptionLifecycle`.
+
+```rust
+// ── Option Lifecycle (added to EngineEvent enum) ──
+OptionAssigned {
+    instrument_id: InstrumentId,
+    agent_id: AgentId,
+    qty: Decimal,
+    settlement: AssignmentSettlement,
+},
+OptionExercised {
+    instrument_id: InstrumentId,
+    agent_id: AgentId,
+    qty: Decimal,
+    settlement_price: Decimal,
+},
+OptionExpired {
+    instrument_id: InstrumentId,
+    agent_id: AgentId,
+    qty: Decimal,
+    expired_value: Decimal,             // OTM = 0, ITM = intrinsic
+},
+DneSubmitted {                          // Do-Not-Exercise instruction
+    instrument_id: InstrumentId,
+    agent_id: AgentId,
+    qty: Decimal,
+},
+DneConfirmed {
+    instrument_id: InstrumentId,
+    agent_id: AgentId,
+},
+GreeksReported {
+    agent_id: AgentId,
+    greeks: PortfolioGreeks,
+},
+
+/// How an assignment settles — determines follow-on state mutation.
+pub enum AssignmentSettlement {
+    /// Assignment results in an equity/underlying position (stock delivery).
+    Physical { resulting_instrument: InstrumentId, qty: Decimal },
+    /// Assignment settles in cash (index options, cash-settled).
+    Cash { settlement_amount: Decimal },
+}
+```
+
+**Sequencer behavior on option lifecycle events:**
+- `OptionAssigned(Physical)` → create/update `TrackedPosition` for the resulting equity
+- `OptionAssigned(Cash)` → credit/debit agent allocation, update realized PnL
+- `OptionExpired` → close option `TrackedPosition`, release defined loss from `total_open_defined_loss`
+- `GreeksReported` → update `FirmBook.portfolio_greeks` (no position mutation)
 
 ---
 

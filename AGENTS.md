@@ -49,6 +49,7 @@ A Rust execution engine for Feynman Capital. Receives signals/orders from strate
 │    ├─► Hyperliquid adapter       │
 │    ├─► Polymarket adapter        │
 │    ├─► Binance adapter           │
+│    ├─► Alpaca adapter (options)  │
 │    └─► SimulatedVenue (backtest) │
 │                                  │
 │  Redis Streams bus (cross-svc)   │
@@ -79,10 +80,14 @@ Signal/Order (from gRPC)
   → Grouper (coalesce by instrument)
   → Detector (identify opportunity)
   → Sizing (conviction → notional → qty)
-  → Risk (AgentRiskManager — see §6)
-  → ExecutionController (route to venue)
+  → Risk (AgentRiskManager — see §6; dispatches on OrderKind for structure checks)
+  → ExecutionController (route to venue; dispatches on OrderKind for multi-leg)
   → Fill (from venue)
   → Position update (after fill confirmation only)
+
+OrderKind::Single  — standard single-instrument order (existing flow)
+OrderKind::Structure — multi-leg order (spread/condor/butterfly); same pipeline,
+                       risk gate runs L1-S1..S7 structure checks in same chain
 ```
 
 ### Concurrency Model
@@ -118,6 +123,8 @@ Layer 0 — Circuit breakers (compiled-in, not hot-reloadable)
 
 Layer 1 — AgentRiskManager (programmatic, configurable per-agent)
   Universal + signal-specific checks (see §6 below).
+  Structure-specific checks (L1-S1..S7) when OrderKind::Structure.
+  Greek limit checks (L1-G1..G4) when GreekLimits configured.
 
 Layer 2 — LLM risk agent (future)
 Layer 3 — Human CIO override (future)

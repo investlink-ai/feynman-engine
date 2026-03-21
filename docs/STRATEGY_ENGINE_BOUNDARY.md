@@ -29,6 +29,8 @@
 │    - Strategy-level position mgmt   │         │    - Fill tracking               │
 │    - Backtest orchestration (clock) │         │    - Portfolio state (FirmBook)  │
 │    - Performance analytics          │         │    - Per-agent budget isolation  │
+│    - Greeks computation (options)   │         │    - Greek limit enforcement     │
+│    - Structure/strike selection     │         │    - Option lifecycle processing │
 │                                     │         │    - Journal & crash recovery    │
 │  Does NOT own:                      │         │                                  │
 │    - Risk enforcement               │         │  Does NOT own:                   │
@@ -58,6 +60,7 @@ The client type determines which RPCs are typical, not which are allowed.
 | `llm_agent` | `RegisterAgent` | `SubmitSignal` | Engine sizes (conviction → qty) | Full pipeline | Satoshi, OpenClaw |
 | `algo_strategy` | `RegisterAgent` | `SubmitOrder` / `SubmitBatch` | Strategy sizes (sends exact qty) | Risk gate only | Mean-reversion bot, arb strategy |
 | `ml_model` | `RegisterAgent` | `SubmitBatch` | Strategy sizes | Risk gate only | RL agent, portfolio optimizer |
+| `option_strategy` | `RegisterAgent` | `SubmitOrder` (with `OrderKind::Structure`) | Strategy sizes + selects structure | Risk gate + structure checks (L1-S1..S7) | feynman-option-trading (RDVM+) |
 | `backtest_harness` | `RegisterAgent` | `SubmitOrder` / `SubmitBatch` | Strategy sizes | Risk gate only | HFTBacktest runner, custom replay |
 
 All client types:
@@ -180,6 +183,53 @@ HFTBacktest Strategy fn            Engine (FEYNMAN_MODE=backtest)
    │                                │
    │  (repeat until backtest done)  │
 ```
+
+### 3.5 Option Structure Orders (feynman-option-trading)
+
+The strategy owns Greeks computation and structure selection. The engine owns risk enforcement, venue submission, and lifecycle event processing.
+
+```
+Strategy (Python RDVM+)              Engine
+   │                                   │
+   ├─ RegisterAgent(algo_strategy) ──► │
+   │ ◄── StatusAck ───────────────────┤
+   │                                   │
+   ├─ SubmitOrder(                     │
+   │    kind=Structure {               │
+   │      structure_type=BullPutSpread,│
+   │      legs=[                       │
+   │        Leg(AAPL250418P170, Sell), │
+   │        Leg(AAPL250418P165, Buy),  │
+   │      ],                           │
+   │      max_loss_per_unit=5.00,      │
+   │      net_debit_credit=-2.50,      │  (credit received)
+   │    }) ───────────────────────────►│
+   │                                   ├─ risk: L1-S1..S7 structure checks
+   │                                   ├─ risk: universal checks (budget, drawdown)
+   │                                   ├─ execute: AlpacaAdapter.submit_structure_order()
+   │ ◄── OrderAck(accepted) ──────────┤
+   │                                   │
+   │ ◄── Fill (structure filled) ─────┤  (via SubscribeFills)
+   │                                   │
+   │  ... time passes, nearing expiry  │
+   │                                   │
+   │ ◄── OptionAssigned(Physical) ────┤  (via SubscribeEvents)
+   │      or OptionExpired             │
+   │                                   │
+   ├─ ReportGreeks(                    │
+   │    delta=-0.15, gamma=0.02,       │
+   │    theta=-12.5, vega=45.0) ─────►│
+   │                                   ├─ store in FirmBook.portfolio_greeks
+   │                                   ├─ risk gate uses for L1-G1..G4 checks
+   │ ◄── StatusAck ───────────────────┤
+```
+
+**Boundary rules for options:**
+- Strategy computes Greeks → engine enforces Greek limits (engine never computes Greeks)
+- Strategy selects structure type/strikes → engine validates defined-risk and enforces limits
+- Strategy decides when to roll/close → engine processes the resulting orders
+- Venue sends assignment/exercise/expiry → engine processes via `SequencerCommand::OnOptionLifecycle`
+- `ReportGreeks` RPC: strategy-initiated, updates `FirmBook.portfolio_greeks`
 
 **Clock synchronization in backtest:**
 
@@ -336,8 +386,10 @@ RPCs already implemented in `service.proto`: `AdvanceClock`, `GetFillHistory`, `
 | RPC | Purpose | Needed by |
 |-----|---------|-----------|
 | `SubscribeMarketState` | Stream engine's view of market state (funding rates, mark prices) | Strategies that need engine's market view for consistency |
+| `ReportGreeks` | Strategy reports portfolio Greeks → engine stores in FirmBook → risk gate enforces limits | feynman-option-trading (RDVM+ strategy) |
+| `SubscribeOptionLifecycle` | Stream option assignment/exercise/expiry events to strategy | Option strategies that need to react to lifecycle events |
 
-Not blocking Phase 0.
+`ReportGreeks` and `SubscribeOptionLifecycle` are required for option trading (#28–31). Not blocking Phase 0.
 
 ---
 

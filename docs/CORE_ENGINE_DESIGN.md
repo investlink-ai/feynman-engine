@@ -1,7 +1,7 @@
 # Feynman Capital — Core Engine Design
 
-**Version:** 1.3.0
-**Status:** Canonical Architecture (2026-03-19) — NautilusTrader hybrid path rejected
+**Version:** 1.4.0
+**Status:** Canonical Architecture (2026-03-21) — NautilusTrader hybrid path rejected, OrderKind multi-leg support added
 **Scope:** Unified Execution Engine + Message Bus + Observability + Multi-Client API
 **Language:** Rust (tokio async runtime)
 
@@ -257,6 +257,8 @@ The unified model separates **intent** (what you want) from **mechanism** (how t
 ### 4.2 Canonical Order
 
 > **Implementation note:** In the codebase, `CanonicalOrder` is implemented as `OrderCore` (the immutable data) wrapped in `PipelineOrder<S>` (the type-state pipeline). The pipeline enforces `Draft → Validated → RiskChecked → Routed` transitions at compile time. Risk evaluation accepts `&PipelineOrder<Validated>`, venue submission accepts `PipelineOrder<Routed>`. Post-submission lifecycle is tracked by `LiveOrder` + `VenueState` FSM. See `crates/types/src/pipeline.rs` for the implementation.
+>
+> **Multi-leg support (2026-03-21):** `OrderCore` contains `kind: OrderKind` — either `Single` (standard single-instrument order) or `Structure` (multi-leg spread/condor/butterfly). The pipeline is unchanged — same type-state transitions, same Sequencer, same journal. The risk gate and venue adapter dispatch on `OrderKind` where behavior differs. See DATA_MODEL.md §3.1.1 for `OrderKind`, `StructureType`, `StructureLeg` definitions.
 
 ```rust
 pub struct CanonicalOrder {
@@ -652,6 +654,13 @@ pub struct DeribitParams {
 
 pub struct AlpacaParams {
     pub extended_hours: bool,
+    pub order_class: Option<AlpacaOrderClass>,  // bracket, oco, oto (Alpaca-specific)
+}
+
+pub enum AlpacaOrderClass {
+    Bracket,    // entry + TP + SL
+    Oco,        // one-cancels-other
+    Oto,        // one-triggers-other
 }
 ```
 
@@ -680,9 +689,7 @@ pub struct PipelineOrder<S: PipelineStage> {
     pub id: OrderId,
     pub client_order_id: ClientOrderId,
     pub agent: AgentId,
-    pub market: MarketId,
-    pub side: Side,
-    pub qty: Decimal,
+    pub kind: OrderKind,         // Single or Structure (see DATA_MODEL.md §3.1.1)
     pub pricing: OrderPricing,
     pub dry_run: bool,           // default: true
     // ... (see DATA_MODEL.md §3.1 for full fields)
@@ -863,6 +870,7 @@ pub trait VenueAdapter: Send + Sync {
 
     fn as_amendable(&self) -> Option<&dyn AmendableVenue> { None }
     fn as_streaming(&self) -> Option<&dyn StreamingVenue> { None }
+    fn as_option_venue(&self) -> Option<&dyn OptionVenue> { None }
 
     // ── Rate Limiter ──
 
@@ -878,6 +886,22 @@ pub trait AmendableVenue: Send + Sync {
         new_price: Option<Decimal>,
         new_qty: Option<Decimal>,
     ) -> Result<()>;
+}
+
+/// Venue supports option-specific operations (Alpaca, Deribit, Bybit options).
+/// Gateway checks `as_option_venue().is_some()` before dispatching structure orders.
+#[async_trait]
+pub trait OptionVenue: Send + Sync {
+    /// Submit a multi-leg structure order. Adapter translates `OrderKind::Structure`
+    /// to venue-native multi-leg representation.
+    async fn submit_structure_order(&self, submission: OrderSubmission) -> Result<VenueOrderAck>;
+
+    /// Subscribe to option lifecycle events (assignment, exercise, expiration).
+    /// Returns bounded channel — adapter polls venue and emits events.
+    fn subscribe_option_lifecycle(&self) -> Result<mpsc::Receiver<OptionLifecycleEvent>>;
+
+    /// Submit Do-Not-Exercise instruction for ITM options near expiry.
+    async fn submit_dne(&self, instrument: &InstrumentId, qty: Decimal) -> Result<()>;
 }
 
 /// Venue supports streaming market data (WebSocket-based venues).
@@ -959,6 +983,11 @@ pub struct VenueCapabilities {
     pub supports_oco: bool,
     pub supports_iceberg: bool,
     pub supports_twap: bool,
+
+    // Options
+    pub supports_options: bool,
+    pub supports_multi_leg: bool,         // native multi-leg order submission
+    pub supports_option_lifecycle: bool,  // assignment/exercise/expiry events
 
     // Real-time
     pub supports_websocket_fills: bool,
@@ -1179,6 +1208,19 @@ Stateful risk evaluation. Knows current firm book. Configurable limits (hot-relo
 
 Algo/ML strategies via `SubmitOrder`/`SubmitBatch` manage their own exits — the engine enforces position limits and budget isolation but does not require stop losses.
 
+**Structure-specific checks (when `OrderKind::Structure`):**
+9. Defined risk only (no naked short legs)
+10. Max loss per structure ≤ `StructureRiskLimits.max_defined_loss_per_structure`
+11. Total defined loss ≤ limit
+12. DTE within expiration window
+13. Structure type in allowed whitelist
+14. Underlying concentration ≤ limit
+
+**Greek limit checks (firm-level, when `GreekLimits` configured):**
+15. Portfolio delta/gamma/vega/theta within limits
+
+See DATA_MODEL.md §5.4a for the full structure risk check matrix (L1-S1 through L1-S7, L1-G1 through L1-G4).
+
 ```rust
 pub trait RiskGate: Send + Sync {
     /// Evaluate order against all risk limits.
@@ -1232,6 +1274,7 @@ pub struct FirmRiskLimits {
     pub max_drawdown_pct: Decimal,         // halt if breached
     pub max_daily_loss: Decimal,           // halt if breached
     pub max_open_orders: u32,
+    pub greek_limits: Option<GreekLimits>, // firm-wide Greek exposure limits (see DATA_MODEL.md §5.2)
 }
 
 pub struct AgentRiskLimits {
@@ -1244,6 +1287,7 @@ pub struct AgentRiskLimits {
     pub allowed_instruments: Option<HashSet<InstrumentId>>, // whitelist
     pub allowed_venues: Option<HashSet<VenueId>>,           // whitelist
     pub allowed_market_kinds: Option<HashSet<MarketKindTag>>, // spot, perp, option, prediction
+    pub structure_limits: Option<StructureRiskLimits>,      // per-agent option structure limits
 }
 
 pub struct InstrumentRiskLimits {
@@ -1777,6 +1821,17 @@ pub enum EngineEvent {
     // ── Venue Connectivity ──
     VenueConnected    { venue_id: VenueId },
     VenueDisconnected { venue_id: VenueId, reason: String },
+
+    // ── Option Lifecycle ──
+    OptionAssigned   { instrument_id: InstrumentId, agent_id: AgentId, qty: Decimal,
+                       settlement: AssignmentSettlement },
+    OptionExercised  { instrument_id: InstrumentId, agent_id: AgentId, qty: Decimal,
+                       settlement_price: Decimal },
+    OptionExpired    { instrument_id: InstrumentId, agent_id: AgentId, qty: Decimal,
+                       expired_value: Decimal },
+    DneSubmitted     { instrument_id: InstrumentId, agent_id: AgentId, qty: Decimal },
+    DneConfirmed     { instrument_id: InstrumentId, agent_id: AgentId },
+    GreeksReported   { agent_id: AgentId, greeks: PortfolioGreeks },
 
     // ── System ──
     EngineStarted  { version: String },
@@ -3644,3 +3699,17 @@ feynman-engine/
 |----------|-------|---------|--------|-------------|------------|------|---------|
 | Auth | API key | API key | API key | Wallet (L1) | Wallet (Polygon) | API + session | API key |
 | Settlement | Custodial | Custodial | Custodial | On-chain | On-chain | Custodial | Custodial |
+
+### Option-Specific Capabilities
+
+| Feature | Alpaca | Deribit | Bybit (Options) | IBKR |
+|---------|--------|---------|-----------------|------|
+| Single-leg options | ✓ | ✓ | ✓ | ✓ |
+| Multi-leg structures | ✓ (mleg API) | ✓ (combo) | ✗ (legs separate) | ✓ (combo) |
+| Assignment events | ✓ (webhook/API) | N/A (cash-settled) | N/A (cash-settled) | ✓ (event) |
+| Exercise events | ✓ | ✓ (auto) | ✓ (auto) | ✓ |
+| DNE instructions | ✓ | N/A | N/A | ✓ |
+| Cash settlement | ✗ (physical only) | ✓ | ✓ | ✓ (index opts) |
+| Physical settlement | ✓ (equities) | ✗ | ✗ | ✓ (equities) |
+| Greeks from venue | ✗ (strategy computes) | ✓ | ✓ | ✓ |
+| Option lifecycle WS | ✗ (polling) | ✓ | ✓ | ✓ |
