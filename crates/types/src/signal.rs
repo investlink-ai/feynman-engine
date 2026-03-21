@@ -4,12 +4,14 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, InstrumentId, SignalId};
+use crate::{AgentId, BasketId, InstrumentId, SignalId};
 
 /// Market signal from an LLM trader agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signal {
     pub id: SignalId,
+    /// Groups related legs when a signal expands into a multi-leg structure.
+    pub basket_id: Option<BasketId>,
     pub agent: AgentId,
     pub instrument: InstrumentId,
     pub direction: Side,
@@ -50,6 +52,7 @@ mod tests {
     fn test_signal_serde() {
         let signal = Signal {
             id: SignalId("sig-123".into()),
+            basket_id: None,
             agent: AgentId("satoshi".into()),
             instrument: InstrumentId("BTC".into()),
             direction: Side::Buy,

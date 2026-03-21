@@ -14,8 +14,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, ClientOrderId, InstrumentId, OrderId, RiskCheckResult, RiskViolation, Side, VenueId,
-    VenueOrderId,
+    AgentId, BasketId, ClientOrderId, InstrumentId, MarketId, OrderId, RiskCheckResult,
+    RiskViolation, Side, VenueId, VenueOrderId,
 };
 
 // ─── Order classification ───
@@ -129,8 +129,12 @@ impl PipelineStage for Routed {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderCore {
     pub id: OrderId,
+    /// Groups related legs when one signal expands into multiple draft orders.
+    pub basket_id: Option<BasketId>,
     pub agent_id: AgentId,
     pub instrument_id: InstrumentId,
+    /// Venue-native market symbol used for adapter submission.
+    pub market_id: MarketId,
     pub venue_id: VenueId,
     pub side: Side,
     pub order_type: OrderType,
@@ -843,8 +847,10 @@ mod tests {
     fn sample_core() -> OrderCore {
         OrderCore {
             id: OrderId("ord-1".into()),
+            basket_id: None,
             agent_id: AgentId("satoshi".into()),
             instrument_id: InstrumentId("BTCUSDT".into()),
+            market_id: MarketId("BTCUSDT".into()),
             venue_id: VenueId("bybit".into()),
             side: Side::Buy,
             order_type: OrderType::Limit,

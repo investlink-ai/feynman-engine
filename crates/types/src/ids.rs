@@ -61,6 +61,10 @@ newtype_id!(
     InstrumentId
 );
 newtype_id!(
+    /// Identifies a venue-native market symbol.
+    MarketId
+);
+newtype_id!(
     /// Identifies a signal from a strategy agent.
     SignalId
 );
