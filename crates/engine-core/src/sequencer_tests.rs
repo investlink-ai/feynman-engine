@@ -1069,6 +1069,7 @@ fn empty_state(now: DateTime<Utc>) -> EngineState {
 fn sample_order(order_id: &str, now: DateTime<Utc>) -> OrderCore {
     OrderCore {
         id: OrderId(order_id.to_owned()),
+        basket_id: None,
         agent_id: AgentId("athena".to_owned()),
         instrument_id: InstrumentId("BTCUSDT".to_owned()),
         venue_id: VenueId("bybit".to_owned()),
@@ -1091,6 +1092,7 @@ fn sample_order(order_id: &str, now: DateTime<Utc>) -> OrderCore {
 fn sample_signal(now: DateTime<Utc>) -> Signal {
     Signal {
         id: SignalId("sig-unsupported".to_owned()),
+        basket_id: None,
         agent: AgentId("athena".to_owned()),
         instrument: InstrumentId("BTCUSDT".to_owned()),
         direction: Side::Buy,

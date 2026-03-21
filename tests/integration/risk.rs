@@ -273,6 +273,7 @@ fn make_order_with(
 ) -> PipelineOrder<Validated> {
     PipelineOrder::new(OrderCore {
         id: OrderId(format!("ord-{agent_id}-{qty}")),
+        basket_id: None,
         agent_id,
         instrument_id: InstrumentId(BTC_USD.into()),
         venue_id: VenueId(BYBIT.into()),

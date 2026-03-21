@@ -961,6 +961,7 @@ mod tests {
     ) -> PipelineOrder<types::Validated> {
         PipelineOrder::new(OrderCore {
             id: OrderId("ord-1".into()),
+            basket_id: None,
             agent_id,
             instrument_id: InstrumentId("BTC-USD".into()),
             venue_id: VenueId("bybit".into()),
@@ -1664,6 +1665,7 @@ mod tests {
         let clock = SimulatedClock::at_epoch();
         let order = PipelineOrder::new(OrderCore {
             id: OrderId("ord-1".into()),
+            basket_id: None,
             agent_id: AgentId("satoshi".into()),
             instrument_id: InstrumentId("BTC-USD".into()),
             venue_id: VenueId("bybit".into()),
@@ -1711,6 +1713,7 @@ mod tests {
         let clock = SimulatedClock::at_epoch();
         let order = PipelineOrder::new(OrderCore {
             id: OrderId("ord-1".into()),
+            basket_id: None,
             agent_id: AgentId("satoshi".into()),
             instrument_id: InstrumentId("BTC-USD".into()),
             venue_id: VenueId("bybit".into()),
@@ -1807,6 +1810,7 @@ mod tests {
         // Sell 1 unit @ 100_000 — notional = 100_000, reduces gross to 300_000
         let order = PipelineOrder::new(OrderCore {
             id: OrderId("ord-sell".into()),
+            basket_id: None,
             agent_id: AgentId("satoshi".into()),
             instrument_id: InstrumentId("BTC-USD".into()),
             venue_id: VenueId("bybit".into()),

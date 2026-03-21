@@ -77,6 +77,7 @@ The signal is the raw output from an LLM trader agent. It expresses intent and c
 ```rust
 pub struct Signal {
     pub id: SignalId,
+    pub basket_id: Option<BasketId>,   // groups related legs when a signal expands into a structure
     pub agent: AgentId,
     pub instrument: InstrumentId,
     pub direction: Side,
@@ -100,7 +101,10 @@ pub enum Urgency { Low, Normal, High, Immediate }
 | Field | Validation | Failure |
 |-------|-----------|---------|
 | `conviction` | 0.0 ≤ x ≤ 1.0 | Reject signal |
+| `conviction` + `sizing_hint` | `conviction = 0.0` with non-zero `sizing_hint` is invalid | Reject signal |
 | `stop_loss` | Required for perps; must be finite positive | Reject signal |
+| `sizing_hint` | If present, must be positive and ≤ agent allocated capital | Reject signal |
+| `take_profit` | Must be on the profitable side of the entry reference price | Reject signal |
 | `instrument` | Must exist in allowed instruments for agent | Reject signal |
 | `arb_type` | Must match a registered plugin | Reject signal |
 | `thesis` | Non-empty | Reject signal |
@@ -157,6 +161,7 @@ impl PipelineStage for Routed {}
 pub struct PipelineOrder<S: PipelineStage> {
     // ── Identity ──
     pub id: OrderId,
+    pub basket_id: Option<BasketId>,   // threads structure grouping through the pipeline
     pub client_order_id: ClientOrderId,  // idempotency key
     pub signal_id: Option<SignalId>,     // traceability (None for SubmitOrder)
     pub agent: AgentId,
