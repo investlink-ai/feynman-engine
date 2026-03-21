@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -102,6 +103,8 @@ where
             || core.snapshot(current_sequence, core.state().last_updated),
             |(_, snapshot)| snapshot,
         );
+        let client_order_id_generators =
+            restore_client_order_generators(core.state(), restart_epoch)?;
 
         Ok((
             Self {
@@ -113,7 +116,7 @@ where
                 snapshot_cache,
                 high_priority_rx,
                 command_rx,
-                client_order_id_generators: std::collections::HashMap::new(),
+                client_order_id_generators,
                 restart_epoch,
             },
             SequencerHandle {
@@ -182,34 +185,28 @@ where
                 let should_commit_metadata = outcome.state_mutated || !outcome.events.is_empty();
                 let committed_snapshot =
                     should_commit_metadata.then(|| self.snapshot_for_commit(sequence_id, now));
+                let events = outcome
+                    .events
+                    .into_iter()
+                    .map(|event| SequencedEvent {
+                        sequence_id,
+                        timestamp: now,
+                        event,
+                    })
+                    .collect::<Vec<_>>();
 
-                if !outcome.events.is_empty() {
-                    let events = outcome
-                        .events
-                        .into_iter()
-                        .map(|event| SequencedEvent {
-                            sequence_id,
-                            timestamp: now,
-                            event,
-                        })
-                        .collect::<Vec<_>>();
-
-                    self.journal.append_batch(&events).await.map_err(|err| {
-                        EngineError::Journal(format!(
-                            "failed to append sequencer events at {sequence_id}: {err}"
-                        ))
-                    })?;
-                }
-
-                if let Some(snapshot) = committed_snapshot {
+                if should_commit_metadata {
                     self.journal
-                        .save_snapshot(sequence_id, &snapshot)
+                        .persist_commit(&events, committed_snapshot.as_ref())
                         .await
                         .map_err(|err| {
                             EngineError::Journal(format!(
-                                "failed to persist sequencer snapshot at {sequence_id}: {err}"
+                                "failed to persist sequencer commit at {sequence_id}: {err}"
                             ))
                         })?;
+                }
+
+                if let Some(snapshot) = committed_snapshot {
                     self.update_metadata(sequence_id, now);
                     self.snapshot_cache = snapshot;
                 }
@@ -539,4 +536,45 @@ pub(crate) fn remaining_qty(record: &OrderRecord) -> Result<Decimal> {
         )));
     }
     Ok(remaining)
+}
+
+fn restore_client_order_generators(
+    state: &crate::EngineState,
+    restart_epoch: u16,
+) -> Result<HashMap<AgentId, ClientOrderIdGenerator>> {
+    let mut next_sequences: HashMap<AgentId, u64> = HashMap::new();
+
+    for ack in state.idempotency_cache.values() {
+        let client_order_id = &ack.client_order_id;
+        let agent = client_order_id.parse_agent().ok_or_else(|| {
+            crate::EngineError::Internal(anyhow!(
+                "persisted client_order_id {} is malformed: missing agent prefix",
+                client_order_id
+            ))
+        })?;
+        let next_sequence = client_order_id
+            .parse_sequence()
+            .and_then(|sequence| sequence.checked_add(1))
+            .ok_or_else(|| {
+                crate::EngineError::Internal(anyhow!(
+                    "persisted client_order_id {} is malformed: missing or overflowing sequence",
+                    client_order_id
+                ))
+            })?;
+
+        next_sequences
+            .entry(agent)
+            .and_modify(|current| *current = (*current).max(next_sequence))
+            .or_insert(next_sequence);
+    }
+
+    Ok(next_sequences
+        .into_iter()
+        .map(|(agent, next_sequence)| {
+            (
+                agent.clone(),
+                ClientOrderIdGenerator::with_start_seq(&agent, restart_epoch, next_sequence),
+            )
+        })
+        .collect())
 }

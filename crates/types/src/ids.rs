@@ -98,7 +98,9 @@ impl ClientOrderId {
     /// Returns `None` if the format is unrecognized.
     #[must_use]
     pub fn parse_agent(&self) -> Option<AgentId> {
-        self.0.split('-').next().map(|s| AgentId(s.to_owned()))
+        let (_, _, prefix) = self.split_suffix_parts()?;
+        let (agent, _) = prefix.rsplit_once('-')?;
+        Some(AgentId(agent.to_owned()))
     }
 
     /// Parse the restart epoch embedded in this client order ID.
@@ -109,6 +111,21 @@ impl ClientOrderId {
             .next()
             .and_then(|s| s.strip_prefix('r'))
             .and_then(|s| s.parse().ok())
+    }
+
+    /// Parse the monotonic counter embedded in this client order ID.
+    #[must_use]
+    pub fn parse_sequence(&self) -> Option<u64> {
+        let (_, sequence, _) = self.split_suffix_parts()?;
+        sequence.parse().ok()
+    }
+
+    fn split_suffix_parts(&self) -> Option<(&str, &str, &str)> {
+        let mut parts = self.0.rsplitn(3, '-');
+        let restart = parts.next()?;
+        let sequence = parts.next()?;
+        let prefix = parts.next()?;
+        Some((restart, sequence, prefix))
     }
 }
 
@@ -129,10 +146,16 @@ impl ClientOrderIdGenerator {
     /// A simple approach: `(process_start_time.timestamp() % 100) as u16`.
     #[must_use]
     pub fn new(agent: &AgentId, restart_epoch: u16) -> Self {
+        Self::with_start_seq(agent, restart_epoch, 0)
+    }
+
+    /// Create a generator starting from a resumed sequence value.
+    #[must_use]
+    pub fn with_start_seq(agent: &AgentId, restart_epoch: u16, start_seq: u64) -> Self {
         Self {
             agent_prefix: agent.0.clone(),
             restart_epoch,
-            counter: AtomicU64::new(0),
+            counter: AtomicU64::new(start_seq),
         }
     }
 
@@ -198,6 +221,7 @@ mod tests {
         assert!(id.0.ends_with("-r03"));
         assert_eq!(id.parse_agent(), Some(AgentId("satoshi".into())));
         assert_eq!(id.parse_restart_epoch(), Some(3));
+        assert_eq!(id.parse_sequence(), Some(0));
     }
 
     #[test]
@@ -207,6 +231,15 @@ mod tests {
         let id1 = gen.next(now);
         let id2 = gen.next(now);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_client_order_id_generator_can_resume_sequence() {
+        let gen = ClientOrderIdGenerator::with_start_seq(&AgentId("test".into()), 7, 41);
+        let now = Utc::now();
+        let id = gen.next(now);
+        assert_eq!(id.parse_sequence(), Some(41));
+        assert_eq!(gen.current_seq(), 42);
     }
 
     #[test]

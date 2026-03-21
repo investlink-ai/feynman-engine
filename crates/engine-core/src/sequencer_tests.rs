@@ -34,8 +34,7 @@ impl RecordingJournal {
 
 #[derive(Clone, Copy)]
 enum JournalFailureMode {
-    AppendBatch,
-    SaveSnapshot,
+    PersistCommit,
 }
 
 #[derive(Clone)]
@@ -57,12 +56,20 @@ impl EventJournal for FailingJournal {
         &self,
         events: &[crate::SequencedEvent<EngineEvent>],
     ) -> std::result::Result<(), crate::EngineError> {
-        if matches!(self.failure_mode, JournalFailureMode::AppendBatch) {
+        self.inner.append_batch(events).await
+    }
+
+    async fn persist_commit(
+        &self,
+        events: &[crate::SequencedEvent<EngineEvent>],
+        snapshot: Option<&EngineStateSnapshot>,
+    ) -> std::result::Result<(), crate::EngineError> {
+        if matches!(self.failure_mode, JournalFailureMode::PersistCommit) {
             return Err(crate::EngineError::Journal(
-                "simulated append failure".to_owned(),
+                "simulated persist_commit failure".to_owned(),
             ));
         }
-        self.inner.append_batch(events).await
+        self.inner.persist_commit(events, snapshot).await
     }
 
     async fn replay_from(
@@ -85,11 +92,6 @@ impl EventJournal for FailingJournal {
         sequence_id: SequenceId,
         snapshot: &EngineStateSnapshot,
     ) -> std::result::Result<(), crate::EngineError> {
-        if matches!(self.failure_mode, JournalFailureMode::SaveSnapshot) {
-            return Err(crate::EngineError::Journal(
-                "simulated snapshot failure".to_owned(),
-            ));
-        }
         self.inner.save_snapshot(sequence_id, snapshot).await
     }
 
@@ -127,6 +129,19 @@ impl EventJournal for RecordingJournal {
             .expect("journal lock")
             .events
             .extend_from_slice(events);
+        Ok(())
+    }
+
+    async fn persist_commit(
+        &self,
+        events: &[crate::SequencedEvent<EngineEvent>],
+        snapshot: Option<&EngineStateSnapshot>,
+    ) -> std::result::Result<(), crate::EngineError> {
+        let mut state = self.state.lock().expect("journal lock");
+        state.events.extend_from_slice(events);
+        if let Some(snapshot) = snapshot {
+            state.snapshot = Some((snapshot.sequence_id, snapshot.clone()));
+        }
         Ok(())
     }
 
@@ -658,7 +673,7 @@ async fn test_journal_append_failure_stops_sequencer() {
     let now = fixed_time();
     let journal = FailingJournal {
         inner: RecordingJournal::default(),
-        failure_mode: JournalFailureMode::AppendBatch,
+        failure_mode: JournalFailureMode::PersistCommit,
     };
     let core = TestCore::new(now);
     let clock = types::SimulatedClock::new(now);
@@ -686,7 +701,7 @@ async fn test_snapshot_persistence_failure_stops_sequencer() {
     let now = fixed_time();
     let journal = FailingJournal {
         inner: RecordingJournal::default(),
-        failure_mode: JournalFailureMode::SaveSnapshot,
+        failure_mode: JournalFailureMode::PersistCommit,
     };
     let core = TestCore::new(now);
     let clock = types::SimulatedClock::new(now);
@@ -793,6 +808,89 @@ async fn test_bootstrap_restores_snapshot_and_avoids_sequence_reuse_after_reject
             .collect::<Vec<_>>(),
         vec![2, 5]
     );
+}
+
+#[tokio::test]
+async fn test_bootstrap_restores_client_order_generator_state() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let first_order =
+        crate::PipelineOrder::new(sample_order("ord-restore-1", now)).into_validated(now);
+    let (first_ack_tx, first_ack_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitOrder {
+            order: first_order,
+            respond: first_ack_tx,
+        })
+        .await
+        .expect("queue first order");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::Shutdown {
+            respond: shutdown_tx,
+        })
+        .await
+        .expect("queue shutdown");
+
+    let first_snapshot = tokio::spawn(sequencer.run())
+        .await
+        .expect("join first sequencer")
+        .expect("first sequencer result");
+    shutdown_rx.await.expect("shutdown ack");
+    let first_ack = first_ack_rx
+        .await
+        .expect("first order channel")
+        .expect("first order accepted");
+
+    assert_eq!(first_snapshot.state.idempotency_cache.len(), 1);
+    assert_eq!(first_ack.client_order_id.parse_sequence(), Some(0));
+
+    let restored_core = TestCore::new(now);
+    let restored_clock = types::SimulatedClock::new(now);
+    let (restored_sequencer, restored_handle) =
+        Sequencer::new(restored_core, journal, StaticPriceSource, restored_clock, 7)
+            .await
+            .expect("restore sequencer");
+
+    let second_order =
+        crate::PipelineOrder::new(sample_order("ord-restore-2", now)).into_validated(now);
+    let (second_ack_tx, second_ack_rx) = oneshot::channel();
+    restored_handle
+        .send(SequencerCommand::SubmitOrder {
+            order: second_order,
+            respond: second_ack_tx,
+        })
+        .await
+        .expect("queue second order");
+
+    let (restored_shutdown_tx, restored_shutdown_rx) = oneshot::channel();
+    restored_handle
+        .send(SequencerCommand::Shutdown {
+            respond: restored_shutdown_tx,
+        })
+        .await
+        .expect("queue restored shutdown");
+
+    let restored_snapshot = tokio::spawn(restored_sequencer.run())
+        .await
+        .expect("join restored sequencer")
+        .expect("restored sequencer result");
+    restored_shutdown_rx.await.expect("restored shutdown ack");
+    let second_ack = second_ack_rx
+        .await
+        .expect("second order channel")
+        .expect("second order accepted");
+
+    assert_ne!(first_ack.client_order_id, second_ack.client_order_id);
+    assert_eq!(second_ack.client_order_id.parse_sequence(), Some(1));
+    assert_eq!(restored_snapshot.state.idempotency_cache.len(), 2);
 }
 
 #[tokio::test]
