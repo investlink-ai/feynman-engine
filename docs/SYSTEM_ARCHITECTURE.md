@@ -249,7 +249,7 @@ stateDiagram-v2
 | Mode | Market Data | Order Submission | Fill Source | Use Case |
 |------|-------------|-----------------|------------|----------|
 | **Backtest** | Historical replay | SimulatedExchange | Fill model (best-price, probabilistic) | Strategy development, tuning |
-| **Paper** | Live WebSocket | PaperAdapter (no real orders) | Simulated at last price | Pre-deployment validation |
+| **Paper** | Live WebSocket | PaperAdapter (no real orders) | Simulated against live orderbook depth | Pre-deployment validation |
 | **Live** | Live WebSocket | Real venue API | Real exchange fills | Production trading |
 
 **Critical:** The execution pipeline is identical across all three modes. Only the `VenueAdapter` implementation changes. Risk checks, position tracking, and event journaling run in all modes.
