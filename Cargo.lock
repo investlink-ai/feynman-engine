@@ -591,6 +591,8 @@ dependencies = [
  "gateway",
  "observability",
  "risk",
+ "rust_decimal",
+ "secrecy",
  "serde",
  "tokio",
  "tonic",

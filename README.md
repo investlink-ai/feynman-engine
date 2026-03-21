@@ -189,7 +189,7 @@ max_gross_notional = 200000
 max_drawdown_pct = 5.0
 
 [venues.bybit]
-testnet = false
+testnet = true
 api_key = "${BYBIT_API_KEY}"
 api_secret = "${BYBIT_API_SECRET}"
 ```
@@ -258,6 +258,14 @@ cargo run -p feynman-engine -- --config config/default.toml
 # Terminal 3: Test agent (gRPC client)
 # Use grpcurl, ghz, or your test script
 grpcurl -plaintext localhost:50051 feynman.engine.v1.ExecutionService/GetFirmBook
+
+# Terminal 4: Bybit adapter smoke against testnet
+export BYBIT_API_KEY="..."
+export BYBIT_API_SECRET="..."
+./scripts/bybit-testnet-smoke.sh
+
+# Optional: also place a market order and wait for a fill
+BYBIT_TESTNET_RUN_MARKET_FILL=1 ./scripts/bybit-testnet-smoke.sh
 ```
 
 ## Troubleshooting
