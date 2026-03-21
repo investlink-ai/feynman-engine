@@ -48,8 +48,9 @@ The abstraction over all exchange interactions. One implementation per venue. **
 pub trait VenueAdapter: Send + Sync + sealed::Sealed {
     fn venue_id(&self) -> &VenueId;
 
-    /// Current connection health. Gateway checks `is_submittable()` before routing.
-    /// On `Stale` or `Disconnected`, submission returns `VenueNotConnected`.
+    /// Current connection health snapshot. Gateway checks `is_submittable()`
+    /// before routing. Adapters may enforce stricter submit-time readiness
+    /// checks for background streams that are not reflected here.
     fn connection_health(&self) -> &VenueConnectionHealth;
 
     /// Per-venue timeout budgets. See DATA_MODEL.md §13.

@@ -69,6 +69,13 @@ thiserror   = "1"
 
 # ── Async trait ──
 async-trait = "0.1"
+futures-util = "0.3"
+hmac = "0.12"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+secrecy = "0.8"
+sha2 = "0.10"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # ── Testing ──
 proptest    = "<1.10"
