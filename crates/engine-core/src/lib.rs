@@ -248,6 +248,11 @@ pub enum SequencerCommand {
         order_id: OrderId,
         reason: String,
     },
+    OnVenueCancelled {
+        order_id: OrderId,
+        reason: String,
+        cancelled_at: DateTime<Utc>,
+    },
     OnFill {
         fill: Fill,
     },
@@ -289,6 +294,7 @@ impl SequencerCommand {
         match self {
             Self::OnVenueAck { .. }
             | Self::OnVenueSubmitFailed { .. }
+            | Self::OnVenueCancelled { .. }
             | Self::OnFill { .. }
             | Self::OnReconciliation { .. }
             | Self::HaltAll { .. }

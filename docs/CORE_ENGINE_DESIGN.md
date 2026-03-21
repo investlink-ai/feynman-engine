@@ -862,6 +862,7 @@ pub trait VenueAdapter: Send + Sync {
     // ── Capabilities ──
 
     fn capabilities(&self) -> &VenueCapabilities;
+    fn simulates_fills_locally(&self) -> bool { false }
 
     // ── Capability-Gated Extensions ──
     // Instead of returning Err(Unsupported) from amend_order, adapters opt-in
@@ -2115,7 +2116,12 @@ Paper Mode Venue Adapter Task
 
 This means paper mode has real market data latency but no execution risk. The
 `FillSimulator` models slippage based on the live orderbook depth at the time of
-the order — not historical data.
+the order — not historical data. In the current implementation, `PaperAdapter`
+stores the latest validated `OrderbookSnapshot` per market, simulates at
+submission time, and re-evaluates resting `GTC` limits on later orderbook
+updates. Residual quantity is preserved only for resting `GTC` limits; `IOC`
+residual quantity is cancelled after the immediate fill instead of being left
+open or silently approximated.
 
 ### 10.4 Fill Simulation Model
 
@@ -2131,15 +2137,22 @@ pub trait FillSimulator: Send + Sync {
     fn simulate(
         &self,
         order: &OrderCore,
+        venue_order_id: &VenueOrderId,
         book: &OrderbookSnapshot,
         fee_model: &dyn FeeModel,
-    ) -> Result<SimulatedFill>;
+    ) -> Result<FillSimulationOutcome>;
 }
 
 pub struct SimulatedFill {
     pub fill: Fill,
+    pub remaining_qty: Decimal,
     pub slippage_bps: Decimal,
     pub market_impact_bps: Decimal,
+}
+
+pub enum FillSimulationOutcome {
+    Resting,
+    Executed(SimulatedFill),
 }
 
 /// Historical data replay source (Internal Backtest only).

@@ -1254,6 +1254,21 @@ pub struct PriceSnapshot {
     pub observed_at: DateTime<Utc>, // venue timestamp
     pub received_at: DateTime<Utc>, // from Clock::now()
 }
+
+pub struct PriceLevel {
+    pub price: Decimal,
+    pub qty: Decimal,
+}
+
+pub struct OrderbookSnapshot {
+    pub venue_id: VenueId,
+    pub instrument_id: InstrumentId,
+    pub market_id: MarketId,
+    pub bids: Vec<PriceLevel>,   // highest bid first
+    pub asks: Vec<PriceLevel>,   // lowest ask first
+    pub observed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+}
 ```
 
 Mark-to-market is computed by the canonical formula:
@@ -1267,6 +1282,10 @@ pub struct MarkToMarketSnapshot {
 ```
 
 The `RiskGate` receives a `&dyn PriceSource` in every `evaluate()` call so drawdown breakers can use real-time values. The Sequencer calls `EngineCore::mark_to_market()` periodically (via `SequencerCommand::MarkToMarket`).
+
+`OrderbookSnapshot` is the canonical depth shape used by paper-mode fill simulation.
+Snapshots are validated before use: positive prices and quantities, bids sorted
+descending, asks sorted ascending, and no crossed book (`best_bid <= best_ask`).
 
 ---
 

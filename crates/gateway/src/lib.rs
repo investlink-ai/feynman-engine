@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -598,12 +599,27 @@ pub trait VenueAdapter: Send + Sync + sealed::Sealed {
     /// Timeout policy for this venue's operations.
     fn timeout_policy(&self) -> &TimeoutPolicy;
 
+    /// Paper adapters simulate fills locally and should still receive dry-run orders.
+    #[must_use]
+    fn simulates_fills_locally(&self) -> bool {
+        false
+    }
+
     /// Submit an order to the venue.
     /// Returns venue-assigned order ID on success.
     ///
     /// Caller must check `connection_health().is_submittable()` first.
     /// If connection is degraded, this returns `VenueNotConnected`.
     async fn submit_order(&self, submission: OrderSubmission) -> Result<VenueOrderAck>;
+
+    /// Paper adapters may queue simulated fills or cancels that must be emitted only
+    /// after the venue ack has been processed by the sequencer.
+    async fn take_post_ack_actions(
+        &self,
+        _venue_order_id: &VenueOrderId,
+    ) -> Result<PostAckActions> {
+        Ok(PostAckActions::default())
+    }
 
     /// Cancel an order by venue order ID.
     async fn cancel_order(&self, venue_order_id: &VenueOrderId) -> Result<()>;
@@ -643,6 +659,786 @@ pub trait VenueAdapter: Send + Sync + sealed::Sealed {
 mod sealed {
     pub trait Sealed {}
 }
+
+// ─── Paper fill simulation ───
+
+/// Simulated fill enriched with fill-quality diagnostics.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct SimulatedFill {
+    pub fill: types::Fill,
+    pub remaining_qty: Decimal,
+    pub slippage_bps: Decimal,
+    pub market_impact_bps: Decimal,
+}
+
+impl SimulatedFill {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.remaining_qty.is_zero()
+    }
+}
+
+/// Result of simulating an order against the latest orderbook snapshot.
+#[derive(Debug, Clone)]
+pub enum FillSimulationOutcome {
+    Resting,
+    Executed(SimulatedFill),
+}
+
+/// One fill that should be emitted after the order ack is processed.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct PostAckFill {
+    pub client_order_id: ClientOrderId,
+    pub fill: types::Fill,
+}
+
+/// Adapter-side actions that must occur after the sequencer records the venue ack.
+#[derive(Debug, Clone, Default)]
+#[must_use]
+pub struct PostAckActions {
+    pub fills: Vec<PostAckFill>,
+    pub cancellation_reason: Option<String>,
+}
+
+/// Paper-mode fill simulation against live orderbook depth.
+pub trait FillSimulator: Send + Sync {
+    fn simulate(
+        &self,
+        order: &types::OrderCore,
+        venue_order_id: &VenueOrderId,
+        book: &types::OrderbookSnapshot,
+        fee_model: &dyn types::FeeModel,
+    ) -> Result<FillSimulationOutcome>;
+}
+
+/// Simple depth-walking simulator for paper mode.
+#[derive(Debug, Default)]
+pub struct LiveOrderbookFillSimulator;
+
+impl FillSimulator for LiveOrderbookFillSimulator {
+    fn simulate(
+        &self,
+        order: &types::OrderCore,
+        venue_order_id: &VenueOrderId,
+        book: &types::OrderbookSnapshot,
+        fee_model: &dyn types::FeeModel,
+    ) -> Result<FillSimulationOutcome> {
+        if order.qty <= Decimal::ZERO {
+            return Err(GatewayError::Validation(
+                "order quantity must be positive".to_owned(),
+            ));
+        }
+
+        if order.venue_id != book.venue_id {
+            return Err(GatewayError::Validation(format!(
+                "order venue {} does not match orderbook venue {}",
+                order.venue_id, book.venue_id
+            )));
+        }
+
+        if order.instrument_id != book.instrument_id {
+            return Err(GatewayError::Validation(format!(
+                "order instrument {} does not match orderbook instrument {}",
+                order.instrument_id, book.instrument_id
+            )));
+        }
+
+        book.validate()
+            .map_err(|err| GatewayError::Validation(err.to_string()))?;
+
+        let price_limit =
+            match order.order_type {
+                types::OrderType::Market => None,
+                types::OrderType::Limit => Some(order.price.ok_or_else(|| {
+                    GatewayError::Validation("limit order missing price".to_owned())
+                })?),
+                _ => {
+                    return Err(GatewayError::Unsupported(format!(
+                        "paper adapter only simulates market and limit orders, got {}",
+                        order.order_type
+                    )));
+                }
+            };
+
+        let (levels, top_of_book) = match order.side {
+            types::Side::Buy => (
+                book.asks.as_slice(),
+                book.best_ask().map(|level| level.price).ok_or_else(|| {
+                    GatewayError::PriceUnavailable {
+                        instrument_id: order.instrument_id.to_string(),
+                    }
+                })?,
+            ),
+            types::Side::Sell => (
+                book.bids.as_slice(),
+                book.best_bid().map(|level| level.price).ok_or_else(|| {
+                    GatewayError::PriceUnavailable {
+                        instrument_id: order.instrument_id.to_string(),
+                    }
+                })?,
+            ),
+        };
+
+        let mut remaining_qty = order.qty;
+        let mut executed_qty = Decimal::ZERO;
+        let mut executed_notional = Decimal::ZERO;
+        let mut worst_price: Option<Decimal> = None;
+
+        for level in levels {
+            if !is_level_fillable(order.side, price_limit, level.price) {
+                break;
+            }
+
+            let level_fill_qty = if remaining_qty < level.qty {
+                remaining_qty
+            } else {
+                level.qty
+            };
+            executed_qty += level_fill_qty;
+            executed_notional += level_fill_qty * level.price;
+            remaining_qty -= level_fill_qty;
+            worst_price = Some(level.price);
+
+            if remaining_qty <= Decimal::ZERO {
+                remaining_qty = Decimal::ZERO;
+                break;
+            }
+        }
+
+        if executed_qty.is_zero() {
+            return Ok(FillSimulationOutcome::Resting);
+        }
+
+        let average_price = executed_notional / executed_qty;
+        let mut fill = types::Fill {
+            order_id: order.id.clone(),
+            venue_order_id: venue_order_id.clone(),
+            instrument_id: order.instrument_id.clone(),
+            side: order.side,
+            qty: executed_qty,
+            price: average_price,
+            fee: Decimal::ZERO,
+            filled_at: book.received_at,
+            is_maker: false,
+        };
+        let fee = fee_model
+            .calculate(&fill)
+            .map_err(|err| GatewayError::Validation(err.to_string()))?;
+        fill.fee = fee.net;
+
+        Ok(FillSimulationOutcome::Executed(SimulatedFill {
+            fill,
+            remaining_qty,
+            slippage_bps: basis_points_delta(average_price, top_of_book),
+            market_impact_bps: basis_points_delta(worst_price.unwrap_or(top_of_book), top_of_book),
+        }))
+    }
+}
+
+fn is_level_fillable(
+    side: types::Side,
+    price_limit: Option<Decimal>,
+    level_price: Decimal,
+) -> bool {
+    match (side, price_limit) {
+        (_, None) => true,
+        (types::Side::Buy, Some(limit)) => level_price <= limit,
+        (types::Side::Sell, Some(limit)) => level_price >= limit,
+    }
+}
+
+fn basis_points_delta(actual: Decimal, reference: Decimal) -> Decimal {
+    if reference.is_zero() {
+        return Decimal::ZERO;
+    }
+
+    ((actual - reference).abs() / reference) * Decimal::new(10_000, 0)
+}
+
+/// Explicit paper-adapter configuration.
+#[derive(Debug, Clone)]
+pub struct PaperAdapterConfig {
+    pub venue_id: VenueId,
+    pub timeout_policy: TimeoutPolicy,
+    pub fill_channel_capacity: usize,
+}
+
+impl PaperAdapterConfig {
+    pub const DEFAULT_FILL_CHANNEL_CAPACITY: usize = 64;
+
+    #[must_use]
+    pub fn new(venue_id: VenueId) -> Self {
+        Self {
+            venue_id,
+            timeout_policy: TimeoutPolicy::default(),
+            fill_channel_capacity: Self::DEFAULT_FILL_CHANNEL_CAPACITY,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PaperAdapterState {
+    orderbooks: HashMap<MarketId, types::OrderbookSnapshot>,
+    open_orders: HashMap<VenueOrderId, PaperOpenOrder>,
+    idempotency_cache: HashMap<ClientOrderId, VenueOrderAck>,
+    post_ack_actions: HashMap<VenueOrderId, PostAckActions>,
+}
+
+#[derive(Debug, Clone)]
+struct PaperOpenOrder {
+    submission: OrderSubmission,
+    venue_order_id: VenueOrderId,
+    accepted_at: DateTime<Utc>,
+    filled_qty: Decimal,
+}
+
+impl PaperOpenOrder {
+    #[must_use]
+    fn remaining_qty(&self) -> Decimal {
+        self.submission.qty - self.filled_qty
+    }
+
+    #[must_use]
+    fn as_open_order(&self) -> VenueOpenOrder {
+        let state = if self.filled_qty.is_zero() {
+            OrderState::Accepted
+        } else {
+            OrderState::PartiallyFilled
+        };
+
+        VenueOpenOrder {
+            venue_order_id: self.venue_order_id.clone(),
+            client_order_id: Some(self.submission.client_order_id.clone()),
+            instrument_id: self.submission.instrument_id.clone(),
+            side: self.submission.side,
+            qty: self.submission.qty,
+            filled_qty: self.filled_qty,
+            price: self.submission.price,
+            state,
+            created_at: self.accepted_at,
+        }
+    }
+}
+
+/// Adapter that consumes live market-data snapshots and simulates fills locally.
+pub struct PaperAdapter {
+    config: PaperAdapterConfig,
+    connection_health: VenueConnectionHealth,
+    capabilities: VenueCapabilities,
+    fill_simulator: Arc<dyn FillSimulator>,
+    fee_model: Arc<dyn types::FeeModel>,
+    state: tokio::sync::Mutex<PaperAdapterState>,
+    fill_subscribers: tokio::sync::Mutex<Vec<tokio::sync::mpsc::Sender<VenueFill>>>,
+}
+
+impl PaperAdapter {
+    #[must_use]
+    pub fn new(
+        config: PaperAdapterConfig,
+        fill_simulator: Arc<dyn FillSimulator>,
+        fee_model: Arc<dyn types::FeeModel>,
+    ) -> Self {
+        let venue_id = config.venue_id.clone();
+        Self {
+            config,
+            connection_health: VenueConnectionHealth::new(venue_id.clone()),
+            capabilities: VenueCapabilities {
+                venue_id,
+                supports_market_orders: true,
+                supports_limit_orders: true,
+                supports_stop_market: false,
+                supports_stop_limit: false,
+                supports_trailing_stop: false,
+                supports_oco: false,
+                supports_amendment: false,
+                supports_reduce_only: true,
+                supports_post_only: true,
+                max_batch_size: Some(1),
+            },
+            fill_simulator,
+            fee_model,
+            state: tokio::sync::Mutex::new(PaperAdapterState::default()),
+            fill_subscribers: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Replace the latest live orderbook snapshot for a market.
+    pub async fn replace_orderbook(&self, snapshot: types::OrderbookSnapshot) -> Result<()> {
+        if snapshot.venue_id != self.config.venue_id {
+            return Err(GatewayError::Validation(format!(
+                "paper adapter for {} cannot ingest snapshot for {}",
+                self.config.venue_id, snapshot.venue_id
+            )));
+        }
+
+        snapshot
+            .validate()
+            .map_err(|err| GatewayError::Validation(err.to_string()))?;
+
+        let mut state = self.state.lock().await;
+        state
+            .orderbooks
+            .insert(snapshot.market_id.clone(), snapshot.clone());
+        let fills = self.collect_repriced_fills(&snapshot, &mut state)?;
+        drop(state);
+
+        for fill in fills {
+            self.broadcast_fill(fill).await;
+        }
+
+        Ok(())
+    }
+
+    async fn broadcast_fill(&self, fill: VenueFill) {
+        let subscribers = {
+            let subscribers = self.fill_subscribers.lock().await;
+            subscribers.clone()
+        };
+
+        for subscriber in subscribers {
+            let _ = subscriber.send(fill.clone()).await;
+        }
+
+        let mut subscribers = self.fill_subscribers.lock().await;
+        subscribers.retain(|sender| !sender.is_closed());
+    }
+
+    fn validate_submission(&self, submission: &OrderSubmission) -> Result<()> {
+        if submission.venue_id != self.config.venue_id {
+            return Err(GatewayError::Validation(format!(
+                "paper adapter {} cannot accept order for venue {}",
+                self.config.venue_id, submission.venue_id
+            )));
+        }
+
+        match submission.order_type {
+            types::OrderType::Market | types::OrderType::Limit => {}
+            _ => {
+                return Err(GatewayError::Unsupported(format!(
+                    "paper adapter does not support order type {}",
+                    submission.order_type
+                )));
+            }
+        }
+
+        match submission.time_in_force {
+            types::TimeInForce::GTC | types::TimeInForce::IOC | types::TimeInForce::FOK => {}
+            types::TimeInForce::GTD { .. } => {
+                return Err(GatewayError::Unsupported(
+                    "paper adapter does not support GTD expiry handling yet".to_owned(),
+                ));
+            }
+        }
+
+        if submission.order_type == types::OrderType::Limit && submission.price.is_none() {
+            return Err(GatewayError::Validation(
+                "limit order missing price".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn collect_repriced_fills(
+        &self,
+        snapshot: &types::OrderbookSnapshot,
+        state: &mut PaperAdapterState,
+    ) -> Result<Vec<VenueFill>> {
+        let venue_order_ids = state
+            .open_orders
+            .iter()
+            .filter_map(|(venue_order_id, order)| {
+                if order.submission.market_id == snapshot.market_id {
+                    Some(venue_order_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut fills = Vec::new();
+
+        for venue_order_id in venue_order_ids {
+            let Some(existing) = state.open_orders.get(&venue_order_id).cloned() else {
+                continue;
+            };
+
+            let remaining_qty = existing.remaining_qty();
+            if remaining_qty <= Decimal::ZERO {
+                state.open_orders.remove(&venue_order_id);
+                continue;
+            }
+
+            let order_core = Self::order_core_from_submission(
+                &existing.submission,
+                existing.accepted_at,
+                remaining_qty,
+            );
+            let simulation = self.fill_simulator.simulate(
+                &order_core,
+                &venue_order_id,
+                snapshot,
+                self.fee_model.as_ref(),
+            )?;
+
+            let FillSimulationOutcome::Executed(simulated_fill) = simulation else {
+                continue;
+            };
+
+            let venue_fill = VenueFill {
+                venue_order_id: venue_order_id.clone(),
+                client_order_id: existing.submission.client_order_id.clone(),
+                instrument_id: simulated_fill.fill.instrument_id.clone(),
+                side: simulated_fill.fill.side,
+                qty: simulated_fill.fill.qty,
+                price: simulated_fill.fill.price,
+                fee: simulated_fill.fill.fee,
+                is_maker: simulated_fill.fill.is_maker,
+                filled_at: simulated_fill.fill.filled_at,
+            };
+            fills.push(venue_fill);
+
+            let new_filled_qty = existing.filled_qty + simulated_fill.fill.qty;
+            if simulated_fill.is_complete() {
+                state.open_orders.remove(&venue_order_id);
+            } else if let Some(open_order) = state.open_orders.get_mut(&venue_order_id) {
+                open_order.filled_qty = new_filled_qty;
+            }
+        }
+
+        Ok(fills)
+    }
+
+    fn order_core_from_submission(
+        submission: &OrderSubmission,
+        created_at: DateTime<Utc>,
+        qty: Decimal,
+    ) -> types::OrderCore {
+        types::OrderCore {
+            id: submission.order_id.clone(),
+            basket_id: None,
+            agent_id: submission.agent_id.clone(),
+            instrument_id: submission.instrument_id.clone(),
+            market_id: submission.market_id.clone(),
+            venue_id: submission.venue_id.clone(),
+            side: submission.side,
+            order_type: submission.order_type,
+            time_in_force: submission.time_in_force,
+            qty,
+            price: submission.price,
+            trigger_price: submission.trigger_price,
+            stop_loss: submission.stop_loss,
+            take_profit: submission.take_profit,
+            post_only: submission.post_only,
+            reduce_only: submission.reduce_only,
+            dry_run: submission.dry_run,
+            exec_hint: submission.exec_hint.clone(),
+            created_at,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl VenueAdapter for PaperAdapter {
+    fn venue_id(&self) -> &VenueId {
+        &self.config.venue_id
+    }
+
+    fn connection_health(&self) -> &VenueConnectionHealth {
+        &self.connection_health
+    }
+
+    fn timeout_policy(&self) -> &TimeoutPolicy {
+        &self.config.timeout_policy
+    }
+
+    fn simulates_fills_locally(&self) -> bool {
+        true
+    }
+
+    async fn submit_order(&self, submission: OrderSubmission) -> Result<VenueOrderAck> {
+        if !self.connection_health.is_submittable() {
+            return Err(GatewayError::VenueNotConnected {
+                venue_id: self.config.venue_id.to_string(),
+                state: format!("{:?}", self.connection_health.state),
+            });
+        }
+
+        self.validate_submission(&submission)?;
+
+        {
+            let state = self.state.lock().await;
+            if let Some(existing) = state.idempotency_cache.get(&submission.client_order_id) {
+                return Ok(existing.clone());
+            }
+        }
+
+        let book = {
+            let state = self.state.lock().await;
+            state
+                .orderbooks
+                .get(&submission.market_id)
+                .cloned()
+                .ok_or_else(|| GatewayError::PriceUnavailable {
+                    instrument_id: submission.instrument_id.to_string(),
+                })?
+        };
+
+        let accepted_at = book.received_at;
+        let venue_order_id = VenueOrderId(format!("paper-{}", submission.client_order_id));
+        let client_order_id = submission.client_order_id.clone();
+        let ack = VenueOrderAck {
+            venue_order_id: venue_order_id.clone(),
+            client_order_id: client_order_id.clone(),
+            accepted_at,
+        };
+        let order_core = Self::order_core_from_submission(&submission, accepted_at, submission.qty);
+
+        let simulation = self.fill_simulator.simulate(
+            &order_core,
+            &venue_order_id,
+            &book,
+            self.fee_model.as_ref(),
+        )?;
+
+        if submission.post_only && matches!(simulation, FillSimulationOutcome::Executed(_)) {
+            return Err(GatewayError::VenueRejected {
+                reason: "post-only order would take liquidity on paper adapter".to_owned(),
+            });
+        }
+
+        let fill_to_broadcast = match simulation {
+            FillSimulationOutcome::Resting => {
+                let mut state = self.state.lock().await;
+                state
+                    .idempotency_cache
+                    .insert(client_order_id.clone(), ack.clone());
+                match submission.time_in_force {
+                    types::TimeInForce::GTC => {
+                        state.open_orders.insert(
+                            venue_order_id.clone(),
+                            PaperOpenOrder {
+                                submission,
+                                venue_order_id,
+                                accepted_at,
+                                filled_qty: Decimal::ZERO,
+                            },
+                        );
+                    }
+                    types::TimeInForce::IOC => {
+                        state.post_ack_actions.insert(
+                            venue_order_id.clone(),
+                            PostAckActions {
+                                fills: Vec::new(),
+                                cancellation_reason: Some(
+                                    "IOC order received no immediate fill on paper adapter"
+                                        .to_owned(),
+                                ),
+                            },
+                        );
+                    }
+                    types::TimeInForce::FOK => {
+                        return Err(GatewayError::VenueRejected {
+                            reason: "FOK order could not be fully filled on paper adapter"
+                                .to_owned(),
+                        });
+                    }
+                    types::TimeInForce::GTD { .. } => {
+                        return Err(GatewayError::Unsupported(
+                            "paper adapter does not support GTD expiry handling yet".to_owned(),
+                        ));
+                    }
+                }
+                None
+            }
+            FillSimulationOutcome::Executed(simulated_fill) => {
+                let post_ack_fill = PostAckFill {
+                    client_order_id: client_order_id.clone(),
+                    fill: simulated_fill.fill.clone(),
+                };
+                if !simulated_fill.is_complete() {
+                    match submission.time_in_force {
+                        types::TimeInForce::GTC
+                            if submission.order_type == types::OrderType::Limit =>
+                        {
+                            let mut state = self.state.lock().await;
+                            state
+                                .idempotency_cache
+                                .insert(client_order_id.clone(), ack.clone());
+                            state.open_orders.insert(
+                                venue_order_id.clone(),
+                                PaperOpenOrder {
+                                    submission,
+                                    venue_order_id: venue_order_id.clone(),
+                                    accepted_at,
+                                    filled_qty: simulated_fill.fill.qty,
+                                },
+                            );
+                            state.post_ack_actions.insert(
+                                venue_order_id.clone(),
+                                PostAckActions {
+                                    fills: vec![post_ack_fill],
+                                    cancellation_reason: None,
+                                },
+                            );
+                        }
+                        types::TimeInForce::IOC => {
+                            let mut state = self.state.lock().await;
+                            state
+                                .idempotency_cache
+                                .insert(client_order_id.clone(), ack.clone());
+                            state.post_ack_actions.insert(
+                                venue_order_id.clone(),
+                                PostAckActions {
+                                    fills: vec![post_ack_fill],
+                                    cancellation_reason: Some(
+                                        "IOC residual quantity cancelled on paper adapter"
+                                            .to_owned(),
+                                    ),
+                                },
+                            );
+                        }
+                        types::TimeInForce::FOK => {
+                            return Err(GatewayError::VenueRejected {
+                                reason: "FOK order could not be fully filled on paper adapter"
+                                    .to_owned(),
+                            });
+                        }
+                        _ => {
+                            return Err(GatewayError::VenueRejected {
+                                reason: format!(
+                                    "paper adapter only supports partial execution for GTC limit or IOC orders; {} {} left {} unfilled",
+                                    submission.order_type,
+                                    submission.time_in_force,
+                                    simulated_fill.remaining_qty
+                                ),
+                            });
+                        }
+                    }
+                } else {
+                    let mut state = self.state.lock().await;
+                    state
+                        .idempotency_cache
+                        .insert(client_order_id.clone(), ack.clone());
+                    state.post_ack_actions.insert(
+                        venue_order_id.clone(),
+                        PostAckActions {
+                            fills: vec![post_ack_fill],
+                            cancellation_reason: None,
+                        },
+                    );
+                }
+
+                None
+            }
+        };
+
+        if let Some(fill) = fill_to_broadcast {
+            self.broadcast_fill(fill).await;
+        }
+
+        Ok(ack)
+    }
+
+    async fn take_post_ack_actions(&self, venue_order_id: &VenueOrderId) -> Result<PostAckActions> {
+        let actions = {
+            let mut state = self.state.lock().await;
+            state
+                .post_ack_actions
+                .remove(venue_order_id)
+                .unwrap_or_default()
+        };
+
+        for queued_fill in &actions.fills {
+            self.broadcast_fill(VenueFill {
+                venue_order_id: queued_fill.fill.venue_order_id.clone(),
+                client_order_id: queued_fill.client_order_id.clone(),
+                instrument_id: queued_fill.fill.instrument_id.clone(),
+                side: queued_fill.fill.side,
+                qty: queued_fill.fill.qty,
+                price: queued_fill.fill.price,
+                fee: queued_fill.fill.fee,
+                is_maker: queued_fill.fill.is_maker,
+                filled_at: queued_fill.fill.filled_at,
+            })
+            .await;
+        }
+
+        Ok(actions)
+    }
+
+    async fn cancel_order(&self, venue_order_id: &VenueOrderId) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.open_orders.remove(venue_order_id).is_some() {
+            return Ok(());
+        }
+
+        Err(GatewayError::OrderNotFound(venue_order_id.to_string()))
+    }
+
+    async fn amend_order(
+        &self,
+        _venue_order_id: &VenueOrderId,
+        _new_price: Option<Decimal>,
+        _new_qty: Option<Decimal>,
+    ) -> Result<VenueOrderAck> {
+        Err(GatewayError::Unsupported(
+            "paper adapter does not support amendments yet".to_owned(),
+        ))
+    }
+
+    async fn query_positions(&self) -> Result<Vec<VenuePosition>> {
+        Err(GatewayError::Unsupported(
+            "paper adapter does not own paper positions; query the sequencer state instead"
+                .to_owned(),
+        ))
+    }
+
+    async fn query_open_orders(&self) -> Result<Vec<VenueOpenOrder>> {
+        let state = self.state.lock().await;
+        Ok(state
+            .open_orders
+            .values()
+            .map(PaperOpenOrder::as_open_order)
+            .collect())
+    }
+
+    async fn query_balance(&self) -> Result<VenueBalance> {
+        Err(GatewayError::Unsupported(
+            "paper adapter does not model balances yet".to_owned(),
+        ))
+    }
+
+    async fn subscribe_fills(&self) -> Result<tokio::sync::mpsc::Receiver<VenueFill>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(self.config.fill_channel_capacity);
+        let mut subscribers = self.fill_subscribers.lock().await;
+        subscribers.push(tx);
+        Ok(rx)
+    }
+
+    fn capabilities(&self) -> &VenueCapabilities {
+        &self.capabilities
+    }
+
+    async fn connect(&mut self) -> Result<()> {
+        let now = Utc::now();
+        self.connection_health.state = ConnectionState::Connected;
+        self.connection_health.last_message_at = Some(now);
+        self.connection_health.last_heartbeat_at = Some(now);
+        self.connection_health.connected_since = Some(now);
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
+        self.connection_health.state = ConnectionState::Disconnected;
+        self.connection_health.connected_since = None;
+        Ok(())
+    }
+}
+
+impl sealed::Sealed for PaperAdapter {}
 
 // ─── Execution Gateway ───
 
@@ -989,8 +1785,22 @@ impl VenueSubmitTask {
             let venue_id = order.core.venue_id.clone();
             let now = self.clock.now();
 
-            // Gate 1 — dry_run: simulate ack without calling the adapter.
-            if order.core.dry_run {
+            // Gate 2 — adapter lookup: fail fast if no adapter registered for this venue.
+            let adapter = match self.adapters.get(&venue_id) {
+                Some(a) => std::sync::Arc::clone(a),
+                None => {
+                    let reason = format!("no adapter registered for venue {venue_id}");
+                    warn!(order_id = %order_id, reason = %reason, "venue submission failed");
+                    let cmd = SequencerCommand::OnVenueSubmitFailed { order_id, reason };
+                    if let Err(err) = self.sequencer_handle.send(cmd).await {
+                        error!(error = %err, "failed to send OnVenueSubmitFailed to sequencer");
+                    }
+                    continue;
+                }
+            };
+
+            // Gate 1 — dry_run: simulate ack without calling real adapters.
+            if order.core.dry_run && !adapter.simulates_fills_locally() {
                 let simulated_id =
                     types::VenueOrderId(format!("sim-{}", order.routing().client_order_id));
                 info!(
@@ -1009,38 +1819,80 @@ impl VenueSubmitTask {
                 continue;
             }
 
-            // Gate 2 — adapter lookup: fail fast if no adapter registered for this venue.
-            let adapter = match self.adapters.get(&venue_id) {
-                Some(a) => std::sync::Arc::clone(a),
-                None => {
-                    let reason = format!("no adapter registered for venue {venue_id}");
-                    warn!(order_id = %order_id, reason = %reason, "venue submission failed");
-                    let cmd = SequencerCommand::OnVenueSubmitFailed { order_id, reason };
-                    if let Err(err) = self.sequencer_handle.send(cmd).await {
-                        error!(error = %err, "failed to send OnVenueSubmitFailed to sequencer");
-                    }
-                    continue;
-                }
-            };
-
             // Dispatch on OrderCore.kind when multi-leg support lands (#29).
             // For now all orders are single-leg and follow the same path.
             let submission = OrderSubmission::from_routed(&order);
 
             match adapter.submit_order(submission).await {
                 Ok(ack) => {
+                    let ack_venue_order_id = ack.venue_order_id.clone();
                     info!(
                         order_id = %order_id,
                         venue_order_id = %ack.venue_order_id,
                         "venue accepted order"
                     );
                     let cmd = SequencerCommand::OnVenueAck {
-                        order_id,
-                        venue_order_id: ack.venue_order_id,
+                        order_id: order_id.clone(),
+                        venue_order_id: ack_venue_order_id.clone(),
                         submitted_at: ack.accepted_at,
                     };
                     if let Err(err) = self.sequencer_handle.send(cmd).await {
                         error!(error = %err, "failed to send OnVenueAck to sequencer");
+                        continue;
+                    }
+
+                    match adapter.take_post_ack_actions(&ack_venue_order_id).await {
+                        Ok(actions) => {
+                            for queued_fill in actions.fills {
+                                let cmd = SequencerCommand::OnFill {
+                                    fill: queued_fill.fill,
+                                };
+                                if let Err(err) = self.sequencer_handle.send(cmd).await {
+                                    error!(
+                                        error = %err,
+                                        order_id = %order_id,
+                                        venue_order_id = %ack_venue_order_id,
+                                        "failed to send simulated OnFill to sequencer"
+                                    );
+                                    break;
+                                }
+                            }
+
+                            if let Some(reason) = actions.cancellation_reason {
+                                let cmd = SequencerCommand::OnVenueCancelled {
+                                    order_id: order_id.clone(),
+                                    reason,
+                                    cancelled_at: self.clock.now(),
+                                };
+                                if let Err(err) = self.sequencer_handle.send(cmd).await {
+                                    error!(
+                                        error = %err,
+                                        order_id = %order_id,
+                                        venue_order_id = %ack_venue_order_id,
+                                        "failed to send OnVenueCancelled to sequencer"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            error!(
+                                error = %err,
+                                order_id = %order_id,
+                                venue_order_id = %ack_venue_order_id,
+                                "failed to collect post-ack adapter actions"
+                            );
+                            let cmd = SequencerCommand::OnVenueSubmitFailed {
+                                order_id,
+                                reason: format!("post-ack adapter action failed: {err}"),
+                            };
+                            if let Err(send_err) = self.sequencer_handle.send(cmd).await {
+                                error!(
+                                    error = %send_err,
+                                    "failed to send OnVenueSubmitFailed to sequencer"
+                                );
+                            }
+                            continue;
+                        }
                     }
                 }
                 Err(err) => {
@@ -1060,6 +1912,7 @@ impl VenueSubmitTask {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use tokio::time::{timeout, Duration as TokioDuration};
 
     struct StaticPriceSource {
         prices: HashMap<InstrumentId, types::PriceSnapshot>,
@@ -1202,6 +2055,161 @@ mod tests {
             )
             .unwrap();
         symbol_map
+    }
+
+    #[derive(Debug, Clone)]
+    struct StaticFeeModel {
+        schedule: types::FeeSchedule,
+    }
+
+    impl StaticFeeModel {
+        fn zero_fee(venue_id: &str) -> Self {
+            Self {
+                schedule: types::FeeSchedule {
+                    venue_id: VenueId(venue_id.to_owned()),
+                    tier: "paper".to_owned(),
+                    maker_rate: Decimal::ZERO,
+                    taker_rate: Decimal::ZERO,
+                    gas_model: types::GasModel::None,
+                    instrument_overrides: Vec::new(),
+                },
+            }
+        }
+    }
+
+    impl types::FeeModel for StaticFeeModel {
+        fn estimate(
+            &self,
+            _order: &types::OrderCore,
+        ) -> std::result::Result<types::FeeEstimate, types::FeeError> {
+            Ok(types::FeeEstimate {
+                as_maker: Decimal::ZERO,
+                as_taker: Decimal::ZERO,
+                worst_case: Decimal::ZERO,
+                gas_estimate: Decimal::ZERO,
+            })
+        }
+
+        fn calculate(
+            &self,
+            _fill: &types::Fill,
+        ) -> std::result::Result<types::Fee, types::FeeError> {
+            Ok(types::Fee {
+                trading_fee: Decimal::ZERO,
+                gas_fee: Decimal::ZERO,
+                rebate: Decimal::ZERO,
+                funding_fee: Decimal::ZERO,
+                net: Decimal::ZERO,
+            })
+        }
+
+        fn schedule(
+            &self,
+            venue_id: &VenueId,
+        ) -> std::result::Result<&types::FeeSchedule, types::FeeError> {
+            if venue_id == &self.schedule.venue_id {
+                return Ok(&self.schedule);
+            }
+
+            Err(types::FeeError::NoSchedule(venue_id.clone()))
+        }
+
+        fn update_schedule(&mut self, venue_id: VenueId, schedule: types::FeeSchedule) {
+            self.schedule = types::FeeSchedule {
+                venue_id,
+                ..schedule
+            };
+        }
+    }
+
+    fn sample_orderbook(now: DateTime<Utc>) -> types::OrderbookSnapshot {
+        types::OrderbookSnapshot {
+            venue_id: VenueId("paper".into()),
+            instrument_id: InstrumentId("BTC".into()),
+            market_id: MarketId("BTCUSDT".into()),
+            bids: vec![
+                types::PriceLevel {
+                    price: Decimal::new(9_990, 0),
+                    qty: Decimal::new(2, 0),
+                },
+                types::PriceLevel {
+                    price: Decimal::new(9_980, 0),
+                    qty: Decimal::new(3, 0),
+                },
+            ],
+            asks: vec![
+                types::PriceLevel {
+                    price: Decimal::new(10_000, 0),
+                    qty: Decimal::new(1, 0),
+                },
+                types::PriceLevel {
+                    price: Decimal::new(10_010, 0),
+                    qty: Decimal::new(3, 0),
+                },
+            ],
+            observed_at: now,
+            received_at: now,
+        }
+    }
+
+    fn sample_order_core(
+        now: DateTime<Utc>,
+        order_type: types::OrderType,
+        side: types::Side,
+        qty: Decimal,
+        price: Option<Decimal>,
+    ) -> types::OrderCore {
+        types::OrderCore {
+            id: OrderId("ord-paper-1".into()),
+            basket_id: None,
+            agent_id: types::AgentId("athena".into()),
+            instrument_id: InstrumentId("BTC".into()),
+            market_id: MarketId("BTCUSDT".into()),
+            venue_id: VenueId("paper".into()),
+            side,
+            order_type,
+            time_in_force: types::TimeInForce::GTC,
+            qty,
+            price,
+            trigger_price: None,
+            stop_loss: None,
+            take_profit: None,
+            post_only: false,
+            reduce_only: false,
+            dry_run: true,
+            exec_hint: types::ExecHint::default(),
+            created_at: now,
+        }
+    }
+
+    fn sample_submission(
+        client_order_id: &str,
+        order_type: types::OrderType,
+        side: types::Side,
+        qty: Decimal,
+        price: Option<Decimal>,
+        time_in_force: types::TimeInForce,
+    ) -> OrderSubmission {
+        OrderSubmission {
+            order_id: OrderId(format!("ord-{client_order_id}")),
+            client_order_id: ClientOrderId(client_order_id.to_owned()),
+            agent_id: types::AgentId("athena".into()),
+            instrument_id: InstrumentId("BTC".into()),
+            market_id: MarketId("BTCUSDT".into()),
+            venue_id: VenueId("paper".into()),
+            side,
+            order_type,
+            time_in_force,
+            qty,
+            price,
+            trigger_price: None,
+            stop_loss: None,
+            take_profit: None,
+            post_only: false,
+            reduce_only: false,
+            dry_run: true,
+            exec_hint: types::ExecHint::default(),
+        }
     }
 
     #[test]
@@ -1511,5 +2519,250 @@ mod tests {
 
         assert_eq!(order_a.core().id, OrderId("ord-sig-1".into()));
         assert_eq!(order_a.core().id, order_b.core().id);
+    }
+
+    #[test]
+    fn fill_simulator_walks_orderbook_depth_for_market_buy() {
+        let now = Utc::now();
+        let simulator = LiveOrderbookFillSimulator;
+        let fee_model = StaticFeeModel::zero_fee("paper");
+        let book = sample_orderbook(now);
+        let order = sample_order_core(
+            now,
+            types::OrderType::Market,
+            types::Side::Buy,
+            Decimal::new(2, 0),
+            None,
+        );
+
+        let outcome = simulator
+            .simulate(
+                &order,
+                &VenueOrderId("paper-athena-1".into()),
+                &book,
+                &fee_model,
+            )
+            .unwrap();
+
+        let simulated_fill = match outcome {
+            FillSimulationOutcome::Executed(fill) => fill,
+            FillSimulationOutcome::Resting => panic!("market order should execute"),
+        };
+        assert_eq!(simulated_fill.fill.qty, Decimal::new(2, 0));
+        assert_eq!(simulated_fill.fill.price, Decimal::new(10_005, 0));
+        assert_eq!(simulated_fill.slippage_bps, Decimal::new(5, 0));
+        assert_eq!(simulated_fill.market_impact_bps, Decimal::new(10, 0));
+        assert!(simulated_fill.is_complete());
+    }
+
+    #[test]
+    fn fill_simulator_returns_resting_for_non_marketable_limit() {
+        let now = Utc::now();
+        let simulator = LiveOrderbookFillSimulator;
+        let fee_model = StaticFeeModel::zero_fee("paper");
+        let book = sample_orderbook(now);
+        let order = sample_order_core(
+            now,
+            types::OrderType::Limit,
+            types::Side::Buy,
+            Decimal::new(1, 0),
+            Some(Decimal::new(9_995, 0)),
+        );
+
+        let outcome = simulator
+            .simulate(
+                &order,
+                &VenueOrderId("paper-athena-2".into()),
+                &book,
+                &fee_model,
+            )
+            .unwrap();
+
+        assert!(matches!(outcome, FillSimulationOutcome::Resting));
+    }
+
+    #[tokio::test]
+    async fn paper_adapter_emits_simulated_fill_for_dry_run_submission() {
+        let now = Utc::now();
+        let fee_model: Arc<dyn types::FeeModel> = Arc::new(StaticFeeModel::zero_fee("paper"));
+        let simulator: Arc<dyn FillSimulator> = Arc::new(LiveOrderbookFillSimulator);
+        let mut adapter = PaperAdapter::new(
+            PaperAdapterConfig::new(VenueId("paper".into())),
+            simulator,
+            fee_model,
+        );
+        adapter.connect().await.unwrap();
+        adapter
+            .replace_orderbook(sample_orderbook(now))
+            .await
+            .unwrap();
+
+        let mut fills = adapter.subscribe_fills().await.unwrap();
+        let submission = sample_submission(
+            "athena-1",
+            types::OrderType::Market,
+            types::Side::Buy,
+            Decimal::new(2, 0),
+            None,
+            types::TimeInForce::IOC,
+        );
+
+        let ack = adapter.submit_order(submission).await.unwrap();
+        let actions = adapter
+            .take_post_ack_actions(&ack.venue_order_id)
+            .await
+            .unwrap();
+        assert_eq!(actions.fills.len(), 1);
+        assert!(actions.cancellation_reason.is_none());
+        let fill = timeout(TokioDuration::from_secs(1), fills.recv())
+            .await
+            .expect("fill should arrive")
+            .expect("fill channel should stay open");
+
+        assert_eq!(ack.venue_order_id, fill.venue_order_id);
+        assert_eq!(fill.qty, Decimal::new(2, 0));
+        assert_eq!(fill.price, Decimal::new(10_005, 0));
+        assert!(adapter.query_open_orders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn paper_adapter_tracks_resting_limit_orders() {
+        let now = Utc::now();
+        let fee_model: Arc<dyn types::FeeModel> = Arc::new(StaticFeeModel::zero_fee("paper"));
+        let simulator: Arc<dyn FillSimulator> = Arc::new(LiveOrderbookFillSimulator);
+        let mut adapter = PaperAdapter::new(
+            PaperAdapterConfig::new(VenueId("paper".into())),
+            simulator,
+            fee_model,
+        );
+        adapter.connect().await.unwrap();
+        adapter
+            .replace_orderbook(sample_orderbook(now))
+            .await
+            .unwrap();
+
+        let submission = sample_submission(
+            "athena-2",
+            types::OrderType::Limit,
+            types::Side::Buy,
+            Decimal::new(1, 0),
+            Some(Decimal::new(9_995, 0)),
+            types::TimeInForce::GTC,
+        );
+
+        let ack = adapter.submit_order(submission).await.unwrap();
+        let open_orders = adapter.query_open_orders().await.unwrap();
+
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].venue_order_id, ack.venue_order_id);
+        assert_eq!(open_orders[0].state, OrderState::Accepted);
+    }
+
+    #[tokio::test]
+    async fn paper_adapter_ioc_partial_fill_becomes_fill_plus_cancel() {
+        let now = Utc::now();
+        let fee_model: Arc<dyn types::FeeModel> = Arc::new(StaticFeeModel::zero_fee("paper"));
+        let simulator: Arc<dyn FillSimulator> = Arc::new(LiveOrderbookFillSimulator);
+        let mut adapter = PaperAdapter::new(
+            PaperAdapterConfig::new(VenueId("paper".into())),
+            simulator,
+            fee_model,
+        );
+        adapter.connect().await.unwrap();
+        adapter
+            .replace_orderbook(sample_orderbook(now))
+            .await
+            .unwrap();
+
+        let mut fills = adapter.subscribe_fills().await.unwrap();
+        let submission = sample_submission(
+            "athena-3",
+            types::OrderType::Limit,
+            types::Side::Buy,
+            Decimal::new(2, 0),
+            Some(Decimal::new(10_000, 0)),
+            types::TimeInForce::IOC,
+        );
+
+        let ack = adapter.submit_order(submission).await.unwrap();
+        let actions = adapter
+            .take_post_ack_actions(&ack.venue_order_id)
+            .await
+            .unwrap();
+
+        assert_eq!(actions.fills.len(), 1);
+        assert_eq!(actions.fills[0].fill.qty, Decimal::new(1, 0));
+        assert_eq!(
+            actions.cancellation_reason,
+            Some("IOC residual quantity cancelled on paper adapter".to_owned())
+        );
+        assert!(adapter.query_open_orders().await.unwrap().is_empty());
+
+        let fill = timeout(TokioDuration::from_secs(1), fills.recv())
+            .await
+            .expect("fill should arrive")
+            .expect("fill channel should stay open");
+        assert_eq!(fill.qty, Decimal::new(1, 0));
+    }
+
+    #[tokio::test]
+    async fn paper_adapter_reprices_resting_limit_on_orderbook_update() {
+        let now = Utc::now();
+        let fee_model: Arc<dyn types::FeeModel> = Arc::new(StaticFeeModel::zero_fee("paper"));
+        let simulator: Arc<dyn FillSimulator> = Arc::new(LiveOrderbookFillSimulator);
+        let mut adapter = PaperAdapter::new(
+            PaperAdapterConfig::new(VenueId("paper".into())),
+            simulator,
+            fee_model,
+        );
+        adapter.connect().await.unwrap();
+        adapter
+            .replace_orderbook(sample_orderbook(now))
+            .await
+            .unwrap();
+
+        let mut fills = adapter.subscribe_fills().await.unwrap();
+        let submission = sample_submission(
+            "athena-4",
+            types::OrderType::Limit,
+            types::Side::Buy,
+            Decimal::new(1, 0),
+            Some(Decimal::new(9_995, 0)),
+            types::TimeInForce::GTC,
+        );
+
+        let ack = adapter.submit_order(submission).await.unwrap();
+        let actions = adapter
+            .take_post_ack_actions(&ack.venue_order_id)
+            .await
+            .unwrap();
+        assert!(actions.fills.is_empty());
+        assert!(actions.cancellation_reason.is_none());
+        assert_eq!(adapter.query_open_orders().await.unwrap().len(), 1);
+
+        let crossed_later = types::OrderbookSnapshot {
+            venue_id: VenueId("paper".into()),
+            instrument_id: InstrumentId("BTC".into()),
+            market_id: MarketId("BTCUSDT".into()),
+            bids: vec![types::PriceLevel {
+                price: Decimal::new(9_990, 0),
+                qty: Decimal::new(2, 0),
+            }],
+            asks: vec![types::PriceLevel {
+                price: Decimal::new(9_994, 0),
+                qty: Decimal::new(2, 0),
+            }],
+            observed_at: now,
+            received_at: now,
+        };
+        adapter.replace_orderbook(crossed_later).await.unwrap();
+
+        let fill = timeout(TokioDuration::from_secs(1), fills.recv())
+            .await
+            .expect("repriced fill should arrive")
+            .expect("fill channel should stay open");
+        assert_eq!(fill.venue_order_id, ack.venue_order_id);
+        assert_eq!(fill.price, Decimal::new(9_994, 0));
+        assert!(adapter.query_open_orders().await.unwrap().is_empty());
     }
 }

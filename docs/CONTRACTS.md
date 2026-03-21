@@ -55,10 +55,16 @@ pub trait VenueAdapter: Send + Sync + sealed::Sealed {
     /// Per-venue timeout budgets. See DATA_MODEL.md §13.
     fn timeout_policy(&self) -> &TimeoutPolicy;
 
+    /// Paper adapters override this so the gateway can route dry-run orders
+    /// into local fill simulation instead of short-circuiting them.
+    fn simulates_fills_locally(&self) -> bool { false }
+
     /// Venue capabilities (supported order types, TIF, amendments).
     fn capabilities(&self) -> &VenueCapabilities;
 
-    /// Submit an order. Must check `dry_run` flag before sending to exchange.
+    /// Submit an order.
+    /// Real adapters must check `dry_run` before sending to an exchange.
+    /// Paper adapters may still accept dry-run orders and simulate fills locally.
     /// Idempotent on `client_order_id`.
     async fn submit_order(&self, submission: OrderSubmission) -> Result<VenueOrderAck>;
 
@@ -120,6 +126,18 @@ pub struct VenueBalance {
 ### Timeout Policy (see DATA_MODEL.md §13 for full types)
 
 `TimeoutPolicy` defines per-operation deadlines: `submit_order` (10s), `cancel_order` (10s), `query_*` (15s), `fill_watchdog` (60s). On timeout: `ReconcileAndDecide` — never blind retry.
+
+### Paper Fill Simulation
+
+Paper adapters consume the latest `OrderbookSnapshot` and emit fills on the same
+bounded `subscribe_fills()` channel as real venues. Current implementation scope:
+
+- `OrderType::Market` and `OrderType::Limit` only
+- immediate depth-walking against the latest snapshot
+- residual quantity preserved only for resting `GTC` limit orders
+- `IOC` residual quantity is cancelled after the immediate fill is emitted
+- resting `GTC` limits are re-evaluated on later orderbook updates
+- idempotent `client_order_id` handling identical to real adapters
 
 ### Capability Extensions
 
