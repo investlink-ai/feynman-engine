@@ -762,6 +762,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "engine-core",
  "proptest",
  "rust_decimal",
  "serde",

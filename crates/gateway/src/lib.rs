@@ -929,6 +929,133 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+// ─── Venue Submit Task ───
+
+/// Capacity of the bounded venue submit channel (matches engine-core).
+pub use engine_core::VENUE_SUBMIT_CHANNEL_CAPACITY;
+
+/// Async task that receives `PipelineOrder<Routed>` from the Sequencer and submits
+/// them to venue adapters.
+///
+/// Ownership model:
+/// - The Sequencer holds the **send** side of the channel.
+/// - `VenueSubmitTask` holds the **receive** side.
+/// - Venue acks (success or failure) are sent back via `SequencerHandle`.
+///
+/// Safety invariants:
+/// - `dry_run` orders are short-circuited: a simulated `VenueOrderId` is returned
+///   immediately without calling the adapter.
+/// - If no adapter is registered for the order's `venue_id`, `OnVenueSubmitFailed`
+///   is sent — never a silent drop.
+/// - All channels are bounded; the submit receive channel capacity matches
+///   `VENUE_SUBMIT_CHANNEL_CAPACITY`.
+pub struct VenueSubmitTask {
+    submit_rx: tokio::sync::mpsc::Receiver<types::PipelineOrder<types::Routed>>,
+    /// Live adapter instances keyed by venue ID.
+    adapters: std::collections::HashMap<VenueId, std::sync::Arc<dyn VenueAdapter>>,
+    sequencer_handle: engine_core::SequencerHandle,
+    clock: std::sync::Arc<dyn types::Clock>,
+}
+
+impl VenueSubmitTask {
+    /// Create a new `VenueSubmitTask`.
+    ///
+    /// `submit_rx` is the receive side of the bounded channel created alongside the Sequencer
+    /// (use `tokio::sync::mpsc::channel(engine_core::VENUE_SUBMIT_CHANNEL_CAPACITY)`).
+    #[must_use]
+    pub fn new(
+        submit_rx: tokio::sync::mpsc::Receiver<types::PipelineOrder<types::Routed>>,
+        adapters: std::collections::HashMap<VenueId, std::sync::Arc<dyn VenueAdapter>>,
+        sequencer_handle: engine_core::SequencerHandle,
+        clock: std::sync::Arc<dyn types::Clock>,
+    ) -> Self {
+        Self {
+            submit_rx,
+            adapters,
+            sequencer_handle,
+            clock,
+        }
+    }
+
+    /// Run the venue submit loop.
+    ///
+    /// Exits when the send side of the submit channel is dropped (sequencer shut down).
+    pub async fn run(mut self) {
+        use engine_core::SequencerCommand;
+        use tracing::{error, info, warn};
+
+        while let Some(order) = self.submit_rx.recv().await {
+            let order_id = order.core.id.clone();
+            let venue_id = order.core.venue_id.clone();
+            let now = self.clock.now();
+
+            // Gate 1 — dry_run: simulate ack without calling the adapter.
+            if order.core.dry_run {
+                let simulated_id =
+                    types::VenueOrderId(format!("sim-{}", order.routing().client_order_id));
+                info!(
+                    order_id = %order_id,
+                    venue_order_id = %simulated_id,
+                    "dry_run — simulating venue ack"
+                );
+                let cmd = SequencerCommand::OnVenueAck {
+                    order_id,
+                    venue_order_id: simulated_id,
+                    submitted_at: now,
+                };
+                if let Err(err) = self.sequencer_handle.send(cmd).await {
+                    error!(error = %err, "failed to send dry-run OnVenueAck to sequencer");
+                }
+                continue;
+            }
+
+            // Gate 2 — adapter lookup: fail fast if no adapter registered for this venue.
+            let adapter = match self.adapters.get(&venue_id) {
+                Some(a) => std::sync::Arc::clone(a),
+                None => {
+                    let reason = format!("no adapter registered for venue {venue_id}");
+                    warn!(order_id = %order_id, reason = %reason, "venue submission failed");
+                    let cmd = SequencerCommand::OnVenueSubmitFailed { order_id, reason };
+                    if let Err(err) = self.sequencer_handle.send(cmd).await {
+                        error!(error = %err, "failed to send OnVenueSubmitFailed to sequencer");
+                    }
+                    continue;
+                }
+            };
+
+            // Dispatch on OrderCore.kind when multi-leg support lands (#29).
+            // For now all orders are single-leg and follow the same path.
+            let submission = OrderSubmission::from_routed(&order);
+
+            match adapter.submit_order(submission).await {
+                Ok(ack) => {
+                    info!(
+                        order_id = %order_id,
+                        venue_order_id = %ack.venue_order_id,
+                        "venue accepted order"
+                    );
+                    let cmd = SequencerCommand::OnVenueAck {
+                        order_id,
+                        venue_order_id: ack.venue_order_id,
+                        submitted_at: ack.accepted_at,
+                    };
+                    if let Err(err) = self.sequencer_handle.send(cmd).await {
+                        error!(error = %err, "failed to send OnVenueAck to sequencer");
+                    }
+                }
+                Err(err) => {
+                    let reason = err.to_string();
+                    warn!(order_id = %order_id, reason = %reason, "venue rejected order");
+                    let cmd = SequencerCommand::OnVenueSubmitFailed { order_id, reason };
+                    if let Err(err) = self.sequencer_handle.send(cmd).await {
+                        error!(error = %err, "failed to send OnVenueSubmitFailed to sequencer");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

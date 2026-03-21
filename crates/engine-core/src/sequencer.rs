@@ -9,12 +9,14 @@ use tracing::{error, info, warn};
 use crate::{
     AgentId, ClientOrderId, ClientOrderIdGenerator, EngineCore, EngineError, EngineEvent,
     EngineStateSnapshot, EventJournal, Fill, OrderAck, OrderRecord, OrderState, PriceSource,
-    ReconciliationAction, ReconciliationReport, Result, SequenceGenerator, SequenceId,
-    SequencedEvent, SequencerCommand,
+    ReconciliationAction, ReconciliationReport, Result, RoutingAssignment, SequenceGenerator,
+    SequenceId, SequencedEvent, SequencerCommand, VenueOrderId,
 };
 
 pub const HIGH_PRIORITY_CHANNEL_CAPACITY: usize = 64;
 pub const COMMAND_CHANNEL_CAPACITY: usize = 1024;
+/// Capacity of the bounded channel feeding `PipelineOrder<Routed>` to the venue submit task.
+pub const VENUE_SUBMIT_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct SequencerHandle {
@@ -56,6 +58,11 @@ pub struct Sequencer<C, J, P, K> {
     command_rx: mpsc::Receiver<SequencerCommand>,
     client_order_id_generators: std::collections::HashMap<AgentId, ClientOrderIdGenerator>,
     restart_epoch: u16,
+    /// Send side of the bounded venue-submit channel.
+    ///
+    /// `None` in test / backtest contexts without a live venue adapter.
+    /// When `Some`, routed orders are dispatched here for async submission by `VenueSubmitTask`.
+    venue_submit_tx: Option<mpsc::Sender<crate::PipelineOrder<crate::Routed>>>,
 }
 
 impl<C, J, P, K> Sequencer<C, J, P, K>
@@ -118,12 +125,26 @@ where
                 command_rx,
                 client_order_id_generators,
                 restart_epoch,
+                venue_submit_tx: None,
             },
             SequencerHandle {
                 high_priority_tx,
                 command_tx,
             },
         ))
+    }
+
+    /// Wire a venue submit channel before calling `run()`.
+    ///
+    /// The send side is held by the Sequencer; the receive side is passed to `VenueSubmitTask`.
+    /// Routed orders are dispatched here for async venue submission.
+    #[must_use]
+    pub fn with_venue_submit_tx(
+        mut self,
+        tx: mpsc::Sender<crate::PipelineOrder<crate::Routed>>,
+    ) -> Self {
+        self.venue_submit_tx = Some(tx);
+        self
     }
 
     pub async fn run(mut self) -> Result<EngineStateSnapshot> {
@@ -242,6 +263,14 @@ where
                 }));
                 Ok(CommandOutcome::default())
             }
+            SequencerCommand::OnVenueAck {
+                order_id,
+                venue_order_id,
+                submitted_at,
+            } => self.handle_venue_ack(order_id, venue_order_id, submitted_at),
+            SequencerCommand::OnVenueSubmitFailed { order_id, reason } => {
+                self.handle_venue_submit_failed(order_id, reason, now)
+            }
             SequencerCommand::OnFill { fill } => self.handle_fill(fill, now),
             SequencerCommand::OnReconciliation { report } => {
                 self.handle_reconciliation(report, now)
@@ -319,15 +348,28 @@ where
         match self.core.evaluate_order(order, now) {
             Ok(risk_checked) => {
                 let client_order_id = self.next_client_order_id(&agent_id, now);
+
+                // Transition: RiskChecked → Routed.
+                //
+                // The venue was already selected at Draft time (by SignalOrderBridge).
+                // Routing stamps the ClientOrderId and routed_at timestamp.
+                let routing = RoutingAssignment {
+                    venue_id: venue_id.clone(),
+                    client_order_id: client_order_id.clone(),
+                    routed_at: now,
+                };
+                let routed = risk_checked.into_routed(routing);
+
                 let ack = OrderAck {
                     order_id: order_id.clone(),
                     client_order_id: client_order_id.clone(),
                     accepted_at: now,
                 };
                 let record = OrderRecord {
-                    core: risk_checked.core.clone(),
+                    core: routed.core.clone(),
                     state: OrderState::Pending,
                     client_order_id: client_order_id.clone(),
+                    venue_order_id: None,
                     fills: Vec::new(),
                     created_at: now,
                     last_updated: now,
@@ -341,12 +383,36 @@ where
                         .insert(client_order_id.clone(), ack.clone());
                 }
 
+                // Dispatch to venue submit task if wired; log a warning if not.
+                if let Some(ref submit_tx) = self.venue_submit_tx {
+                    match submit_tx.try_send(routed) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                order_id = %order_id,
+                                "venue submit channel is full — order will not be submitted"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!(
+                                order_id = %order_id,
+                                "venue submit channel is closed — order will not be submitted"
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        order_id = %order_id,
+                        "no venue submit task wired — order routed but not submitted"
+                    );
+                }
+
                 info!(
                     order_id = %order_id,
                     agent_id = %agent_id,
                     venue_id = %venue_id,
                     client_order_id = %client_order_id,
-                    "sequencer accepted order"
+                    "sequencer accepted and routed order"
                 );
                 let _ = respond.send(Ok(ack));
 
@@ -355,15 +421,16 @@ where
                         order_id: order_id.clone(),
                         agent_id,
                         instrument_id,
-                        venue_id,
+                        venue_id: venue_id.clone(),
                     },
                     EngineEvent::OrderValidated {
                         order_id: order_id.clone(),
                     },
                     EngineEvent::OrderRiskChecked {
-                        order_id,
+                        order_id: order_id.clone(),
                         outcome: types::RiskOutcomeKind::Approved,
                     },
+                    EngineEvent::OrderRouted { order_id, venue_id },
                 ]))
             }
             Err(err) => {
@@ -383,6 +450,71 @@ where
                 }]))
             }
         }
+    }
+
+    fn handle_venue_ack(
+        &mut self,
+        order_id: crate::OrderId,
+        venue_order_id: VenueOrderId,
+        submitted_at: DateTime<Utc>,
+    ) -> Result<CommandOutcome> {
+        let record = self
+            .core
+            .state_mut()
+            .orders
+            .get_mut(&order_id)
+            .ok_or_else(|| EngineError::OrderNotFound(order_id.to_string()))?;
+
+        if record.state != OrderState::Pending {
+            return Err(EngineError::InvalidTransition(format!(
+                "venue ack for order {} in unexpected state {}",
+                order_id, record.state
+            )));
+        }
+
+        record.state = OrderState::Submitted;
+        record.venue_order_id = Some(venue_order_id.clone());
+        record.last_updated = submitted_at;
+
+        info!(
+            order_id = %order_id,
+            venue_order_id = %venue_order_id,
+            "venue acknowledged order"
+        );
+
+        Ok(CommandOutcome::mutated(vec![EngineEvent::OrderSubmitted {
+            order_id,
+            venue_order_id,
+        }]))
+    }
+
+    fn handle_venue_submit_failed(
+        &mut self,
+        order_id: crate::OrderId,
+        reason: String,
+        now: DateTime<Utc>,
+    ) -> Result<CommandOutcome> {
+        let record = self
+            .core
+            .state_mut()
+            .orders
+            .get_mut(&order_id)
+            .ok_or_else(|| EngineError::OrderNotFound(order_id.to_string()))?;
+
+        record.state = OrderState::Rejected;
+        record.last_updated = now;
+
+        warn!(
+            order_id = %order_id,
+            reason = %reason,
+            "venue submission failed"
+        );
+
+        Ok(CommandOutcome::mutated(vec![EngineEvent::OrderRejected {
+            order_id,
+            stage: "venue_submit".to_owned(),
+            reason,
+        }]))
     }
 
     fn handle_fill(&mut self, fill: Fill, now: DateTime<Utc>) -> Result<CommandOutcome> {
