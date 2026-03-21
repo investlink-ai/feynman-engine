@@ -353,6 +353,10 @@ where
                 //
                 // The venue was already selected at Draft time (by SignalOrderBridge).
                 // Routing stamps the ClientOrderId and routed_at timestamp.
+                // Clone core before into_routed() consumes risk_checked.
+                // PipelineOrder<Routed> is !Clone (by design), so we capture the
+                // OrderCore here for the OrderRecord we'll write after try_send succeeds.
+                let routed_core = risk_checked.core.clone();
                 let routing = RoutingAssignment {
                     venue_id: venue_id.clone(),
                     client_order_id: client_order_id.clone(),
@@ -360,13 +364,51 @@ where
                 };
                 let routed = risk_checked.into_routed(routing);
 
+                // Dispatch to venue submit task BEFORE mutating state.
+                // If the channel is full or closed, fail-fast: no state mutation,
+                // error returned to caller. Ghost orders (state written but never
+                // submitted) must never happen.
+                if let Some(ref submit_tx) = self.venue_submit_tx {
+                    match submit_tx.try_send(routed) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_dropped)) => {
+                            let reason = "venue submit channel is full — order rejected".to_owned();
+                            warn!(order_id = %order_id, "{}", reason);
+                            let _ = respond
+                                .send(Err(EngineError::Internal(anyhow::anyhow!("{}", reason))));
+                            return Ok(CommandOutcome::events(vec![EngineEvent::OrderRejected {
+                                order_id,
+                                stage: "route".to_owned(),
+                                reason,
+                            }]));
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_dropped)) => {
+                            let reason =
+                                "venue submit channel is closed — order rejected".to_owned();
+                            warn!(order_id = %order_id, "{}", reason);
+                            let _ = respond
+                                .send(Err(EngineError::Internal(anyhow::anyhow!("{}", reason))));
+                            return Ok(CommandOutcome::events(vec![EngineEvent::OrderRejected {
+                                order_id,
+                                stage: "route".to_owned(),
+                                reason,
+                            }]));
+                        }
+                    }
+                } else {
+                    warn!(
+                        order_id = %order_id,
+                        "no venue submit task wired — order routed but not submitted"
+                    );
+                }
+
                 let ack = OrderAck {
                     order_id: order_id.clone(),
                     client_order_id: client_order_id.clone(),
                     accepted_at: now,
                 };
                 let record = OrderRecord {
-                    core: routed.core.clone(),
+                    core: routed_core,
                     state: OrderState::Pending,
                     client_order_id: client_order_id.clone(),
                     venue_order_id: None,
@@ -381,30 +423,6 @@ where
                     state
                         .idempotency_cache
                         .insert(client_order_id.clone(), ack.clone());
-                }
-
-                // Dispatch to venue submit task if wired; log a warning if not.
-                if let Some(ref submit_tx) = self.venue_submit_tx {
-                    match submit_tx.try_send(routed) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!(
-                                order_id = %order_id,
-                                "venue submit channel is full — order will not be submitted"
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!(
-                                order_id = %order_id,
-                                "venue submit channel is closed — order will not be submitted"
-                            );
-                        }
-                    }
-                } else {
-                    warn!(
-                        order_id = %order_id,
-                        "no venue submit task wired — order routed but not submitted"
-                    );
                 }
 
                 info!(
@@ -500,6 +518,13 @@ where
             .orders
             .get_mut(&order_id)
             .ok_or_else(|| EngineError::OrderNotFound(order_id.to_string()))?;
+
+        if record.state != OrderState::Pending {
+            return Err(EngineError::InvalidTransition(format!(
+                "venue submit failed for order {} in unexpected state {}",
+                order_id, record.state
+            )));
+        }
 
         record.state = OrderState::Rejected;
         record.last_updated = now;
