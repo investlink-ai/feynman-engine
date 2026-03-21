@@ -134,7 +134,9 @@ bounded `subscribe_fills()` channel as real venues. Current implementation scope
 
 - `OrderType::Market` and `OrderType::Limit` only
 - immediate depth-walking against the latest snapshot
-- residual quantity allowed only for resting `GTC` limit orders
+- residual quantity preserved only for resting `GTC` limit orders
+- `IOC` residual quantity is cancelled after the immediate fill is emitted
+- resting `GTC` limits are re-evaluated on later orderbook updates
 - idempotent `client_order_id` handling identical to real adapters
 
 ### Capability Extensions

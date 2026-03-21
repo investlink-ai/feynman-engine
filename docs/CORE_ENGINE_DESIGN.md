@@ -2117,10 +2117,11 @@ Paper Mode Venue Adapter Task
 This means paper mode has real market data latency but no execution risk. The
 `FillSimulator` models slippage based on the live orderbook depth at the time of
 the order — not historical data. In the current implementation, `PaperAdapter`
-stores the latest validated `OrderbookSnapshot` per market and simulates at
-submission time. Residual quantity is only preserved for resting `GTC` limit
-orders; other partially fillable orders are rejected explicitly instead of being
-silently approximated.
+stores the latest validated `OrderbookSnapshot` per market, simulates at
+submission time, and re-evaluates resting `GTC` limits on later orderbook
+updates. Residual quantity is preserved only for resting `GTC` limits; `IOC`
+residual quantity is cancelled after the immediate fill instead of being left
+open or silently approximated.
 
 ### 10.4 Fill Simulation Model
 

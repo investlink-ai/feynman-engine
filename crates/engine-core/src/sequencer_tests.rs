@@ -1210,6 +1210,78 @@ async fn test_venue_submit_failed_transitions_order_to_rejected() {
     assert_eq!(record.venue_order_id, None);
 }
 
+#[tokio::test]
+async fn test_venue_cancelled_transitions_order_to_cancelled() {
+    let now = fixed_time();
+    let journal = RecordingJournal::default();
+    let core = TestCore::new(now);
+    let clock = types::SimulatedClock::new(now);
+    let (sequencer, handle) = Sequencer::new(core, journal.clone(), StaticPriceSource, clock, 7)
+        .await
+        .expect("bootstrap sequencer");
+
+    let run_task = tokio::spawn(sequencer.run());
+
+    let order = crate::PipelineOrder::new(sample_order("ord-cancel", now)).into_validated(now);
+    let (ack_tx, ack_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::SubmitOrder {
+            order,
+            respond: ack_tx,
+        })
+        .await
+        .expect("queue order");
+    let _ = ack_rx.await.expect("ack channel").expect("order accepted");
+
+    handle
+        .send(SequencerCommand::OnVenueAck {
+            order_id: OrderId("ord-cancel".to_owned()),
+            venue_order_id: VenueOrderId("venue-cancel".to_owned()),
+            submitted_at: now,
+        })
+        .await
+        .expect("queue venue ack");
+
+    handle
+        .send(SequencerCommand::OnVenueCancelled {
+            order_id: OrderId("ord-cancel".to_owned()),
+            reason: "ioc residual cancelled".to_owned(),
+            cancelled_at: now,
+        })
+        .await
+        .expect("queue venue cancelled");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    handle
+        .send(SequencerCommand::Shutdown {
+            respond: shutdown_tx,
+        })
+        .await
+        .expect("queue shutdown");
+    let final_snapshot = run_task
+        .await
+        .expect("sequencer join")
+        .expect("sequencer result");
+    shutdown_rx.await.expect("shutdown ack");
+
+    let tags: Vec<_> = journal
+        .events()
+        .iter()
+        .map(|e| event_tag(&e.event))
+        .collect();
+    assert!(
+        tags.contains(&"order_cancelled".to_owned()),
+        "expected order_cancelled in {tags:?}"
+    );
+
+    let record = final_snapshot
+        .state
+        .orders
+        .get(&OrderId("ord-cancel".to_owned()))
+        .expect("order record");
+    assert_eq!(record.state, OrderState::Cancelled);
+}
+
 fn fixed_time() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0)
         .single()

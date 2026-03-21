@@ -271,6 +271,11 @@ where
             SequencerCommand::OnVenueSubmitFailed { order_id, reason } => {
                 self.handle_venue_submit_failed(order_id, reason, now)
             }
+            SequencerCommand::OnVenueCancelled {
+                order_id,
+                reason,
+                cancelled_at,
+            } => self.handle_venue_cancelled(order_id, reason, cancelled_at),
             SequencerCommand::OnFill { fill } => self.handle_fill(fill, now),
             SequencerCommand::OnReconciliation { report } => {
                 self.handle_reconciliation(report, now)
@@ -513,6 +518,38 @@ where
         Ok(CommandOutcome::mutated(vec![EngineEvent::OrderRejected {
             order_id,
             stage: "venue_submit".to_owned(),
+            reason,
+        }]))
+    }
+
+    fn handle_venue_cancelled(
+        &mut self,
+        order_id: crate::OrderId,
+        reason: String,
+        cancelled_at: DateTime<Utc>,
+    ) -> Result<CommandOutcome> {
+        let record = self
+            .core
+            .state_mut()
+            .orders
+            .get_mut(&order_id)
+            .ok_or_else(|| EngineError::OrderNotFound(order_id.to_string()))?;
+
+        match record.state {
+            OrderState::Submitted | OrderState::PartiallyFilled => {}
+            _ => {
+                return Err(EngineError::InvalidTransition(format!(
+                    "venue cancel for order {} in unexpected state {}",
+                    order_id, record.state
+                )));
+            }
+        }
+
+        record.state = OrderState::Cancelled;
+        record.last_updated = cancelled_at;
+
+        Ok(CommandOutcome::mutated(vec![EngineEvent::OrderCancelled {
+            order_id,
             reason,
         }]))
     }
