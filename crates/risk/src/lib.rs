@@ -1433,6 +1433,7 @@ mod tests {
             basket_id: None,
             agent_id: AgentId("satoshi".into()),
             instrument_id: InstrumentId("BTC-USD".into()),
+            market_id: types::MarketId("BTC-USD".into()),
             venue_id: VenueId("bybit".into()),
             side,
             order_type: OrderType::Limit,

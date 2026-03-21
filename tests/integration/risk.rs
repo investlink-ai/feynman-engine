@@ -276,6 +276,7 @@ fn make_order_with(
         basket_id: None,
         agent_id,
         instrument_id: InstrumentId(BTC_USD.into()),
+        market_id: types::MarketId(BTC_USD.into()),
         venue_id: VenueId(BYBIT.into()),
         side: Side::Buy,
         order_type: OrderType::Limit,

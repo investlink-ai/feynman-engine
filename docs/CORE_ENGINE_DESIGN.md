@@ -1566,11 +1566,13 @@ Current bridge behavior in `gateway`:
 - `Signal.sizing_hint` is treated as an explicit notional target when present.
 - `conviction=0` is only allowed when the bridge emits no orders; `conviction=0` with `sizing_hint` is rejected as ambiguous intent.
 - `Signal.sizing_hint` must remain within the agent's allocated capital.
+- The bridge rejects stale quotes before sizing, using a configurable max-age threshold.
 - Otherwise quantity is sized from `conviction × allocated_capital / |reference_price - stop_loss|`.
+- `stop_loss` must remain on the losing side of the reference price for the chosen direction.
 - `take_profit` must be on the profitable side of the reference price for the chosen direction.
 - Venue selection is explicit: mapped venue ∩ allowed venues ∩ connected venues, then the configured routing policy picks a winner (default: highest available balance).
 - If `allowed_instruments` is configured for the agent, the bridge rejects out-of-scope instruments before routing.
-- Draft market orders still carry a reference price so downstream risk checks remain deterministic.
+- Draft orders carry both the unified `instrument_id` and the venue-native `market_id`; market orders still carry a reference price so downstream risk checks remain deterministic.
 
 ### 8.6 Pipeline Stages (Composable)
 

@@ -103,8 +103,10 @@ pub enum Urgency { Low, Normal, High, Immediate }
 | `conviction` | 0.0 ≤ x ≤ 1.0 | Reject signal |
 | `conviction` + `sizing_hint` | `conviction = 0.0` with non-zero `sizing_hint` is invalid | Reject signal |
 | `stop_loss` | Required for perps; must be finite positive | Reject signal |
+| `stop_loss` | Must be on the losing side of the entry reference price | Reject signal |
 | `sizing_hint` | If present, must be positive and ≤ agent allocated capital | Reject signal |
 | `take_profit` | Must be on the profitable side of the entry reference price | Reject signal |
+| `price source` | Cached quote must be fresh enough for bridge sizing | Reject signal |
 | `instrument` | Must exist in allowed instruments for agent | Reject signal |
 | `arb_type` | Must match a registered plugin | Reject signal |
 | `thesis` | Non-empty | Reject signal |

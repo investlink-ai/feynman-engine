@@ -1072,6 +1072,7 @@ fn sample_order(order_id: &str, now: DateTime<Utc>) -> OrderCore {
         basket_id: None,
         agent_id: AgentId("athena".to_owned()),
         instrument_id: InstrumentId("BTCUSDT".to_owned()),
+        market_id: types::MarketId("BTCUSDT".to_owned()),
         venue_id: VenueId("bybit".to_owned()),
         side: Side::Buy,
         order_type: OrderType::Limit,

@@ -14,7 +14,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 pub use types::{
-    ClientOrderId, ConnectionState, HeartbeatConfig, InstrumentId, OrderId, OrderState,
+    ClientOrderId, ConnectionState, HeartbeatConfig, InstrumentId, MarketId, OrderId, OrderState,
     PipelineOrder, RiskChecked, TimeoutPolicy, VenueConnectionHealth, VenueId, VenueOrderId,
 };
 
@@ -29,6 +29,12 @@ pub enum GatewayError {
 
     #[error("price unavailable for instrument {instrument_id}")]
     PriceUnavailable { instrument_id: String },
+
+    #[error("price for instrument {instrument_id} is stale (max age {max_age:?})")]
+    StalePrice {
+        instrument_id: String,
+        max_age: Duration,
+    },
 
     #[error("no route available for instrument {instrument_id}: {reason}")]
     RoutingUnavailable {
@@ -153,6 +159,7 @@ pub struct SignalOrderBridgeConfig {
     pub default_time_in_force: types::TimeInForce,
     pub dry_run: bool,
     pub routing_policy: SignalRoutingPolicy,
+    pub max_price_age: Duration,
 }
 
 impl Default for SignalOrderBridgeConfig {
@@ -162,6 +169,7 @@ impl Default for SignalOrderBridgeConfig {
             default_time_in_force: types::TimeInForce::IOC,
             dry_run: true,
             routing_policy: SignalRoutingPolicy::HighestAvailableBalance,
+            max_price_age: Duration::from_secs(30),
         }
     }
 }
@@ -282,7 +290,7 @@ impl SignalOrderBridge {
                     "signal_to_orders rejected signal during sizing"
                 );
             })?;
-        let venue_id = self
+        let venue = self
             .select_venue(signal, agent_limits, venue_states)
             .inspect_err(|err| {
                 info!(
@@ -299,7 +307,8 @@ impl SignalOrderBridge {
             basket_id: signal.basket_id.clone(),
             agent_id: signal.agent.clone(),
             instrument_id: signal.instrument.clone(),
-            venue_id: venue_id.clone(),
+            market_id: MarketId(venue.symbol.clone()),
+            venue_id: venue.venue_id.clone(),
             side: signal.direction,
             order_type: self.config.default_order_type,
             time_in_force: self.config.default_time_in_force,
@@ -321,7 +330,8 @@ impl SignalOrderBridge {
             signal_id = %signal.id,
             agent = %signal.agent,
             instrument = %signal.instrument,
-            venue = %venue_id,
+            venue = %venue.venue_id,
+            market = %venue.symbol,
             qty = %qty,
             reference_price = %reference_price,
             order_id = %order.id,
@@ -381,6 +391,18 @@ impl SignalOrderBridge {
         signal: &types::Signal,
         reference_price: Decimal,
     ) -> Result<()> {
+        let valid_stop_loss = match signal.direction {
+            types::Side::Buy => signal.stop_loss < reference_price,
+            types::Side::Sell => signal.stop_loss > reference_price,
+        };
+
+        if !valid_stop_loss {
+            return Err(GatewayError::Validation(format!(
+                "stop_loss {} is not on the losing side of reference price {} for {:?}",
+                signal.stop_loss, reference_price, signal.direction
+            )));
+        }
+
         if let Some(take_profit) = signal.take_profit {
             let valid_take_profit = match signal.direction {
                 types::Side::Buy => take_profit > reference_price,
@@ -408,6 +430,13 @@ impl SignalOrderBridge {
             .ok_or_else(|| GatewayError::PriceUnavailable {
                 instrument_id: signal.instrument.to_string(),
             })?;
+
+        if price_source.is_stale(&signal.instrument, self.config.max_price_age) {
+            return Err(GatewayError::StalePrice {
+                instrument_id: signal.instrument.to_string(),
+                max_age: self.config.max_price_age,
+            });
+        }
 
         let reference_price = match signal.direction {
             types::Side::Buy => snapshot.ask,
@@ -464,7 +493,7 @@ impl SignalOrderBridge {
         signal: &types::Signal,
         agent_limits: Option<&types::AgentRiskLimits>,
         venue_states: &[VenueRouteState],
-    ) -> Result<VenueId> {
+    ) -> Result<VenueSymbol> {
         if let Some(allowed_instruments) =
             agent_limits.and_then(|limits| limits.allowed_instruments.as_ref())
         {
@@ -526,13 +555,13 @@ impl SignalOrderBridge {
         }
 
         let selected = match self.config.routing_policy {
-            SignalRoutingPolicy::FirstListed => eligible_states.remove(0).0.venue_id.clone(),
+            SignalRoutingPolicy::FirstListed => eligible_states.remove(0).0.clone(),
             SignalRoutingPolicy::HighestAvailableBalance => eligible_states
                 .into_iter()
                 .max_by(|(_, left), (_, right)| {
                     left.available_balance.cmp(&right.available_balance)
                 })
-                .map(|(mapping, _)| mapping.venue_id.clone())
+                .map(|(mapping, _)| mapping.clone())
                 .ok_or_else(|| GatewayError::RoutingUnavailable {
                     instrument_id: signal.instrument.to_string(),
                     reason: "no eligible venues remained after routing".to_owned(),
@@ -710,6 +739,7 @@ pub struct OrderSubmission {
     pub client_order_id: ClientOrderId,
     pub agent_id: types::AgentId,
     pub instrument_id: InstrumentId,
+    pub market_id: MarketId,
     pub venue_id: VenueId,
     pub side: types::Side,
     pub order_type: types::OrderType,
@@ -736,6 +766,7 @@ impl OrderSubmission {
             client_order_id: routing.client_order_id.clone(),
             agent_id: core.agent_id.clone(),
             instrument_id: core.instrument_id.clone(),
+            market_id: core.market_id.clone(),
             venue_id: routing.venue_id.clone(),
             side: core.side,
             order_type: core.order_type,
@@ -905,6 +936,7 @@ mod tests {
 
     struct StaticPriceSource {
         prices: HashMap<InstrumentId, types::PriceSnapshot>,
+        stale: bool,
     }
 
     impl types::PriceSource for StaticPriceSource {
@@ -913,7 +945,7 @@ mod tests {
         }
 
         fn is_stale(&self, _instrument: &InstrumentId, _max_age: Duration) -> bool {
-            false
+            self.stale
         }
     }
 
@@ -1022,6 +1054,7 @@ mod tests {
                     received_at: now,
                 },
             )]),
+            stale: false,
         }
     }
 
@@ -1072,6 +1105,7 @@ mod tests {
         let order = orders.first().unwrap().core();
         let expected_qty = Decimal::new(10_000, 0) / Decimal::new(105, 0);
         assert_eq!(order.venue_id, VenueId("bybit".into()));
+        assert_eq!(order.market_id, MarketId("BTCUSDT".into()));
         assert_eq!(order.basket_id, signal.basket_id);
         assert_eq!(order.price, Some(Decimal::new(10005, 0)));
         assert_eq!(order.qty, expected_qty);
@@ -1106,6 +1140,7 @@ mod tests {
         let order = orders.first().unwrap().core();
         let expected_qty = Decimal::new(12_000, 0) / Decimal::new(10_005, 0);
         assert_eq!(order.venue_id, VenueId("binance".into()));
+        assert_eq!(order.market_id, MarketId("BTCUSDT".into()));
         assert_eq!(order.qty, expected_qty);
     }
 
@@ -1258,6 +1293,56 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, GatewayError::Validation(_)));
+    }
+
+    #[test]
+    fn signal_bridge_rejects_stop_loss_on_wrong_side_of_entry() {
+        let now = Utc::now();
+        let bridge =
+            SignalOrderBridge::new(SignalOrderBridgeConfig::default(), sample_symbol_map());
+        let mut signal = sample_signal(now);
+        signal.stop_loss = Decimal::new(10_100, 0);
+        let firm_book = sample_firm_book(now);
+        let limits = sample_limits();
+        let prices = sample_prices(now);
+
+        let err = bridge
+            .signal_to_orders(
+                &signal,
+                &firm_book,
+                Some(&limits),
+                &prices,
+                &[route_state("bybit", Decimal::new(30_000, 0), now)],
+                now,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, GatewayError::Validation(_)));
+    }
+
+    #[test]
+    fn signal_bridge_rejects_stale_prices() {
+        let now = Utc::now();
+        let bridge =
+            SignalOrderBridge::new(SignalOrderBridgeConfig::default(), sample_symbol_map());
+        let signal = sample_signal(now);
+        let firm_book = sample_firm_book(now);
+        let limits = sample_limits();
+        let mut prices = sample_prices(now);
+        prices.stale = true;
+
+        let err = bridge
+            .signal_to_orders(
+                &signal,
+                &firm_book,
+                Some(&limits),
+                &prices,
+                &[route_state("bybit", Decimal::new(30_000, 0), now)],
+                now,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, GatewayError::StalePrice { .. }));
     }
 
     #[test]
