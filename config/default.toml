@@ -58,7 +58,7 @@ max_unresolved_markets = 10
 
 # ── Venue Configuration ──
 [venues.bybit]
-testnet = false
+testnet = true
 api_key = "${BYBIT_API_KEY}"
 api_secret = "${BYBIT_API_SECRET}"
 

@@ -1318,7 +1318,10 @@ impl VenueConnectionHealth {
 }
 ```
 
-`VenueAdapter::connection_health()` exposes this. The gateway checks `is_submittable()` before routing. On transition to `Stale`, reconciliation is scheduled immediately on reconnect.
+`VenueAdapter::connection_health()` exposes this snapshot. The gateway checks
+`is_submittable()` before routing, and adapters may enforce stricter submit-time
+readiness checks for background streams that are not reflected in the snapshot.
+On transition to `Stale`, reconciliation is scheduled immediately on reconnect.
 
 All venue operations have explicit timeouts via `TimeoutPolicy`. Timeout behavior: `Reconcile`, `AlertOnly`, or `CancelAndReconcile` — never silent retry.
 

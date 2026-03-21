@@ -14,6 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+mod bybit;
+
+pub use bybit::{BybitAdapter, BybitAuth, BybitConfig};
+
 pub use types::{
     ClientOrderId, ConnectionState, HeartbeatConfig, InstrumentId, MarketId, OrderId, OrderState,
     PipelineOrder, RiskChecked, TimeoutPolicy, VenueConnectionHealth, VenueId, VenueOrderId,
@@ -593,7 +597,9 @@ pub trait VenueAdapter: Send + Sync + sealed::Sealed {
     /// Venue identifier.
     fn venue_id(&self) -> &VenueId;
 
-    /// Current connection health (heartbeat, latency, state).
+    /// Current connection health snapshot (heartbeat, latency, state).
+    /// Adapters may enforce stricter submit-time readiness checks for
+    /// background streams that are not reflected in this snapshot.
     fn connection_health(&self) -> &VenueConnectionHealth;
 
     /// Timeout policy for this venue's operations.

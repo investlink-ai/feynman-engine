@@ -40,6 +40,7 @@ cargo test {test_name}                     # Single test
 cargo test -- --ignored                    # Property tests (slow, marked #[ignore])
 cargo test -- --nocapture --test-threads=1 # Run with output, serial
 cargo test --doc                           # Doc tests only
+./scripts/bybit-testnet-smoke.sh           # Live Bybit testnet adapter smoke (requires API env)
 ```
 
 ---
@@ -106,6 +107,9 @@ RUST_LOG=feynman_engine=debug,types=trace cargo run --bin feynman-engine  # Modu
 
 Bootstrap config is loaded from TOML and then overridden by runtime env where present:
 `FEYNMAN_MODE`/`ENGINE_MODE`, `ENGINE_DRY_RUN`, `ENGINE_GRPC_PORT`, and `REDIS_URL`.
+Bybit credentials are referenced from `config/default.toml` as `${BYBIT_API_KEY}` and
+`${BYBIT_API_SECRET}`, so define them in your shell or runner environment before
+starting the engine or running the Bybit smoke script.
 
 ---
 
